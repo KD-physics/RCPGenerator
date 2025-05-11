@@ -1,0 +1,2 @@
+g++ -O3 -std=c++17 -o RCPGenerator.exe RCPGenerator.cpp
+g++ -O3 -std=c++17 -o InitializeParticles.exe InitializeParticles.cpp
