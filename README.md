@@ -1,4 +1,4 @@
-# ND‑RCP: N‑Dimensional Random Close Packing Generator
+# N‑Dimensional Random Close Packing Generator
 
 ![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)
 
