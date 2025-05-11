@@ -228,7 +228,7 @@ You can create circular (in 2D), cylindrical (in 3D), or hyperspherical (in high
 
   Creates a 4D hypersphere of diameter 1.5; remaining settings define periodicity only.
 
-> **Note:** After interpreting the spherical boundary, the code ignores any additional values in `--box` and `--walls` beyond those needed for the sphere (i.e. the remaining dims are purely periodic).
+> **Note:** After interpreting the spherical boundary, the code ignores any additional values in `--box` and `--walls` beyond those needed for the sphere (i.e. the remaining dims are purely periodic).  Also I find that many times the program can struggle with cylindrical boundaries and maxes out the number of steps. However, the final packing is still quite close to rcp.
 
 
 ## Usage: MATLAB
