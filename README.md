@@ -17,7 +17,7 @@ Ideal for computational physicists, ML researchers, and anyone needing controlle
 
 ## Features
 
-- Grows packing diameters in random close packings via ADAM optimizer
+- Generates random close packings via ADAM optimizer
 - Built-in support for a wide variety of particle size distributions
 - Periodic or hard‑walled boundary conditions, including circular or hypersphere walls
 - Packings hieight can be constrained to multiple of largest particle diameter
