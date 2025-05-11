@@ -10,6 +10,11 @@ ND‑RCP provides fast, flexible tools for generating and relaxing random close 
 
 Ideal for computational physicists, ML researchers, and anyone needing controlled particle packings.
 
+| ![Ex1](Images/example1.png) | ![Ex2](Images/example2.png) | ![Ex3](Images/example3.png) | ![Ex4](Images/example4.png) |
+|:---------------------------:|:---------------------------:|:---------------------------:|:---------------------------:|
+| Caption 1                   | Caption 2                   | Caption 3                   | Caption 4                   |
+
+
 ## Features
 
 - Grows packing diameters in random close packings via ADAM optimizer
@@ -155,13 +160,70 @@ Full list of options
 
 ### 3. How to properly use fixed height
 
-
 ### 4. How to use circular boundary
-
 
 ##. MATLAB
 
 Matlab functionality is one-to-one with c++ code. There is the example file example.m that include end to end demos
+
+## Rough Overview of Algorithm
+
+RCPGenerator implements an iterative expansion–relaxation scheme first described by Desmond & Weeks (2009) [arXiv:0903.0864]. Starting from an initial set of particle positions and diameters, the algorithm alternates between expanding particle sizes and minimizing the overlap energy. When the force can be sufficiently balanced, but the overlap energy cannot be reduced below a threshold, diameters are contracted and the minimization repeats. Expansion and contraction rates decrease over time until the diameter adjustment step falls below a tolerance, at which point the algorithm terminates and returns the final positions and diameters as the RCP state.
+
+Energy minimization was originally implemented using a conjugate‑gradient solver in Desmond & Weeks (2009). Since then the ADAM optimizer was introduced for neural netork training, and here we find it performs much faster. As such, energy minimization is handled by a sequence of optimizers: ADAM for rapid initial convergence, AMSGrad for stability when ADAM stalls, and finally overdamped Verlet integrator if overlaps persist. In practice, ADAM quickly removes most overlaps (down to ≈5×10⁻⁴ D), after which AMSGrad and Verlet address the remaining small overlaps (down to ≈1×10⁻⁵ D).
+
+1. **Initialization**
+
+   * Load initial positions `x` and diameters `D` from input.
+   * Set constants:
+
+     * `DELTA_PHI0 = 1.5 × 1.5e-3` (initial φ step size)
+     * `phi_min` (dimension‐dependent minimum φ)
+     * `N_STEPS = 150000`, `DT = 0.1`, default `METHOD = "ADAM"`
+   * Initialize optimizer state (ADAM/AMSGrad/Verlet), neighbor lists, and force arrays.
+
+2. **Main Loop (up to `N_STEPS`)**
+
+   * **Force evaluation & neighbor management**
+
+     * Recompute neighbor pairs every 750 steps or when particle displacements exceed a quarter of the minimum diameter.
+     * Compute forces `F`, potential energy `U`, and minimum gap distances via `GetForcesND_3`.
+   * **Optimizer switching**
+
+     * **ADAM** for steps 1–2500 → switch to **AMSGrad** for steps 2501–4000 → switch to **Verlet** thereafter.
+     * Triggers at:
+
+       * step > 2500: `method = "AMSGrad"`
+       * step > 4000: `method = "Verlet"`
+   * **Diameter scaling**
+
+     * On step 150, set `delta_phi = DELTA_PHI0`.
+     * Update `phi = max(phi + dphi, phi_min)`.
+     * Compute and apply new diameters via `scale_diametersND` (and scale box height if `--fix-height`).
+   * **Expansion vs. contraction**
+
+     * If `U < U_threshold` (≈6.25×10⁻⁸) or `max_min_dist < sqrt(U_threshold)×10`, **expand**: `dphi = delta_phi`.
+     * Else if `U > U_threshold` and `step > 125`:
+
+       * If net force magnitude < `F_tol` (≈5×10⁻⁶), **contract**: `dphi = −delta_phi/2`.
+       * Otherwise hold: `dphi = 0`.
+     * Adjust `delta_phi` up/down based on oscillations or sustained progress.
+   * **Position updates**
+
+     * For ADAM/AMSGrad: standard ADAM updates using `m_hat`, `v_hat`, and learning rate `alpha`.
+     * For Verlet: `x += v_verlet×DT + 0.5×a_old×DT²`.
+   * **Termination**
+
+     * Break when `delta_phi < 5e-6` and overlaps/forces are below thresholds.
+
+3. **Output**
+
+   * Save intermediate packings if `--save-interval > 0`.
+   * On termination, write final positions + diameters to `--output`.
+
+This loop alternates expansion when overlaps are low and contraction when overlaps are too large, steadily honing in on a tight random close packing.
+
+
 
 ## Contributing
 
@@ -173,15 +235,13 @@ Matlab functionality is one-to-one with c++ code. There is the example file exam
 ## License & Citation
 
 This project is released under the **MIT License**.
-If you use ND‑RCP in published work, please cite:
 
-> Desmond, K. *N‑Dimensional Random Close Packing Generator*, GitHub Repository, YYYY.
-> DOI or arXiv\:XXXX.XXXXX (if available)
+* Desmond, K. W., & Weeks, E. R. (2014). *Influence of particle size distribution on random close packing of spheres*. Physical Review E, 90(2), 022204. [arXiv:1303.4627](https://arxiv.org/pdf/1303.4627)
+* Desmond, K. W., & Weeks, E. R. (2009). *Random close packing of disks and spheres in confined geometries*. Physical Review E, 80(5), 051305. [arXiv:0903.0864](https://arxiv.org/pdf/0903.0864)
 
 ## Contact
 
-Kenneth Desmond — [@<GitHubUsername>](https://github.com/<GitHubUsername>)
-[youremail@example.com](mailto:youremail@example.com)
+Kenneth Desmond — [@<KD-physics>](https://github.com/<KD-physics>)
 
 ```
 ```
