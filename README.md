@@ -4,24 +4,24 @@
 
 ## Description
 
-ND‑RCP provides fast, flexible tools for generating and relaxing random close packings of spheres in arbitrary dimensions.
+RCPGenerator provides a fast, flexible tool for generating random close packings of hyperspheres in arbitrary dimensions.
 - **C++** executables for seeding and optimizing packings with ADAM/Verlet.
-- **MATLAB** scripts for initialization, packing, and visualization.
+- **MATLAB** for seeding and optimizing packings with ADAM/Verlet and scripts for visualization.
 
 Ideal for computational physicists, ML researchers, and anyone needing dense particle packings for simulations or 3D printing.
 
 | ![Ex1](Images/example1.png) | ![Ex2](Images/example2.png) | ![Ex3](Images/example3.png) | ![Ex4](Images/example4.png) |
 |:---------------------------:|:---------------------------:|:---------------------------:|:---------------------------:|
-| Cropped 2D packing with periodic boundary in x, and hard boundary in y. Constrains were applied such that the final packing height will be a user supplied multiple of the largest particle diameter.                   | 2D circle confined packing.                   | Cylindrically confined packing with upper and lower hard boundaries.                   | Spherically confined packing.                  |
+| Cropped 2D packing with periodic boundary in the x-direction and hard boundary in the y-direction. A constraint is applied to ensure the final packing height is a user-specified multiple of the largest particle diameter. | Circle confined packing                  | Cylindrically confined packing with upper and lower hard boundaries.                   | Spherically confined packing.                  |
 
 
 ## Features
 
-- Generate packings via an iterative expansion–relaxation scheme (Desmond & Weeks 2009).
+- Generate packings via an iterative expansion–contraction scheme (Desmond & Weeks 2009).
 - Support for various particle size distributions (monodisperse, bidisperse, Gaussian, power‑law, custom, and more).
-- Periodic or hard‑wall boundary conditions (including circular or spherical containers).
+- Periodic or hard‑wall boundary conditions (including circular, cylindrical, or spherical containers).
 - Optionally fix container height as a multiple of the first particle diameter.
-- If computer resources permit, will generate packings in any arbitrary dimension greater than 1
+- If computer resources are sufficient, can generate packings in any arbitrary dimension of size 2 or greater
 - Export and import packing data in plain‑text format.
 - Both C++ and MATLAB routines included. Each set of code are independent whose functionality mirror each other. 
 
@@ -64,7 +64,11 @@ g++ -O3 -std=c++17 -o RCPGenerator.exe       RCPGenerator.cpp
 
 ### 1. Intializing Particle Positions and Diameters
 
-First, particle positions and diameters need to be generated in a column format as x, y, z, ..., D. One can do this themselves or use the provide InitializeParticles.cpp function. There is no upper limit on dimensions, only lower limit at 2 dimensions. Note that the positions can be saved to a file and later uploaded into the RCPGenerator using the --file flag or they can be piped into RCPGenerator via | or <. An example use case for InitializeParticles.cpp would be
+First, particle positions and diameters must be generated in column format as x, y, z, ..., D, where D is the diameter. You can create this data manually or use the provided InitializeParticles.cpp utility. There is no upper limit on the number of dimensions, though the minimum is 2D.
+
+The generated positions can be saved to a file and later loaded into RCPGenerator using the --file flag, or piped directly via | or <.
+
+An example use case for InitializeParticles.cpp is:
 
 ```bash
 ./InitializeParticles.exe \
@@ -81,7 +85,7 @@ This example would generate a intial packing of 500 particles in 3 dimensions at
 
 Below is the full set of InitializeParticles.exe flags to adjust the type of packing that is initialized.
 
-### Command‑line Arguments (C++)
+#### Command‑line Arguments for InitializeParticles (C++)
 
 | Flag            | Type       | Default         | Description                                                                                                        |
 | --------------- | ---------- | --------------- | ------------------------------------------------------------------------------------------------------------------ |
@@ -112,32 +116,44 @@ Below is the full set of InitializeParticles.exe flags to adjust the type of pac
 
 ### 2. Generating RCP (C++)
 
-RCPGenerator requires a set of initial positions and diameters to be provide in column format as x,y,z,...D, and either piped in or uploaded using the --file flag. A simple example would be
+RCPGenerator requires a set of initial particle positions and diameters provided in column format as x, y, z, ..., D. This data can be piped in or loaded using the --file flag. A simple example is:
 
 ```bash
 ./RCPGenerator.exe --file init_500_3D.txt
 ```
 
-This example would use all the default settings which are all periodic boundaries, and the number of dimensions and number of particles are inferred from position and diameter data, and the container is unit size. With this format the final positions will be printed to the command line terminal. If one desires the positions to be saved to a file, the --output flag can be used as
+This command uses all default settings: periodic boundaries in all directions, unit-sized container, and automatic inference of the number of dimensions and particles from the input data.
+
+By default, the final packed positions will be printed to the terminal. To save the output to a file, you can use the --output flag, for example:
 
 ```bash
 ./RCPGenerator.exe --file init_500_3D.txt --output saved_positions
 ```
 
-or you can pipe the data
+Alternatively, output can be redirected manually:
 
 ```bash
 ./RCPGenerator.exe --file init_500_3D.txt > saved_positions.txt
 ```
 
-where .txt is always attached to end of the file name automatically when using --output flag. There are many other flags to set the size of the container (box), to make the boundaries hard or periodic (walls), to print status updates (verbose), to constrain the final height to be a multiple of the first listed diameter (fix-height). A full list of options are given below. A more controlled use might be something like 
+Note that .txt is automatically appended to the output filename when using the --output flag.
+
+There are many additional flags available to customize the packing process, including:
+
+   --box to set the container size,
+
+   --walls to specify hard or periodic boundaries,
+
+   --verbose to print status updates during packing,
+
+   --fix-height to constrain the final packing height to be a user-defined multiple of the largest particle diameter.
 
 ```bash
 ./InitializeParticles.exe --N 15000 --Ndim 3 --dist powerlaw --d_min 1.0 --d_max 15.0 --exponent -3 --phi 0.01 --box 1,0.5,1 > input.txt
 ./RCPGenerator.exe --file input.txt --output final_packing.txt --NeighborMax 1500 --box 1,0.5,1 --walls 0,1,0 
 ```
 
-In this example, we have the following attributes
+In this example, the packing would have the following attributes
 
    - **Number of particles (--N)**         : 15,000
 
