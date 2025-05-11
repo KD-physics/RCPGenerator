@@ -1,7 +1,6 @@
-```markdown
 # ND‑RCP: N‑Dimensional Random Close Packing Generator
 
-[![Build Status](https://github.com/<USERNAME>/<REPO>/actions/workflows/build.yml/badge.svg)] [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)]
+![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)
 
 ## Description
 
@@ -13,30 +12,32 @@ Ideal for computational physicists, ML researchers, and anyone needing controlle
 
 ## Features
 
-- Seed initial positions at a target packing fraction φ in n dimensions
-- Relax packings to high density via gradient‑based dynamics
-- Support monodisperse, bidisperse, and power‑law diameter distributions
-- Periodic or hard‑walled boundary conditions
-- Export/import plain‑text packing files for interoperability
-- MATLAB routines for quick prototyping and 2D/3D plotting
+- Grows packing diameters in random close packings via ADAM optimizer
+- Built-in support for a wide variety of particle size distributions
+- Periodic or hard‑walled boundary conditions, including circular or hypersphere walls
+- Packings hieight can be constrained to multiple of largest particle diameter
+- Export/import plain‑text packing files
+- Both c++ and MATLAB routines included
 
 ## Repository Structure
 
-```
-
 /c++
-├ RCPGenerator.cpp         # packing relaxation executable
-├ InitializeParticles.cpp  # initial‐positions generator
+
+    ├ RCPGenerator.cpp         # packing relaxation executable
+    └ InitializeParticles.cpp  # initial‐positions generator
+
 /matlab
-├ initialize\_particlesND.m # N‑D seeding function
-├ CreatePacking.m          # packing optimizer
-├ plot\_particles\_periodic.m
-├ plot\_particles\_3D.m
-└ example.m                # end‑to‑end demo
+
+    ├ initialize\_particlesND.m # N‑D seeding function
+    ├ CreatePacking.m          # packing optimizer
+    ├ plot\_particles\_periodic.m
+    ├ plot\_particles\_3D.m
+    └ example.m                # end‑to‑end demo
+
 README.md
+
 LICENSE
 
-````
 
 ## Prerequisites
 
@@ -53,9 +54,11 @@ g++ -O3 -std=c++17 -o RCPGenerator.exe       RCPGenerator.cpp
 
 *No installation step required for the MATLAB scripts.*
 
-## Usage
+## Usage: C++
 
-### 1. Seed initial positions (C++)
+### 1. Intializing Particle Positions and Diameters
+
+First, particle positions and diameter need to be generated in a column form x, y, z, ..., D. One can do this themselves or used the provide InitializeParticles.cpp function. There is no upper limit on dimensions, only lower limit on 2 dimensions. Note that the positions can be saved to a file and later uploaded using the --file flag in RCPGenerator, or then can be piped into RCPGenerator via | or <. An example use case for InitializeParticles.cpp would be (assuming compiled to InitializeParticles.exe)
 
 ```bash
 ./InitializeParticles.exe \
@@ -68,113 +71,97 @@ g++ -O3 -std=c++17 -o RCPGenerator.exe       RCPGenerator.cpp
   > init_500_3D.txt
 ```
 
-### 2. Relax packing (C++)
+The command line arguments are as follows
+
+### Command‑line Arguments (C++)
+
+| Flag            | Type       | Default         | Description                                                                                                        |
+| --------------- | ---------- | --------------- | ------------------------------------------------------------------------------------------------------------------ |
+| `--phi`         | float      | 0.05            | Target packing fraction                                                                                            |
+| `--N`           | int        | —               | Number of particles                                                                                                |
+| `--Ndim`        | int        | —               | Spatial dimensions (>=2)                                                                                           |
+| `--box`         | comma list | 1 repeated Ndim | Box lengths per dimension                                                                                          |
+| `--dist`        | string     | —               | Distribution type: mono, bidisperse, gaussian, biGaussian, lognormal, flat, powerlaw, exponential, weibull, custom |
+| `--d`           | float      | —               | Diameter (monodisperse)                                                                                            |
+| `--d1`          | float      | —               | First diameter (bidisperse)                                                                                        |
+| `--d2`          | float      | —               | Second diameter (bidisperse)                                                                                       |
+| `--p`           | float      | —               | Fraction (bidisperse, biGaussian)                                                                                  |
+| `--mu`          | float      | —               | Mean (gaussian)                                                                                                    |
+| `--sigma`       | float      | —               | Std dev (gaussian)                                                                                                 |
+| `--mu1`         | float      | —               | Mean1 (biGaussian)                                                                                                 |
+| `--sigma1`      | float      | —               | Std1 (biGaussian)                                                                                                  |
+| `--mu2`         | float      | —               | Mean2 (biGaussian)                                                                                                 |
+| `--sigma2`      | float      | —               | Std2 (biGaussian)                                                                                                  |
+| `--d_min`       | float      | —               | Min diameter (flat, powerlaw, exponential)                                                                         |
+| `--d_max`       | float      | —               | Max diameter (flat, powerlaw, exponential)                                                                         |
+| `--exponent`    | float      | —               | Exponent (powerlaw)                                                                                                |
+| `--scale`       | float      | —               | Scale (weibull)                                                                                                    |
+| `--shape`       | float      | —               | Shape (weibull)                                                                                                    |
+| `--custom_list` | string     | —               | Comma-separated list for custom distribution                                                                       |
+| `--fix-height`  | flag       | false           | Fix height dimension when scaling diameters                                                                        |
+| `--help`        | flag       | false           | Show help message                                                                                                  |
+
+
+### 2. Generating RCP (C++)
+
+Using a set of initial positions and diameters provide via column format x,y,z,...D, either piped in or set via the --file flag, and RCP can be generated simply as 
 
 ```bash
-./RCPGenerator.exe \
-  --file init_500_3D.txt \
-  --output rcp_500_3D.txt \
-  --box 1,1,1 \
-  --save-interval 100 \
-  --verbose
+./RCPGenerator.exe --file init_500_3D.txt
 ```
 
-### 3. MATLAB end‑to‑end demo
+where the boundaries are all periodic, and the number of dimensions of particles are inferred from data within the file. With this format the final positions will be printed to the command terminal. If one desires the positions to be printed to a file, the the use case would be
 
-```matlab
-cd matlab
-example  % runs initialization, packing, and plots results
+```bash
+./RCPGenerator.exe --file init_500_3D.txt --output saved_positions
 ```
 
-## Command‑line Arguments (C++)
+or
+
+```bash
+./RCPGenerator.exe --file init_500_3D.txt > saved_positions.txt
+```
+
+where .txt is always attached to end of file name automatically. There are many other flags to set the size of the container (box), to make the boundaries hard (walls), to print status updates (verbose), if the final height of the container is to be a multiple of the first listed diameter (fix-height). A full list of options are given below. A more controlled use might be something like 
+
+```bash
+./InitializeParticles.exe --N 15000 --Ndim 3 --dist powerlaw --d_min 1.0 --d_max 15.0 --exponent -3 --phi 0.01 --box 1,0.5,1 --walls 0,1,0 > input.txt
+./RCPGenerator.exe --file input.txt --output final_packing.txt --NeighborMax 1500 --box 1,0.5,1 --walls 0,1,0 
+```
+
+In this example, we have the following attributes
+   N (Number of particles)          : 15,000
+   Ndim (dimensions)                : 3
+   Diameter distribution (--dist)   : Power law with exponent -3 and the lower and upper limits from 1-15
+   Packing fraction (phi)           : 0.01
+   Container is box of widths (box) : 1 along x, 0.5 along y, and 1 along z
+   Boundary conditions (walls)      : 0 (false) means periodic in x, 1 (true) means hard wall in y, 0 (false) means periodic in z
+   NeighborMax                      : This one is a little tricky. The code works by building a maintaining a full list of possible nearby neighbors that gets updated periodically. The matrix that stores these possible neighbors is pre-assigned an allocation of memory based on the max number of expected neighbor neighbors. There are default values for NeighborMax but they might not be enough. If it isn't the code will exit and tell you to increase this number. As the size ratio between large and small particles grows, the number of possible nearby neighbors will as well
+   
+Full list of options
 
 | Flag              | Type       | Default          | Description                                                     |
 | ----------------- | ---------- | ---------------- | --------------------------------------------------------------- |
-| `--N`             | int        | —                | Number of particles                                             |
-| `--Ndim`          | int        | —                | Number of spatial dimensions                                    |
-| `--phi`           | float      | 0.2              | Initial packing fraction                                        |
-| `--dist`          | string     | monodisperse     | Diameter distribution: `monodisperse`, `bidisperse`, `powerlaw` |
-| `--D`             | float      | 1.0              | Particle diameter (for monodisperse)                            |
-| `--D2`            | float      | —                | Second diameter (for bidisperse)                                |
-| `--ratio`         | float      | 1.4              | D2/D1 ratio (for bidisperse)                                    |
-| `--alpha`         | float      | 3.0              | Exponent (for power‑law distribution)                           |
-| `--box`           | comma list | 1,1,…,1          | Box lengths in each dimension (e.g. `--box 1,1,1`)              |
-| `--walls`         | bool       | false            | Use hard walls instead of periodic boundaries                   |
-| `--save-interval` | int        | 0                | Write intermediate files every N steps (0 = off)                |
-| `--verbose`       | bool       | false            | Print progress messages                                         |
-| `--file`          | string     | —                | Input file (output of `InitializeParticles.exe`)                |
-| `--output`        | string     | `rcp_output.txt` | Output path for the relaxed packing                             |
+| `--file`          | string     | —                | Input file (output of InitializeParticles.exe)                  |
+| `--output`        | string     | packing\_out.txt | Output file for relaxed packing                                 |
+| `--box`           | comma list | —                | Box lengths per dimension                                       |
+| `--NeighborMax`   | int        | 0 (auto)         | Max neighbors for spatial binning (0 = automatic based on Ndim) |
+| `--seed`          | int        | 0                | Seed for RNG (0 = time-based)                                   |
+| `--verbose`       | flag       | false            | Print progress and debug messages                               |
+| `--fix-height`    | flag       | false            | Fix height dimension when scaling diameters                     |
+| `--save-interval` | int        | 0                | Interval (steps) to save intermediate packings (0 = off)        |
+| `--walls`         | comma list | 0 repeated Ndim  | Hard-wall flags per dimension (0 = periodic, 1 = hard wall)     |
 
-## MATLAB Functions & Options
 
-### initialize\_particlesND
+### 3. How to properly use fixed height
 
-```matlab
-[x, D] = initialize_particlesND(...
-    N, phi, box, dist, Name,Value...)
-```
 
-| Name      | Type    | Default        | Description                                  |
-| --------- | ------- | -------------- | -------------------------------------------- |
-| `N`       | int     | —              | Number of particles                          |
-| `phi`     | double  | —              | Packing fraction                             |
-| `box`     | \[1×n]  | ones(1,n)      | Box lengths in each dimension                |
-| `dist`    | string  | 'monodisperse' | 'monodisperse' \| 'bidisperse' \| 'powerlaw' |
-| `'D'`     | double  | 1.0            | Diameter (monodisperse)                      |
-| `'D2'`    | double  | —              | Second diameter (bidisperse)                 |
-| `'ratio'` | double  | 1.4            | D2/D1 ratio (bidisperse)                     |
-| `'alpha'` | double  | 3.0            | Exponent (powerlaw)                          |
-| `'walls'` | logical | false          | Hard walls if true (otherwise periodic)      |
+### 4. How to use circular boundary
 
-### CreatePacking
 
-```matlab
-[xOpt, DOpt] = CreatePacking(...
-    x, D, box, Name,Value...)
-```
+##. MATLAB
 
-| Name             | Type   | Default | Description                                       |
-| ---------------- | ------ | ------- | ------------------------------------------------- |
-| `'maxIter'`      | int    | 10000   | Maximum number of optimization iterations         |
-| `'tol'`          | double | 1e-6    | Convergence tolerance                             |
-| `'saveInterval'` | int    | 0       | Save intermediate packing every N steps (0 = off) |
-
-## Input / Output Formats
-
-* **Text files**
-  Each line:
-
-  ```
-  x1 x2 … xn D
-  ```
-
-  (space‑separated coordinates + diameter)
-
-* **MATLAB**
-
-  * `x`: N×n matrix of positions
-  * `D`: N×1 vector of diameters
-
-## Visualization
-
-* **2D periodic scatter**:
-
-  ```matlab
-  plot_particles_periodic(x, D, box)
-  ```
-* **3D sphere rendering**:
-
-  ```matlab
-  plot_particles_3D(x, D, box)
-  ```
-
-## Examples
-
-See [`matlab/example.m`](matlab/example.m) for a complete demo:
-
-1. Generate positions
-2. Relax packing
-3. Plot results
+Matlab functionality is one-to-one with c++ code. There is the example file example.m that include end to end demos
 
 ## Contributing
 
