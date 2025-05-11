@@ -8,7 +8,7 @@ ND‑RCP provides fast, flexible tools for generating and relaxing random close 
 - **C++** executables for seeding and optimizing packings with ADAM/Verlet.
 - **MATLAB** scripts for initialization, packing, and visualization.
 
-Ideal for computational physicists, ML researchers, and anyone needing controlled particle packings.
+Ideal for computational physicists, ML researchers, and anyone needing dense particle packings for simulations or 3D printing.
 
 | ![Ex1](Images/example1.png) | ![Ex2](Images/example2.png) | ![Ex3](Images/example3.png) | ![Ex4](Images/example4.png) |
 |:---------------------------:|:---------------------------:|:---------------------------:|:---------------------------:|
