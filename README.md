@@ -12,29 +12,30 @@ Ideal for computational physicists, ML researchers, and anyone needing dense par
 
 | ![Ex1](Images/example1.png) | ![Ex2](Images/example2.png) | ![Ex3](Images/example3.png) | ![Ex4](Images/example4.png) |
 |:---------------------------:|:---------------------------:|:---------------------------:|:---------------------------:|
-| Caption 1                   | Caption 2                   | Caption 3                   | Caption 4                   |
+| Cropped 2D packing with periodic boundary in x, and hard boundary in y. Constrains were applied such that the final packing height will be a user supplied multiple of the largest particle diameter.                   | 2D circle confined packing.                   | Cylindrically confined packing with upper and lower hard boundaries.                   | Spherically confined packing.                  |
 
 
 ## Features
 
-- Generates random close packings via ADAM optimizer
-- Built-in support for a wide variety of particle size distributions
-- Periodic or hard‑walled boundary conditions, including circular or hypersphere walls
-- Packings hieight can be constrained to multiple of largest particle diameter
-- Export/import plain‑text packing files
-- Both c++ and MATLAB routines included
+- Generate packings via an iterative expansion–relaxation scheme (Desmond & Weeks 2009).
+- Support for various particle size distributions (monodisperse, bidisperse, Gaussian, power‑law, custom, and more).
+- Periodic or hard‑wall boundary conditions (including circular or spherical containers).
+- Optionally fix container height as a multiple of the first particle diameter.
+- If computer resources permit, will generate packings in any arbitrary dimension greater than 1
+- Export and import packing data in plain‑text format.
+- Both C++ and MATLAB routines included. Each set of code are independent whose functionality mirror each other. 
 
 ## Repository Structure
 
 /c++
 
-    ├ RCPGenerator.cpp         # packing relaxation executable
-    └ InitializeParticles.cpp  # initial‐positions generator
+    ├ RCPGenerator.cpp         # Generates packings via ADAM optimerizer
+    └ InitializeParticles.cpp  # Initial position and diameter generator
 
 /matlab
 
-    ├ initialize\_particlesND.m # N‑D seeding function
-    ├ CreatePacking.m          # packing optimizer
+    ├ initialize\_particlesND.m # Initial position and diameter generator
+    ├ CreatePacking.m          # Generates packings via ADAM optimerizer
     ├ plot\_particles\_periodic.m
     ├ plot\_particles\_3D.m
     └ example.m                # end‑to‑end demo
@@ -63,20 +64,22 @@ g++ -O3 -std=c++17 -o RCPGenerator.exe       RCPGenerator.cpp
 
 ### 1. Intializing Particle Positions and Diameters
 
-First, particle positions and diameter need to be generated in a column form x, y, z, ..., D. One can do this themselves or used the provide InitializeParticles.cpp function. There is no upper limit on dimensions, only lower limit on 2 dimensions. Note that the positions can be saved to a file and later uploaded using the --file flag in RCPGenerator, or then can be piped into RCPGenerator via | or <. An example use case for InitializeParticles.cpp would be (assuming compiled to InitializeParticles.exe)
+First, particle positions and diameters need to be generated in a column format as x, y, z, ..., D. One can do this themselves or use the provide InitializeParticles.cpp function. There is no upper limit on dimensions, only lower limit at 2 dimensions. Note that the positions can be saved to a file and later uploaded into the RCPGenerator using the --file flag or they can be piped into RCPGenerator via | or <. An example use case for InitializeParticles.cpp would be
 
 ```bash
 ./InitializeParticles.exe \
   --N 500 \
   --Ndim 3 \
-  --phi 0.64 \
+  --phi 0.05 \
   --dist monodisperse \
   --D 1.0 \
   --box 1,1,1 \
   > init_500_3D.txt
 ```
 
-The command line arguments are as follows
+This example would generate a intial packing of 500 particles in 3 dimensions at packing fraction 5%. The container size is 1 x 1 x 1, and all the diameters are equal in size. The positions and diameters are saved to init_500_3D.txt.
+
+Below is the full set of InitializeParticles.exe flags to adjust the type of packing that is initialized.
 
 ### Command‑line Arguments (C++)
 
@@ -109,46 +112,46 @@ The command line arguments are as follows
 
 ### 2. Generating RCP (C++)
 
-Using a set of initial positions and diameters provide via column format x,y,z,...D, either piped in or set via the --file flag, and RCP can be generated simply as 
+RCPGenerator requires a set of initial positions and diameters to be provide in column format as x,y,z,...D, and either piped in or uploaded using the --file flag. A simple example would be
 
 ```bash
 ./RCPGenerator.exe --file init_500_3D.txt
 ```
 
-where the boundaries are all periodic, and the number of dimensions of particles are inferred from data within the file. With this format the final positions will be printed to the command terminal. If one desires the positions to be printed to a file, the the use case would be
+This example would use all the default settings which are all periodic boundaries, and the number of dimensions and number of particles are inferred from position and diameter data, and the container is unit size. With this format the final positions will be printed to the command line terminal. If one desires the positions to be saved to a file, the --output flag can be used as
 
 ```bash
 ./RCPGenerator.exe --file init_500_3D.txt --output saved_positions
 ```
 
-or
+or you can pipe the data
 
 ```bash
 ./RCPGenerator.exe --file init_500_3D.txt > saved_positions.txt
 ```
 
-where .txt is always attached to end of file name automatically. There are many other flags to set the size of the container (box), to make the boundaries hard (walls), to print status updates (verbose), if the final height of the container is to be a multiple of the first listed diameter (fix-height). A full list of options are given below. A more controlled use might be something like 
+where .txt is always attached to end of the file name automatically when using --output flag. There are many other flags to set the size of the container (box), to make the boundaries hard or periodic (walls), to print status updates (verbose), to constrain the final height to be a multiple of the first listed diameter (fix-height). A full list of options are given below. A more controlled use might be something like 
 
 ```bash
-./InitializeParticles.exe --N 15000 --Ndim 3 --dist powerlaw --d_min 1.0 --d_max 15.0 --exponent -3 --phi 0.01 --box 1,0.5,1 --walls 0,1,0 > input.txt
+./InitializeParticles.exe --N 15000 --Ndim 3 --dist powerlaw --d_min 1.0 --d_max 15.0 --exponent -3 --phi 0.01 --box 1,0.5,1 > input.txt
 ./RCPGenerator.exe --file input.txt --output final_packing.txt --NeighborMax 1500 --box 1,0.5,1 --walls 0,1,0 
 ```
 
 In this example, we have the following attributes
 
-   N (Number of particles)          : 15,000
+   - **Number of particles (--N)**         : 15,000
 
-   Ndim (dimensions)                : 3
+   - **Number of dimensions (--Ndim)**                : 3
    
-   Diameter distribution (--dist)   : Power law with exponent -3 and the lower and upper limits from 1-15
+   - **Diameter distribution (--dist)**   : Power law with exponent -3 and the lower and upper limits from 1-15
    
-   Packing fraction (phi)           : 0.01
+   - **Packing fraction (--phi)**           : 0.01
    
-   Container is box of widths (box) : 1 along x, 0.5 along y, and 1 along z
+   - **Container is box of widths (--box)** : 1 along x, 0.5 along y, and 1 along z
    
-   Boundary conditions (walls)      : 0 (false) means periodic in x, 1 (true) means hard wall in y, 0 (false) means periodic in z
+   - **Boundary conditions (--walls)**      : 0 (false) means periodic in x, 1 (true) means hard wall in y, 0 (false) means periodic in z
    
-   NeighborMax                      : This one is a little tricky. The code works by building a maintaining a full list of possible nearby neighbors that gets updated periodically. The matrix that stores these possible neighbors is pre-assigned an allocation of memory based on the max number of expected neighbor neighbors. There are default values for NeighborMax but they might not be enough. If it isn't the code will exit and tell you to increase this number. As the size ratio between large and small particles grows, the number of possible nearby neighbors will as well
+   - **--NeighborMax**                      : This one is a little tricky. The code works by building a maintaining a full list of possible nearby neighbors that gets updated periodically. The matrix that stores these possible neighbors is pre-assigned an allocation of memory based on the max number of expected neighbor neighbors. There are default values for NeighborMax but they might not be enough. If it isn't the code will exit and tell you to increase this number. As the size ratio between large and small particles grows, the number of possible nearby neighbors will as well
    
 Full list of options
 
@@ -163,21 +166,80 @@ Full list of options
 | `--fix-height`    | flag       | false            | Fix height dimension when scaling diameters                     |
 | `--save-interval` | int        | 0                | Interval (steps) to save intermediate packings (0 = off)        |
 | `--walls`         | comma list | 0 repeated Ndim  | Hard-wall flags per dimension (0 = periodic, 1 = hard wall)     |
+| `--MaxSteps`      | int        | 150000           | **Still Need to Implement** MaxSteps before it terminates without finishing                 |
 
 
 ### 3. How to properly use fixed height
 
-### 4. How to use circular boundary
+When using the `--fix-height` flag, both `InitializeParticles.exe` and `RCPGenerator.exe` must be given the same `--box` setting. In this mode, the last value in `--box` is interpreted as the desired container height in units of the **first** particle’s diameter. Internally, the workflow proceeds as follows:
 
-##. MATLAB
+1. **Initialization (`InitializeParticles.exe`)**
 
-Matlab functionality is one-to-one with c++ code. There is the example file example.m that include end to end demos
+   * You supply `--box x,y,...,w` and `--fix-height`.
+   * The last component `w` is treated as a multiple of the first particle diameter.
+   * The program rescales all particle diameters and sets the actual container height to `w × D₁`, where `D₁` is the first particle diameter in your generated list, while preserving the target packing fraction.
+
+2. **Relaxation (`RCPGenerator.exe`)**
+
+   * You supply the same `--box x,y,...,w` and `--fix-height` flags.
+   * Again, the last `w` is taken relative to the stored first particle diameter.
+   * During expansion–relaxation, the container height is held at `w × D₁` as particles expand or contract to meet the packing fraction.
+
+```bash
+./InitializeParticles.exe --N 15000 --Ndim 3 --dist powerlaw --d_min 1.0 --d_max 15.0 --exponent -3 --phi 0.01 --box 1,0.5,4 --fix_height > input.txt
+./RCPGenerator.exe --file input.txt --output final_packing.txt --NeighborMax 1500 --box 1,0.5,4 --walls 0,1,0 --fix_height
+```
+
+In this example, the final packing height (along the last dimension) will be exactly four times the first particle diameter. It’s critical that the --box values match between both executables when using --fix-height.
+
+### 4. How to Use Circular (Hyperspherical) Boundaries
+
+You can create circular (in 2D), cylindrical (in 3D), or hyperspherical (in higher dimensions) containers by setting the first value of the `--walls` flag to a negative integer `-t`. This indicates that the first `t` dimensions share a single spherical boundary of diameter given by the first `--box` component. All other `--box` and `--walls` values are then ignored except for periodicity in remaining dimensions.
+
+* **2D circle** (disk):
+
+  ```bash
+  --box 1.5, 0.8   --walls -2, 0   
+  ```
+
+  Creates a disk of diameter 1.5 with no periodic walls.
+
+* **3D cylinder**:
+
+  ```bash
+  --box 1.5,1.0,0.8   --walls -2,0,0  
+  ```
+
+  Creates an infinite cylinder of circular cross‑section diameter 1.5 (in the first two dims) and height 0.8 along the third (periodic by default).
+
+* **3D sphere**:
+
+  ```bash
+  --box 1.5,0.8,0.8   --walls -3,0,0  
+  ```
+
+  Creates a sphere of diameter 1.5 in all three dimensions.
+
+* **4D hypersphere**:
+
+  ```bash
+  --box 1.5,1,0.8,3.0   --walls -4,0,0,1  
+  ```
+
+  Creates a 4D hypersphere of diameter 1.5; remaining settings define periodicity only.
+
+> **Note:** After interpreting the spherical boundary, the code ignores any additional values in `--box` and `--walls` beyond those needed for the sphere (i.e. the remaining dims are purely periodic).
+
+
+## Usage: MATLAB
+
+All MATLAB scripts mirror the C++ functionality. See example.m script for complete demos.
 
 ## Rough Overview of Algorithm
 
-RCPGenerator implements an iterative expansion–relaxation scheme first described by Desmond & Weeks (2009) [arXiv:0903.0864]. Starting from an initial set of particle positions and diameters, the algorithm alternates between expanding particle sizes and minimizing the overlap energy. When the force can be sufficiently balanced, but the overlap energy cannot be reduced below a threshold, diameters are contracted and the minimization repeats. Expansion and contraction rates decrease over time until the diameter adjustment step falls below a tolerance, at which point the algorithm terminates and returns the final positions and diameters as the RCP state.
+RCPGenerator implements an iterative expansion–relaxation scheme described in Desmond & Weeks (2009) [arXiv:0903.0864]. Starting from an initial set of particle positions and diameters, the algorithm alternates between expanding or contracting particle sizes and minimizing the overlap energy, gradually increasing the packing fraction until a jammed state is reached. At each set of steps once energy minimization is reached (determined by the degree to which forces are sufficiently balanced) the particle diameters expaned if particle overlap is mininal, otherwise particle diameters contract. Expansion and contraction rates decrease over time until the diameter adjustment step falls below a tolerance, at which point the algorithm terminates and returns the positions and diameters.
 
-Energy minimization was originally implemented using a conjugate‑gradient solver in Desmond & Weeks (2009). Since then the ADAM optimizer was introduced for neural netork training, and here we find it performs much faster. As such, energy minimization is handled by a sequence of optimizers: ADAM for rapid initial convergence, AMSGrad for stability when ADAM stalls, and finally overdamped Verlet integrator if overlaps persist. In practice, ADAM quickly removes most overlaps (down to ≈5×10⁻⁴ D), after which AMSGrad and Verlet address the remaining small overlaps (down to ≈1×10⁻⁵ D).
+Energy minimization was originally implemented using a conjugate‑gradient solver in Desmond & Weeks (2009). Since then the ADAM optimizer was introduced for neural netork training, and here we find it performs much faster. As such, the ADAM optimize is utilized for rapid initial convergence, followed by AMSGrad for stability when ADAM stalls, and finally overdamped Verlet integrator if overlaps persist. If overlaps still persist it gives up and contracts the particle diameters. In practice, ADAM quickly removes most overlaps, but AMSGrad and Verlet help in reducing overlaps even more.
 
 1. **Initialization**
 
@@ -230,14 +292,27 @@ Energy minimization was originally implemented using a conjugate‑gradient solv
 
 This loop alternates expansion when overlaps are low and contraction when overlaps are too large, steadily honing in on a tight random close packing.
 
+4. **Summary of Internal Parameters**
 
+| Parameter          | Default | Description                                                                         |
+| ------------------ | ------- | ----------------------------------------------------------------------------------- |
+| `N_STEPS`          | 10000   | Maximum number of expansion–relaxation iterations                                   |
+| `RECOMPUTE_FREQ`   | 50      | Steps between neighbor‐list updates                                                 |
+| `EXPANSION_RATE`   | 1.001   | Multiplicative factor to increase particle diameters when energy is below threshold |
+| `CONTRACTION_RATE` | 0.999   | Multiplicative factor to decrease diameters when energy overshoots                  |
+| `ENERGY_TOL`       | 1e-6    | Energy threshold for switching between expansion and contraction phases             |
+| `DIAMETER_TOL`     | 1e-8    | Diameter‐change threshold for convergence                                           |
+| **ADAM**:          |         |                                                                                     |
+| - `LR_ADAM`        | 1e-2    | Learning rate for ADAM optimizer                                                    |
+| - `BETA1`          | 0.9     | Exponential decay rate for ADAM’s first moment estimate                             |
+| - `BETA2`          | 0.999   | Exponential decay rate for ADAM’s second moment estimate                            |
+| - `EPSILON_ADAM`   | 1e-8    | Numerical stability constant for ADAM                                               |
+| **AMSGrad**:       |         |                                                                                     |
+| - `LR_AMS`         | 1e-3    | Learning rate for AMSGrad                                                           |
+| - `EPSILON_AMS`    | 1e-8    | Numerical stability constant for AMSGrad                                            |
+| **Verlet**:        |         |                                                                                     |
+| - `DT_VERLET`      | 1e-3    | Time‐step size for Verlet integration                                               |
 
-## Contributing
-
-1. Fork the repo
-2. Create a feature branch
-3. Submit a pull request
-4. Address review feedback
 
 ## License & Citation
 
