@@ -135,12 +135,19 @@ where .txt is always attached to end of file name automatically. There are many 
 ```
 
 In this example, we have the following attributes
+
    N (Number of particles)          : 15,000
+
    Ndim (dimensions)                : 3
+   
    Diameter distribution (--dist)   : Power law with exponent -3 and the lower and upper limits from 1-15
+   
    Packing fraction (phi)           : 0.01
+   
    Container is box of widths (box) : 1 along x, 0.5 along y, and 1 along z
+   
    Boundary conditions (walls)      : 0 (false) means periodic in x, 1 (true) means hard wall in y, 0 (false) means periodic in z
+   
    NeighborMax                      : This one is a little tricky. The code works by building a maintaining a full list of possible nearby neighbors that gets updated periodically. The matrix that stores these possible neighbors is pre-assigned an allocation of memory based on the max number of expected neighbor neighbors. There are default values for NeighborMax but they might not be enough. If it isn't the code will exit and tell you to increase this number. As the size ratio between large and small particles grows, the number of possible nearby neighbors will as well
    
 Full list of options
