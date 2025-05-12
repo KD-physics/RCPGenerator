@@ -5,13 +5,13 @@
 ## Description
 
 RCPGenerator provides a fast, flexible tool for generating random close packings, dense packings, and jammed states of spheres in 2–N dimensions.
-- **C++** executables for seeding and optimizing packings with ADAM/Verlet.
-- **MATLAB** for seeding and optimizing packings with ADAM/Verlet and scripts for visualization.
-- Supports initial particle configurations, arbitrary and pre-defined particle size distributions, periodic/hard‑wall boundaries, and rectangular, cylindrical, and spherical container geometries for physics simulations, 3D printing, and modeling of poweders, colloids, and granular media.
+- **C++** executables for seeding and generating dense packings via ADAM/Verlet optimizer.
+- **MATLAB** for seeding and generating dense packings via ADAM/Verlet optimizer, along with scripts for visualization.
+- Supports initial particle configurations, arbitrary and pre-defined particle size distributions, periodic/hard‑wall boundaries, and rectangular, cylindrical, and spherical container geometries for physics simulations, 3D printing, and modeling of powders, colloids, and granular media.
 
 | ![Ex1](Images/example1.png) | ![Ex2](Images/example2.png) | ![Ex3](Images/example3.png) | ![Ex4](Images/example4.png) |
 |:---------------------------:|:---------------------------:|:---------------------------:|:---------------------------:|
-| Cropped 2D rcp with periodic boundary in x and hard boundary in y. Constraint is applied to ensure container height is fixed to a multiple of the largest particle diameter. | Dense packing confined within circular container                  | Cylindrically confined packing with upper and lower hard boundaries.                   | Spherically confined packing.                  |
+| Cropped rcp; periodic boundary in x, hard boundary in y, and constrained height to be fixed multiple of largest diameter. | Dense packing confined within circular container                  | Cylindrically confined packing with upper and lower hard boundaries.                   | Spherically confined packing.                  |
 
 
 ## Features
