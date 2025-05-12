@@ -45,11 +45,11 @@ RCPGenerator provides a fast, flexible tool for generating random close packings
 
 /matlab
 
-    ├ initialize\_particlesND.m # Initial position and diameter generator
-    ├ CreatePacking.m          # Generates packings via ADAM optimerizer
-    ├ plot\_particles\_periodic.m
-    ├ plot\_particles\_3D.m
-    └ example.m                # end‑to‑end demo
+    ├ initialize\_particlesND.m    # Initial position and diameter generator
+    ├ CreatePacking.m              # Generates packings via ADAM optimerizer
+    ├ plot\_particles\_periodic.m  # Plot particles in 2D
+    ├ plot\_particles\_3D.m        # Plot particles in 3D
+    └ example.m                    # end‑to‑end demo
 
 README.md
 
