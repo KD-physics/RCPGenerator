@@ -350,7 +350,7 @@ This project is released under the **MIT License**.
 
 * Desmond, K. W., & Weeks, E. R. (2014). *Influence of particle size distribution on random close packing of spheres*. Physical Review E, 90(2), 022204. [arXiv:1303.4627](https://arxiv.org/pdf/1303.4627)
 * Desmond, K. W., & Weeks, E. R. (2009). *Random close packing of disks and spheres in confined geometries*. Physical Review E, 80(5), 051305. [arXiv:0903.0864](https://arxiv.org/pdf/0903.0864)
-* Original Alogorithm Methodology: A. S. Clarke and J. D. Wiley (1987), *Numerical simulation of the dense random packing of a binary mixture of hard spheres: Amorphous metals, Phys. Rev. B 35, 7350
+* Original Algorithm Methodology: A. S. Clarke and J. D. Wiley (1987), *Numerical simulation of the dense random packing of a binary mixture of hard spheres: Amorphous metals, Phys. Rev. B 35, 7350
 
 
 ## Contact
