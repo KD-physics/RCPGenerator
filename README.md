@@ -4,15 +4,14 @@
 
 ## Description
 
-RCPGenerator provides a fast, flexible tool for generating random close packings of hyperspheres in arbitrary dimensions.
+RCPGenerator provides a fast, flexible tool for generating random close packings, dense packings, and jammed states of spheres in 2–N dimensions.
 - **C++** executables for seeding and optimizing packings with ADAM/Verlet.
 - **MATLAB** for seeding and optimizing packings with ADAM/Verlet and scripts for visualization.
-
-Ideal for computational physicists, ML researchers, and anyone needing dense particle packings for simulations or 3D printing.
+- Supports initial particle configurations, particle size distributions, periodic/hard‑wall boundaries, and container geometries for physics simulations, ML preprocessing, and 3D printing.
 
 | ![Ex1](Images/example1.png) | ![Ex2](Images/example2.png) | ![Ex3](Images/example3.png) | ![Ex4](Images/example4.png) |
 |:---------------------------:|:---------------------------:|:---------------------------:|:---------------------------:|
-| Cropped 2D packing with periodic boundary in the x-direction and hard boundary in the y-direction. A constraint is applied to ensure the final packing height is a user-specified multiple of the largest particle diameter. | Circle confined packing                  | Cylindrically confined packing with upper and lower hard boundaries.                   | Spherically confined packing.                  |
+| Cropped 2D rcp with periodic boundary in x and hard boundary in y. Constraint is applied to ensure container height is fixed to a multiple of the largest particle diameter. | Dense packing confined within circular container                  | Cylindrically confined packing with upper and lower hard boundaries.                   | Spherically confined packing.                  |
 
 
 ## Features
@@ -24,6 +23,18 @@ Ideal for computational physicists, ML researchers, and anyone needing dense par
 - If computer resources are sufficient, can generate packings in any arbitrary dimension of size 2 or greater
 - Export and import packing data in plain‑text format.
 - Both C++ and MATLAB routines included. Each set of code are independent whose functionality mirror each other. 
+
+## Table of Contents
+1. [Repository Structure](#repository-structure)
+2. [Prerequisites](#prerequisites)
+3. [Compiling & Installation](#build--installation)
+4. [Quickstart: Generating Dense Packings with C++](#quickstart-generating-dense-packings-with-c)
+5. [Boundary Conditions & Containers](#boundary-conditions--containers)
+6. [Quickstart: Generating Dense Packings with Matlab](#quickstart-generating-dense-packings-with-matlab)
+7. [Brief Overview of Packing Protocol (ADAM, AMSGrad, Verlet)](#brief-overview-of-packing-protocol-adam-amsgrad-verlet)
+8. [Citation & Further Reading](#citation--further-reading)
+
+
 
 ## Repository Structure
 
@@ -50,7 +61,7 @@ LICENSE
 - **C++**: GCC or Clang supporting C++17
 - **MATLAB**: R2022a or later
 
-## Build & Installation
+## Compiling & Installation
 
 ```bash
 cd c++
@@ -60,7 +71,7 @@ g++ -O3 -std=c++17 -o RCPGenerator.exe       RCPGenerator.cpp
 
 *No installation step required for the MATLAB scripts.*
 
-## Usage: C++
+## Quickstart: Generating Dense Packings with c++
 
 ### 1. Intializing Particle Positions and Diameters
 
@@ -71,6 +82,7 @@ The generated positions can be saved to a file and later loaded into RCPGenerato
 An example use case for InitializeParticles.cpp is:
 
 ```bash
+# Initializing 5% random packing of monodisperse spheres
 ./InitializeParticles.exe \
   --N 500 \
   --Ndim 3 \
@@ -119,6 +131,7 @@ Below is the full set of InitializeParticles.exe flags to adjust the type of pac
 RCPGenerator requires a set of initial particle positions and diameters provided in column format as x, y, z, ..., D. This data can be piped in or loaded using the --file flag. A simple example is:
 
 ```bash
+# Generate dense packing of monodisperse spheres using prior initialization
 ./RCPGenerator.exe --file init_500_3D.txt
 ```
 
@@ -149,6 +162,7 @@ There are many additional flags available to customize the packing process, incl
    --fix-height to constrain the final packing height to be a user-defined multiple of the largest particle diameter.
 
 ```bash
+# Initialize and densely pack 15000 particles in 3D with a powerlaw distribution of particle diameters
 ./InitializeParticles.exe --N 15000 --Ndim 3 --dist powerlaw --d_min 1.0 --d_max 15.0 --exponent -3 --phi 0.01 --box 1,0.5,1 > input.txt
 ./RCPGenerator.exe --file input.txt --output final_packing.txt --NeighborMax 1500 --box 1,0.5,1 --walls 0,1,0 
 ```
@@ -184,8 +198,8 @@ Full list of options
 | `--walls`         | comma list | 0 repeated Ndim  | Hard-wall flags per dimension (0 = periodic, 1 = hard wall)     |
 | `--MaxSteps`      | int        | 150000           | **Still Need to Implement** MaxSteps before it terminates without finishing                 |
 
-
-### 3. How to properly use fixed height
+## Boundary Conditions & Containers
+### 1. How to properly use fixed height
 
 When using the `--fix-height` flag, both `InitializeParticles.exe` and `RCPGenerator.exe` must be given the same `--box` setting. In this mode, the last value in `--box` is interpreted as the desired container height in units of the **first** particle’s diameter. Internally, the workflow proceeds as follows:
 
@@ -208,7 +222,7 @@ When using the `--fix-height` flag, both `InitializeParticles.exe` and `RCPGener
 
 In this example, the final packing height (along the last dimension) will be exactly four times the first particle diameter. It’s critical that the --box values match between both executables when using --fix-height.
 
-### 4. How to Use Circular (Hyperspherical) Boundaries
+### 2. How to Use Circular (Hyperspherical) Boundaries
 
 You can create circular (in 2D), cylindrical (in 3D), or hyperspherical (in higher dimensions) containers by setting the first value of the `--walls` flag to a negative integer `-t`. This indicates that the first `t` dimensions share a single spherical boundary of diameter given by the first `--box` component. All other `--box` and `--walls` values are then ignored except for periodicity in remaining dimensions.
 
@@ -247,11 +261,11 @@ You can create circular (in 2D), cylindrical (in 3D), or hyperspherical (in high
 > **Note:** After interpreting the spherical boundary, the code ignores any additional values in `--box` and `--walls` beyond those needed for the sphere (i.e. the remaining dims are purely periodic).  Also I find that many times the program can struggle with cylindrical boundaries and maxes out the number of steps. However, the final packing is still quite close to rcp.
 
 
-## Usage: MATLAB
+## Quickstart: Generating Dense Packings with Matlab
 
 All MATLAB scripts mirror the C++ functionality. See example.m script for complete demos.
 
-## Rough Overview of Algorithm
+## Brief Overview of Packing Protocol (ADAM, AMSGrad, Verlet)
 
 RCPGenerator implements an iterative expansion–relaxation scheme described in Desmond & Weeks (2009) [arXiv:0903.0864]. Starting from an initial set of particle positions and diameters, the algorithm alternates between expanding or contracting particle sizes and minimizing the overlap energy, gradually increasing the packing fraction until a jammed state is reached. At each set of steps once energy minimization is reached (determined by the degree to which forces are sufficiently balanced) the particle diameters expaned if particle overlap is mininal, otherwise particle diameters contract. Expansion and contraction rates decrease over time until the diameter adjustment step falls below a tolerance, at which point the algorithm terminates and returns the positions and diameters.
 
@@ -330,7 +344,7 @@ This loop alternates expansion when overlaps are low and contraction when overla
 | - `DT_VERLET`      | 1e-3    | Time‐step size for Verlet integration                                               |
 
 
-## License & Citation
+## Citation & Further Reading
 
 This project is released under the **MIT License**.
 
