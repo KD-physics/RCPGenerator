@@ -1,3 +1,8 @@
+title: "Random Close Packing Code – C++, MATLAB & Python"
+description: "Fast, multi‑language toolkit to generate random close packings, jammed states, and dense sphere packings in 2–N dimensions."
+keywords: ["random close packing", "jammed state", "dense packing", "particle configurations", "hypersphere packing", "C++", "MATLAB", "Python"]
+---
+
 # N‑Dimensional Random Close Packing Generator
 
 ![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)
