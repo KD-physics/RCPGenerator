@@ -2,10 +2,12 @@ function [x, D, U_history, phi_history, F_history] = CreatePacking(x0, D, Box, w
 % Optimizes particle packing using the Adam algorithm in ND.
 %
 % INPUTS:
-%   x0       : [N x Ndim] matrix of initial particle positions.
-%   D        : [N x 1] array of particle diameters.
-%   Box      : [1 x Ndim] array of periodic box dimensions in each dimension.
-%   verbose  : Boolean flag for progress display (default: false).
+%   x0          : [N x Ndim] matrix of initial particle positions.
+%   D           : [N x 1] array of particle diameters.
+%   Box         : [1 x Ndim] array of container dimensions in each dimension.
+%   walls       : [1 x Ndim] array of boundary condistions. 0 for perioidc, 1 for hard.
+%   fix_height  : Last dimension constrainted to maintain initial Box(end)/D(1) ratio
+%   verbose     : Boolean flag for progress display (default: false).
 %
 % OUTPUTS:
 %   x         : [N x Ndim] final particle positions.
@@ -18,8 +20,9 @@ function [x, D, U_history, phi_history, F_history] = CreatePacking(x0, D, Box, w
 % - Utilizes an adaptive adjustment to the packing fraction (phi).
 % - The optimization terminates when phi changes by a negligible amount.
 % 
-% Last Update
-%   - December 14, 2024
+% History 
+%   - Created December 14, 2024
+%   - Last Update May 11, 2025
 %   - Kenneth Desmond
 %
     
