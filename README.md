@@ -8,6 +8,7 @@ RCPGenerator provides a fast, flexible tool for generating random close packings
 - **C++** executables for seeding and generating dense packings via ADAM/Verlet optimizer.
 - **MATLAB** for seeding and generating dense packings via ADAM/Verlet optimizer, along with scripts for visualization.
 - Supports initial particle configurations, arbitrary and pre-defined particle size distributions, periodic/hard‑wall boundaries, and rectangular, cylindrical, and spherical container geometries for physics simulations, 3D printing, and modeling of powders, colloids, and granular media.
+- Supports arbitrary particle size distributions and able to converge with very large size ratios of greater than 100 in 2D 
 
 | ![Ex1](Images/example1.png) | ![Ex2](Images/example2.png) | ![Ex3](Images/example3.png) | ![Ex4](Images/example4.png) |
 |:---------------------------:|:---------------------------:|:---------------------------:|:---------------------------:|
@@ -22,7 +23,8 @@ RCPGenerator provides a fast, flexible tool for generating random close packings
 - Optionally fix container height as a multiple of the first particle diameter.
 - If computer resources are sufficient, can generate packings in any arbitrary dimension of size 2 or greater
 - Export and import packing data in plain‑text format.
-- Both C++ and MATLAB routines included. Each set of code are independent whose functionality mirror each other. 
+- Both C++ and MATLAB routines included. Each set of code are independent whose functionality mirror each other.
+- Able to handle very large size ratios, with prior success in generating packings that have particle diameter ratios > 100 in 2D, > 50 in 3D, > 15 in 4D, and > 5 in 5D.  
 
 ## Table of Contents
 1. [Repository Structure](#repository-structure)
