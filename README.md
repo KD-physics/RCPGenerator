@@ -89,13 +89,16 @@ An example use case for InitializeParticles.cpp is:
   --N 500 \
   --Ndim 3 \
   --phi 0.05 \
-  --dist monodisperse \
-  --D 1.0 \
+  --dist mono \
+  --d 1.0 \
   --box 1,1,1 \
+  --walls 0,0,0 \
   > init_500_3D.txt
 ```
 
 This example would generate a intial packing of 500 particles in 3 dimensions at packing fraction 5%. The container size is 1 x 1 x 1, and all the diameters are equal in size. The positions and diameters are saved to init_500_3D.txt.
+
+> **Important Note:** You must supply flags N, Ndim, phi, dist (its parameters), box, and walls, otherwise you will get a Segmentation fault (core dumped) error!
 
 Below is the full set of InitializeParticles.exe flags to adjust the type of packing that is initialized.
 
