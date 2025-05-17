@@ -221,7 +221,7 @@ When using the `--fix-height` flag, both `InitializeParticles.exe` and `RCPGener
    * During expansion–relaxation, the container height is held at `w × D₁` as particles expand or contract to meet the packing fraction.
 
 ```bash
-./InitializeParticles.exe --N 15000 --Ndim 3 --dist powerlaw --d_min 1.0 --d_max 15.0 --exponent -3 --phi 0.01 --box 1,0.5,4 --fix_height > input.txt
+./InitializeParticles.exe --N 15000 --Ndim 3 --dist powerlaw --d_min 1.0 --d_max 15.0 --exponent -3 --phi 0.01 --box 1,0.5,4 --walls 0,1,0 --fix_height > input.txt
 ./RCPGenerator.exe --file input.txt --output final_packing.txt --NeighborMax 1500 --box 1,0.5,4 --walls 0,1,0 --fix_height
 ```
 
