@@ -480,20 +480,19 @@ int main(int argc, char** argv) {
         }
 
         // every save_interval steps, dump out a file
-        if (save_interval > 0)
-        {
-        if ((step-1) % save_interval == 0) {
-            std::ostringstream oss;
-            oss << outPath
-                << "_"
-                << std::setw(6)        // pad to width=6
-                << std::setfill('0')
-                << step-1
-                << ".txt";            // add extension back
-
-            std::string filename = oss.str(); 
-            writePositions(filename, x, D);
-        }
+        if (save_interval > 0){
+          if ((step-1) % save_interval == 0) {
+              std::ostringstream oss;
+              oss << outPath
+                  << "_"
+                  << std::setw(6)        // pad to width=6
+                  << std::setfill('0')
+                  << step-1
+                  << ".txt";            // add extension back
+  
+              std::string filename = oss.str(); 
+              writePositions(filename, x, D);
+          }
         }
         
     }
