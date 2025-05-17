@@ -479,8 +479,10 @@ int main(int argc, char** argv) {
             printStatus(step, phi, delta_phi, U, max_min_dist, F_magnitude, computeMaxNeighbors(pairs), computeNumChanges(refresh), alpha, delta_x(x, x_old, D));
         }
 
-            // every save_interval steps, dump out a file
-        if ((step-1) % save_interval == 0 && save_interval > 0) {
+        // every save_interval steps, dump out a file
+        if (save_interval > 0)
+        {
+        if ((step-1) % save_interval == 0) {
             std::ostringstream oss;
             oss << outPath
                 << "_"
@@ -491,6 +493,7 @@ int main(int argc, char** argv) {
 
             std::string filename = oss.str(); 
             writePositions(filename, x, D);
+        }
         }
         
     }
