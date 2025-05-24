@@ -1,3 +1,5 @@
+[🏠 Home](https://kd-physics.github.io/)
+
 # N‑Dimensional Random Close Packing Generator
 
 ![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)
