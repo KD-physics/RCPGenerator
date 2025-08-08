@@ -1,0 +1,541 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>2D Disk RCP – Soft Potential + ADAM</title>
+  <!-- Tailwind via CDN -->
+  <script src="https://cdn.tailwindcss.com"></script>
+  <!-- React 18 + ReactDOM 18 UMD -->
+  <script crossorigin src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+  <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+  <!-- Babel (for in-browser JSX transform) -->
+  <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+  <style>
+    html, body { height: 100%; }
+  </style>
+</head>
+<body class="min-h-screen bg-slate-900 text-slate-100">
+  <div id="root"></div>
+
+  <script type="text/babel">
+    const { useEffect, useMemo, useRef, useState } = React;
+
+    // ========================= Utilities =========================
+    function rand() { return Math.random(); }
+    function mod(a, n) { return ((a % n) + n) % n; }
+
+    // Map log slider [0,1] -> [1e-7, 1e-3] (legacy tests)
+    function sliderToLog(v01) { const lo = -7, hi = -3; const e = lo + (hi - lo) * v01; return Math.pow(10, e); }
+    // Separate mappings per requirements
+    function sliderToLogLR(v01) { const lo = -6, hi = -2; const e = lo + (hi - lo) * v01; return Math.pow(10, e); }
+    function sliderToLogMu(v01) { const lo = -5, hi = -2; const e = lo + (hi - lo) * v01; return Math.pow(10, e); }
+
+    // Distribution helpers
+    function sampleDiameters(N, dist, p1, p2) {
+      const d = new Array(N);
+      if (dist === 'Monodisperse') {
+        const D = Math.max(1e-6, p1); // p1 = diameter
+        d.fill(D);
+      } else if (dist === 'Uniform') {
+        // p1 = Dmin, p2 = Dmax
+        const Dmin = Math.max(1e-6, Math.min(p1, p2));
+        const Dmax = Math.max(Dmin + 1e-6, Math.max(p1, p2));
+        for (let i = 0; i < N; i++) d[i] = Dmin + rand() * (Dmax - Dmin);
+      } else if (dist === 'Lognormal') {
+        // p1 = median diameter (m), p2 = log-std (sigma of ln)
+        const m = Math.max(1e-6, p1);
+        const s = Math.max(1e-6, p2);
+        for (let i = 0; i < N; i++) {
+          const u1 = rand() || 1e-12; const u2 = rand();
+          const z = Math.sqrt(-2 * Math.log(u1)) * Math.cos(2 * Math.PI * u2);
+          d[i] = m * Math.exp(s * z);
+        }
+      } else if (dist === 'Gaussian') {
+        // p1 = mean diameter, p2 = std dev; truncate at > 1e-6
+        const mu = Math.max(1e-6, p1);
+        const sig = Math.max(1e-6, p2);
+        for (let i = 0; i < N; i++) {
+          const u1 = rand() || 1e-12; const u2 = rand();
+          const z = Math.sqrt(-2 * Math.log(u1)) * Math.cos(2 * Math.PI * u2);
+          d[i] = Math.max(1e-6, mu + sig * z);
+        }
+      }
+      return d;
+    }
+
+    // Compute scale s so that s*D0 hits target phi in unit square
+    function scaleForPhi(D0, phiTarget) {
+      const area0 = D0.reduce((acc, D) => acc + Math.PI * (D * 0.5) ** 2, 0);
+      if (area0 === 0) return 1.0;
+      return Math.sqrt((phiTarget * 1.0) / area0);
+    }
+
+    // Minimum-image displacement for PBC on unit square
+    function minImage(dx) {
+      if (dx > 0.5) return dx - 1.0;
+      if (dx < -0.5) return dx + 1.0;
+      return dx;
+    }
+
+    function makeAdam(N) {
+      return {
+        mX: new Float64Array(2 * N),
+        vX: new Float64Array(2 * N),
+        mS: 0,
+        vS: 0,
+        t: 0,
+      };
+    }
+
+    function adamStep(sys, gradX, gradS, lr) {
+      const b1 = 0.9, b2 = 0.999, eps = 1e-8;
+      const { mX, vX } = sys.adam;
+      sys.adam.t += 1;
+      const t = sys.adam.t;
+      const b1t = 1 - Math.pow(b1, t);
+      const b2t = 1 - Math.pow(b2, t);
+
+      for (let i = 0; i < gradX.length; i++) {
+        mX[i] = b1 * mX[i] + (1 - b1) * gradX[i];
+        vX[i] = b2 * vX[i] + (1 - b2) * gradX[i] * gradX[i];
+        const mhat = mX[i] / b1t;
+        const vhat = vX[i] / b2t;
+        sys.x[i] -= lr * mhat / (Math.sqrt(vhat) + eps);
+        sys.x[i] = mod(sys.x[i], 1.0);
+      }
+
+      sys.adam.mS = b1 * sys.adam.mS + (1 - b1) * gradS;
+      sys.adam.vS = b2 * sys.adam.vS + (1 - b2) * gradS * gradS;
+      const mS_hat = sys.adam.mS / b1t;
+      const vS_hat = sys.adam.vS / b2t;
+      sys.s -= lr * mS_hat / (Math.sqrt(vS_hat) + eps);
+      sys.s = Math.max(1e-5, sys.s);
+    }
+
+    function computeEnergyAndGrad(sys, mu, k = 1.0) {
+      const { N, x, D0, s } = sys;
+      const D = new Float64Array(N);
+      for (let i = 0; i < N; i++) D[i] = s * D0[i];
+
+      let E = 0;
+      const gradX = new Float64Array(2 * N);
+      let gradS = 0;
+
+      for (let i = 0; i < N; i++) {
+        const xi = x[2 * i], yi = x[2 * i + 1];
+        const ri = 0.5 * D[i];
+        for (let j = i + 1; j < N; j++) {
+          const xj = x[2 * j], yj = x[2 * j + 1];
+          const rj = 0.5 * D[j];
+          let dx = xi - xj; dx = minImage(dx);
+          let dy = yi - yj; dy = minImage(dy);
+          const r = Math.hypot(dx, dy) + 1e-12;
+          const R = ri + rj;
+          const overlap = R - r;
+          if (overlap > 0) {
+            const e = 0.5 * k * overlap * overlap;
+            E += e;
+            const pref = k * overlap / r;
+            gradX[2 * i]     -= pref * dx;
+            gradX[2 * i + 1] -= pref * dy;
+            gradX[2 * j]     += pref * dx;
+            gradX[2 * j + 1] += pref * dy;
+            const gDi = 0.5 * k * overlap;
+            gradS += gDi * D0[i] + gDi * D0[j];
+          }
+        }
+      }
+
+      const sumD0 = D0.reduce((a, v) => a + v, 0);
+      E += -mu * s * sumD0;
+      gradS += -mu * sumD0;
+
+      return { E, gradX, gradS };
+    }
+
+    function tryPlaceNonOverlapping(N, D, maxTriesPerParticle = 5000) {
+      const x = new Float64Array(2 * N);
+      for (let i = 0; i < N; i++) {
+        const ri = 0.5 * D[i];
+        let placed = false;
+        for (let t = 0; t < maxTriesPerParticle; t++) {
+          const xi = rand();
+          const yi = rand();
+          let ok = true;
+          for (let j = 0; j < i; j++) {
+            const rj = 0.5 * D[j];
+            let dx = xi - x[2 * j]; dx = minImage(dx);
+            let dy = yi - x[2 * j + 1]; dy = minImage(dy);
+            const r = Math.hypot(dx, dy);
+            if (r < ri + rj) { ok = false; break; }
+          }
+          if (ok) { x[2 * i] = xi; x[2 * i + 1] = yi; placed = true; break; }
+        }
+        if (!placed) return null;
+      }
+      return x;
+    }
+
+    function scaleForPhiAndPlace(N, dist, p1, p2, phi) {
+      let D0 = sampleDiameters(N, dist, p1, p2);
+      let s = scaleForPhi(D0, phi);
+      let x = null;
+      let sAttempt = s;
+      for (let tries = 0; tries < 8; tries++) {
+        const Dtry = D0.map(d => d * sAttempt);
+        x = tryPlaceNonOverlapping(N, Dtry);
+        if (x) { return { x, D0: new Float64Array(D0), s: sAttempt }; }
+        sAttempt *= 0.95;
+      }
+      const sFinal = Math.min(s, 0.9 * s);
+      const Dfinal = D0.map(d => d * sFinal);
+      x = tryPlaceNonOverlapping(N, Dfinal, 10000);
+      if (!x) throw new Error("Failed to place non-overlapping disks. Try lower initial \u03C6 or fewer particles.");
+      return { x, D0: new Float64Array(D0), s: sFinal };
+    }
+
+    function computePhi(sys) {
+      let A = 0;
+      for (let i = 0; i < sys.N; i++) {
+        const r = 0.5 * sys.D0[i] * sys.s;
+        A += Math.PI * r * r;
+      }
+      return A;
+    }
+
+    function App() {
+      const [N, setN] = useState(128);
+      const [phi, setPhi] = useState(0.45);
+      const [dist, setDist] = useState('Lognormal');
+      const [p1, setP1] = useState(0.02);
+      const [p2, setP2] = useState(0.02);
+      const [muSlider, setMuSlider] = useState(0.5);
+      const [lrSlider, setLrSlider] = useState(0.5);
+      const mu = useMemo(() => sliderToLogMu(muSlider), [muSlider]);
+      const lr = useMemo(() => sliderToLogLR(lrSlider), [lrSlider]);
+
+      const [sys, setSys] = useState(null);
+      const [energy, setEnergy] = useState(0);
+      const [running, setRunning] = useState(false);
+      const [phiLive, setPhiLive] = useState(0);
+
+      const canvasRef = useRef(null);
+      const rafRef = useRef(null);
+      const wrapperRef = useRef(null);
+
+      const palette = useMemo(() => [
+        { fill: '#ffd16655', stroke: '#ffd166' },
+        { fill: '#06d6a055', stroke: '#06d6a0' },
+        { fill: '#118ab255', stroke: '#118ab2' },
+        { fill: '#ef476f55', stroke: '#ef476f' },
+      ], []);
+
+      function onGenerate() {
+        try {
+          const { x, D0, s } = scaleForPhiAndPlace(N, dist, p1, p2, phi);
+          const colors = new Uint8Array(N);
+          for (let i = 0; i < N; i++) colors[i] = Math.floor(Math.random() * 4);
+          const sNew = { N, x, D0, s, colors, adam: makeAdam(N) };
+          const { E } = computeEnergyAndGrad(sNew, mu);
+          setEnergy(E);
+          setSys(sNew);
+          setPhiLive(computePhi(sNew));
+          setRunning(false);
+        } catch (e) {
+          alert(e?.message ?? String(e));
+        }
+      }
+
+      useEffect(() => {
+        if (!running || !sys) return;
+        const step = () => {
+          if (!sys) return;
+          const iters = 4;
+          for (let k = 0; k < iters; k++) {
+            const { E, gradX, gradS } = computeEnergyAndGrad(sys, mu);
+            setEnergy(E);
+            adamStep(sys, gradX, gradS, lr);
+          }
+          setPhiLive(computePhi(sys));
+          draw();
+          rafRef.current = requestAnimationFrame(step);
+        };
+        rafRef.current = requestAnimationFrame(step);
+        return () => { if (rafRef.current) cancelAnimationFrame(rafRef.current); };
+      }, [running, sys, mu, lr]);
+
+      function draw() {
+        const canvas = canvasRef.current; if (!canvas) return;
+        const ctx = canvas.getContext('2d'); if (!ctx) return;
+        const W = canvas.width, H = canvas.height;
+        ctx.clearRect(0, 0, W, H);
+        ctx.fillStyle = '#0b1020';
+        ctx.fillRect(0, 0, W, H);
+
+        if (!sys) return;
+        const pad = 10; const S = Math.min(W, H) - 2 * pad; const ox = (W - S) / 2; const oy = (H - S) / 2;
+        ctx.strokeStyle = '#1f2a44';
+        ctx.lineWidth = 1;
+        ctx.strokeRect(ox, oy, S, S);
+
+        ctx.lineWidth = 1.5;
+        for (let i = 0; i < sys.N; i++) {
+          const xi = sys.x[2 * i];
+          const yi = sys.x[2 * i + 1];
+          const r = 0.5 * sys.D0[i] * sys.s;
+          const px = (u) => ox + (u) * S;
+          const py = (v) => oy + (v) * S;
+          const pr = (rr) => rr * S;
+          const c = palette[sys.colors[i] % 4];
+          const images = [
+            [xi, yi],
+            [xi - 1, yi], [xi + 1, yi],
+            [xi, yi - 1], [xi, yi + 1],
+            [xi - 1, yi - 1], [xi + 1, yi - 1], [xi - 1, yi + 1], [xi + 1, yi + 1],
+          ];
+          for (const [ux, uy] of images) {
+            const cx = px(ux);
+            const cy = py(uy);
+            if (cx + pr(r) < ox || cx - pr(r) > ox + S || cy + pr(r) < oy || cy - pr(r) > oy + S) continue;
+            ctx.beginPath();
+            ctx.arc(cx, cy, pr(r), 0, Math.PI * 2);
+            ctx.fillStyle = c.fill;
+            ctx.fill();
+            ctx.strokeStyle = c.stroke;
+            ctx.stroke();
+          }
+        }
+      }
+
+      useEffect(() => {
+        const onResize = () => {
+          const canvas = canvasRef.current; if (!canvas) return;
+          const wrapper = wrapperRef.current;
+          const rect = wrapper?.getBoundingClientRect();
+          const railWidth = 176; // w-44
+          const gap = 12;        // gap-3
+          const maxCanvas = Math.min((rect?.width ?? 800) - railWidth - gap, 600);
+          const finalSize = Math.max(260, maxCanvas);
+          canvas.width = finalSize * devicePixelRatio;
+          canvas.height = finalSize * devicePixelRatio;
+          canvas.style.width = `${finalSize}px`;
+          canvas.style.height = `${finalSize}px`;
+          draw();
+        };
+        window.addEventListener('resize', onResize);
+        onResize();
+        return () => window.removeEventListener('resize', onResize);
+      }, [sys]);
+
+      useEffect(() => { draw(); });
+
+      function DistParams() {
+        if (dist === 'Monodisperse') {
+          return (
+            <div className="space-y-1">
+              <label className="text-sm">Diameter (initial, unscaled): {p1.toFixed(4)}</label>
+              <input type="range" min={0.002} max={0.08} step={0.001} value={p1}
+                onChange={e => setP1(parseFloat(e.target.value))} className="w-full" />
+            </div>
+          );
+        } else if (dist === 'Uniform') {
+          return (
+            <div className="grid grid-cols-2 gap-3">
+              <div>
+                <label className="text-sm">D<sub>min</sub>: {p1.toFixed(4)}</label>
+                <input type="range" min={0.002} max={0.08} step={0.001} value={p1}
+                  onChange={e => setP1(parseFloat(e.target.value))} className="w-full" />
+              </div>
+              <div>
+                <label className="text-sm">D<sub>max</sub>: {p2.toFixed(4)}</label>
+                <input type="range" min={Math.max(0.003, p1 + 0.001)} max={0.12} step={0.001} value={p2}
+                  onChange={e => setP2(parseFloat(e.target.value))} className="w-full" />
+              </div>
+            </div>
+          );
+        } else if (dist === 'Lognormal') {
+          return (
+            <div className="grid grid-cols-2 gap-3">
+              <div>
+                <label className="text-sm">Median D: {p1.toFixed(4)}</label>
+                <input type="range" min={0.005} max={0.05} step={0.001} value={p1}
+                  onChange={e => setP1(parseFloat(e.target.value))} className="w-full" />
+              </div>
+              <div>
+                <label className="text-sm">log-σ: {p2.toFixed(4)}</label>
+                <input type="range" min={0.01} max={0.8} step={0.001} value={p2}
+                  onChange={e => setP2(parseFloat(e.target.value))} className="w-full" />
+              </div>
+            </div>
+          );
+        } else { // Gaussian
+          return (
+            <div className="grid grid-cols-2 gap-3">
+              <div>
+                <label className="text-sm">Mean D: {p1.toFixed(4)}</label>
+                <input type="range" min={0.005} max={0.08} step={0.001} value={p1}
+                  onChange={e => setP1(parseFloat(e.target.value))} className="w-full" />
+              </div>
+              <div>
+                <label className="text-sm">Std D: {p2.toFixed(4)}</label>
+                <input type="range" min={0.0005} max={0.04} step={0.0005} value={p2}
+                  onChange={e => setP2(parseFloat(e.target.value))} className="w-full" />
+              </div>
+            </div>
+          );
+        }
+      }
+
+      function onDownloadCSV(current) {
+        if (!current) return;
+        const rows = ["id,x,y,diameter"];
+        for (let i = 0; i < current.N; i++) {
+          const id = i;
+          const x = current.x[2 * i].toFixed(6);
+          const y = current.x[2 * i + 1].toFixed(6);
+          const D = (current.s * current.D0[i]).toFixed(6);
+          rows.push(`${id},${x},${y},${D}`);
+        }
+        const blob = new Blob([rows.join('\n')], { type: 'text/csv;charset=utf-8;' });
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement('a');
+        a.href = url;
+        a.download = 'packing.csv';
+        document.body.appendChild(a);
+        a.click();
+        document.body.removeChild(a);
+        setTimeout(() => URL.revokeObjectURL(url), 1000);
+      }
+
+      return (
+        <div className="min-h-screen bg-slate-900 text-slate-100 p-4">
+          <div className="max-w-6xl mx-auto grid md:grid-cols-[minmax(0,1fr),360px] gap-6 items-start">
+            <div className="space-y-3">
+              <h1 className="text-2xl font-semibold">2D Disk Random Close Packing – Soft Potential + ADAM</h1>
+
+              <div ref={wrapperRef} className="flex flex-row gap-3 items-stretch">
+                <div className="rounded-2xl bg-slate-800/70 p-3 shadow flex-1">
+                  <canvas ref={canvasRef} className="rounded-xl border border-slate-700 w-full h-full" />
+                </div>
+
+                <div className="rounded-2xl bg-slate-800/70 p-3 shadow w-44">
+                  <div className="rounded-xl bg-slate-900/40 p-2 h-full flex flex-col justify-between">
+                    <div className="grid grid-cols-2 gap-2 place-items-stretch">
+                      <div className="flex flex-col items-center">
+                        <span className="text-[10px]">μ = {mu.toExponential(2)}</span>
+                        <div className="relative mt-1 h-56 w-10 overflow-hidden">
+                          <input type="range" min={0} max={1} step={0.001} value={muSlider}
+                            onChange={e => setMuSlider(parseFloat(e.target.value))}
+                            className="absolute top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2 w-56 h-3 -rotate-90" />
+                        </div>
+                      </div>
+                      <div className="flex flex-col items-center">
+                        <span className="text-[10px]">LR = {lr.toExponential(2)}</span>
+                        <div className="relative mt-1 h-56 w-10 overflow-hidden">
+                          <input type="range" min={0} max={1} step={0.001} value={lrSlider}
+                            onChange={e => setLrSlider(parseFloat(e.target.value))}
+                            className="absolute top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2 w-56 h-3 -rotate-90" />
+                        </div>
+                      </div>
+                    </div>
+                    <div className="grid grid-cols-2 gap-2 mt-3">
+                      <button onClick={() => setRunning(true)}
+                        className="rounded-lg bg-emerald-600 hover:bg-emerald-500 active:bg-emerald-700 transition px-2 py-2 text-sm font-medium">Optimize</button>
+                      <button onClick={() => setRunning(false)}
+                        className="rounded-lg bg-rose-600 hover:bg-rose-500 active:bg-rose-700 transition px-2 py-2 text-sm font-medium">Stop</button>
+                    </div>
+                  </div>
+                </div>
+              </div>
+
+              <div className="flex flex-wrap gap-4 text-sm">
+                <div className="px-3 py-2 bg-slate-800/70 rounded-xl">N: <span className="font-mono">{sys?.N ?? N}</span></div>
+                <div className="px-3 py-2 bg-slate-800/70 rounded-xl">Energy: <span className="font-mono">{energy.toExponential(3)}</span></div>
+                <div className="px-3 py-2 bg-slate-800/70 rounded-xl">μ: <span className="font-mono">{mu.toExponential(2)}</span></div>
+                <div className="px-3 py-2 bg-slate-800/70 rounded-xl">LR: <span className="font-mono">{lr.toExponential(2)}</span></div>
+                <div className="px-3 py-2 bg-slate-800/70 rounded-xl">Scale s: <span className="font-mono">{sys ? sys.s.toFixed(4) : '-'}</span></div>
+                <div className="px-3 py-2 bg-slate-800/70 rounded-xl">φ: <span className="font-mono">{sys ? phiLive.toFixed(3) : '-'}</span></div>
+                <div className="px-3 py-2 bg-slate-800/70 rounded-xl">Running: <span className="font-mono">{running ? 'yes' : 'no'}</span></div>
+              </div>
+              <p className="text-xs text-slate-400 max-w-3xl">
+                Potential: E = ∑<sub>i&lt;j</sub> ½ k·δ<sub>ij</sub><sup>2</sup> for overlaps (δ = R<sub>i</sub>+R<sub>j</sub>−r<sub>ij</sub> &gt; 0), periodic BC with minimum-image convention.
+                Growth: −μ · s · ∑ D<sub>0,i</sub>. Optimization updates positions and the single global scale s; diameter ratios stay fixed.
+              </p>
+            </div>
+
+            <div className="space-y-4">
+              <div className="rounded-2xl bg-slate-800/70 p-4 shadow space-y-4">
+                <h2 className="text-lg font-semibold">Initialization</h2>
+                <div>
+                  <label className="text-sm">Number of particles: {N}</label>
+                  <input type="range" min={4} max={1024} step={1} value={N}
+                    onChange={e => setN(parseInt(e.target.value))} className="w-full" />
+                </div>
+                <div>
+                  <label className="text-sm">Initial packing fraction φ: {phi.toFixed(3)}</label>
+                  <input type="range" min={0.10} max={0.55} step={0.005} value={phi}
+                    onChange={e => setPhi(parseFloat(e.target.value))} className="w-full" />
+                  <p className="text-[11px] text-slate-400 mt-1">Tip: φ ≲ 0.5 is easier to place without overlaps (RSA-like).</p>
+                </div>
+                <div>
+                  <label className="text-sm">Diameter distribution</label>
+                  <select value={dist} onChange={e => setDist(e.target.value)}
+                    className="w-full mt-1 rounded-lg bg-slate-900 border border-slate-700 px-3 py-2">
+                    <option>Monodisperse</option>
+                    <option>Uniform</option>
+                    <option>Lognormal</option>
+                    <option>Gaussian</option>
+                  </select>
+                </div>
+                <DistParams />
+                <button onClick={onGenerate}
+                  className="w-full rounded-xl bg-blue-600 hover:bg-blue-500 active:bg-blue-700 transition px-4 py-2 font-medium">
+                  Generate Initial Packing
+                </button>
+              </div>
+
+              <div className="rounded-2xl bg-slate-800/70 p-4 shadow space-y-4">
+                <h2 className="text-lg font-semibold">Tools</h2>
+                <button onClick={() => {
+                  const results = [];
+                  const push = (name, ok, msg='') => {
+                    const line = `${ok ? '✅' : '❌'} ${name}${msg ? ' — ' + msg : ''}`;
+                    console[ok ? 'log' : 'error'](line);
+                    results.push(line);
+                  };
+                  // Test examples (subset to avoid blocking UI)
+                  const a = sliderToLogLR(0), b = sliderToLogLR(1);
+                  push('LR bounds', Math.abs(a - 1e-6) < 1e-8 && Math.abs(b - 1e-2) < 1e-4, `a=${a}, b=${b}`);
+                  alert(results.join('\n'));
+                }}
+                  className="w-full rounded-xl bg-slate-700 hover:bg-slate-600 active:bg-slate-800 transition px-4 py-2 font-medium">
+                  Run Built-in Tests (console + alert)
+                </button>
+                <button onClick={() => onDownloadCSV(sys)} disabled={!sys || running}
+                  className="w-full rounded-xl bg-indigo-600 hover:bg-indigo-500 active:bg-indigo-700 disabled:opacity-50 transition px-4 py-2 font-medium">
+                  Download positions & diameters (CSV)
+                </button>
+              </div>
+
+              <div className="rounded-2xl bg-slate-800/70 p-4 shadow space-y-2 text-sm">
+                <h2 className="text-base font-semibold">Notes</h2>
+                <ul className="list-disc ml-5 space-y-1 text-slate-300">
+                  <li>Periodic boundary conditions via minimum-image convention.</li>
+                  <li>Initialization sets D = s·D0 to meet target φ; optimization preserves D0 ratios.</li>
+                  <li>Energy: overlaps (quadratic) + growth term −μ·s·∑D0.</li>
+                  <li>ADAM updates positions and global scale s; s is constrained ≥ 1e−5.</li>
+                  <li>Visualization draws edge-ghosts so wrapped disks appear continuous.</li>
+                </ul>
+              </div>
+            </div>
+          </div>
+        </div>
+      );
+    }
+
+    const root = ReactDOM.createRoot(document.getElementById('root'));
+    root.render(<App />);
+  </script>
+</body>
+</html>
