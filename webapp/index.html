@@ -523,7 +523,7 @@
                 <ul className="list-disc ml-5 space-y-1 text-slate-300">
                   <li>First choose system (particle) settings, then press Generate Initial Packing. Then press Pack, and adjust sliders mu and lr to experiment with packing protocol.</li>
                   <li>When satisfied, press stop. You can then download particle positions and diameters.</li>
-                  <li>mu = determines amount of accepatable particle-particle overlap.</li>
+                  <li>mu influences rate at which particles adjust diameters. Also larger mu lead to larger particle-particle overlaps.Typically you start with a larger mu and lower it to settle packing into rcp state.</li>
                   <li>lr = learning rate which scales step size between iterations.</li>
                   <li>Initialization sets D = s·D0 to meet target packing fraction φ; optimization preserves D0 ratios.</li>
                   <li>Energy = soft potential overlaps (quadratic) + particle pressure like term (particle size growth/shrinkage term) −μ·s·∑D0.</li>
