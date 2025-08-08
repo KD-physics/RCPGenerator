@@ -441,7 +441,7 @@
                     </div>
                     <div className="grid grid-cols-2 gap-2 mt-3">
                       <button onClick={() => setRunning(true)}
-                        className="rounded-lg bg-emerald-600 hover:bg-emerald-500 active:bg-emerald-700 transition px-2 py-2 text-sm font-medium">Optimize</button>
+                        className="rounded-lg bg-emerald-600 hover:bg-emerald-500 active:bg-emerald-700 transition px-2 py-2 text-sm font-medium">Pack</button>
                       <button onClick={() => setRunning(false)}
                         className="rounded-lg bg-rose-600 hover:bg-rose-500 active:bg-rose-700 transition px-2 py-2 text-sm font-medium">Stop</button>
                     </div>
@@ -469,7 +469,7 @@
                 <h2 className="text-lg font-semibold">Initialization</h2>
                 <div>
                   <label className="text-sm">Number of particles: {N}</label>
-                  <input type="range" min={4} max={1024} step={1} value={N}
+                  <input type="range" min={4} max={2048} step={1} value={N}
                     onChange={e => setN(parseInt(e.target.value))} className="w-full" />
                 </div>
                 <div>
@@ -519,13 +519,16 @@
               </div>
 
               <div className="rounded-2xl bg-slate-800/70 p-4 shadow space-y-2 text-sm">
-                <h2 className="text-base font-semibold">Notes</h2>
+                <h2 className="text-base font-semibold">Overview</h2>
                 <ul className="list-disc ml-5 space-y-1 text-slate-300">
-                  <li>Periodic boundary conditions via minimum-image convention.</li>
-                  <li>Initialization sets D = s·D0 to meet target φ; optimization preserves D0 ratios.</li>
-                  <li>Energy: overlaps (quadratic) + growth term −μ·s·∑D0.</li>
+                  <li>First choose system (particle) settings, then press Generate Initial Packing. Then press Pack, and adjust sliders mu and lr to experiment with packing protocol.</li>
+                  <li>When satisfied, press stop. You can then download particle positions and diameters.</li>
+                  <li>mu = determines amount of accepatable particle-particle overlap.</li>
+                  <li>lr = learning rate which scales step size between iterations.</li>
+                  <li>Initialization sets D = s·D0 to meet target packing fraction φ; optimization preserves D0 ratios.</li>
+                  <li>Energy = soft potential overlaps (quadratic) + particle pressure like term (particle size growth/shrinkage term) −μ·s·∑D0.</li>
+                  <li>Particle pressure like term (particle size growth/shrinkage term) = −μ·s·∑D0, s is scaling initial diameters D0.</li>
                   <li>ADAM updates positions and global scale s; s is constrained ≥ 1e−5.</li>
-                  <li>Visualization draws edge-ghosts so wrapped disks appear continuous.</li>
                 </ul>
               </div>
             </div>
