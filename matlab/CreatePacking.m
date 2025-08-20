@@ -1,13 +1,11 @@
-function [x, D, U_history, phi_history, F_history] = CreatePacking(x0, D, Box, walls, fix_height, verbose)
+function [x, D, U_history, phi_history, F_history] = CreatePacking2(x0, D, Box, walls, fix_height, verbose)
 % Optimizes particle packing using the Adam algorithm in ND.
 %
 % INPUTS:
-%   x0          : [N x Ndim] matrix of initial particle positions.
-%   D           : [N x 1] array of particle diameters.
-%   Box         : [1 x Ndim] array of container dimensions in each dimension.
-%   walls       : [1 x Ndim] array of boundary condistions. 0 for perioidc, 1 for hard.
-%   fix_height  : Last dimension constrainted to maintain initial Box(end)/D(1) ratio
-%   verbose     : Boolean flag for progress display (default: false).
+%   x0       : [N x Ndim] matrix of initial particle positions.
+%   D        : [N x 1] array of particle diameters.
+%   Box      : [1 x Ndim] array of periodic box dimensions in each dimension.
+%   verbose  : Boolean flag for progress display (default: false).
 %
 % OUTPUTS:
 %   x         : [N x Ndim] final particle positions.
@@ -20,9 +18,8 @@ function [x, D, U_history, phi_history, F_history] = CreatePacking(x0, D, Box, w
 % - Utilizes an adaptive adjustment to the packing fraction (phi).
 % - The optimization terminates when phi changes by a negligible amount.
 % 
-% History 
-%   - Created December 14, 2024
-%   - Last Update May 11, 2025
+% Last Update
+%   - December 14, 2024
 %   - Kenneth Desmond
 %
     
@@ -39,7 +36,8 @@ function [x, D, U_history, phi_history, F_history] = CreatePacking(x0, D, Box, w
     N = size(x0, 1); % Number of particles
     Ndim = size(x0, 2); % Number of dimensions
     L = Box; % Box dimensions in each direction
-    
+    L0 = L;
+
     % Default verbosity
     if nargin < 4
         walls = zeros(1,Ndim);
@@ -94,6 +92,13 @@ function [x, D, U_history, phi_history, F_history] = CreatePacking(x0, D, Box, w
     m_hat = zeros(N, Ndim); 
     v_hat = zeros(N, Ndim); 
     
+    kappa = 1;
+    dkappa = 0;
+    m_kappa = 0; 
+    v_kappa = 0; 
+    m_hat_kappa = 0; 
+    v_hat_kappa = 0; 
+    
     
     %%%%%%%%%%%%%%%%%%
     %%% Initialize Particle Diameters
@@ -111,7 +116,7 @@ function [x, D, U_history, phi_history, F_history] = CreatePacking(x0, D, Box, w
 
     phi = 0.15; % Initial packing fraction
     if Ndim == 2; phi = 0.76; end % Initial packing fraction
-    if Ndim == 3; phi = 0.33; end % Initial packing fraction
+    if Ndim == 3; phi = 0.45; end % Initial packing fraction
     if Ndim == 4; phi = 0.15; end % Initial packing fraction
     if Ndim == 5; phi = 0.1; end % Initial packing fraction
     if Ndim > 5 ; phi = 0.1/sqrt(Ndim); end % Initial packing fraction
@@ -152,14 +157,23 @@ function [x, D, U_history, phi_history, F_history] = CreatePacking(x0, D, Box, w
     phi_min = 0.8;
     if Ndim == 2; phi_min = 0.36; end
     if Ndim == 3; phi_min = 0.61; end
-    if Ndim == 4; phi_min = 0.3; end
+    if Ndim == 4; phi_min = 0.4; end
     if Ndim == 5; phi_min = 0.18; end
         
-    R = 1.00005;
+    R = 1/1.0002;
     
     %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
     %%% --- Main Function ---
     %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+
+    DD = D;
+    N_steps = 150000;
+    mu = 5E-4;
+    mu_flag = 1;
+    alpha = 0.003;
+    alpha_max = 0.003;
+    mu_change = 1E9;
+    phi_max = [0,0];
 
     % Diameter Growth and Optimization Loop
     for step = 1:N_steps
@@ -168,36 +182,36 @@ function [x, D, U_history, phi_history, F_history] = CreatePacking(x0, D, Box, w
         %%% Set Optimizer Given Current Conditions
         %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
     
-        if dphi ~= 0
-            if verbose; fprintf("Step %d: Adjusting phi %.3e\n",step, dphi); end        
-            if ~strcmp(method, 'ADAM') && verbose
-                fprintf('Swithcing to Method: %s\n', 'Adam')
-            end
-            method = 'ADAM';
-            LastPhiUpdate = step;
-            if dphi > 0
-                alpha = min(alpha*1.25, alpha_max);
-            end
-        end
-    
-    
-        if step - LastPhiUpdate > 2500 && strcmp(method, 'ADAM')
-            if verbose
-                fprintf('Swithcing to Method: %s\n', 'AMSGrad')
-            end
-            method = 'AMSGrad';
-        end
-    
-        if step - LastPhiUpdate > 4000 && strcmp(method, 'AMSGrad')
-            if verbose
-                fprintf('Swithcing to Method: %s\n', 'Verlet')
-            end
-            method = 'Verlet';
-    
-            v_verlet(:) = 0;
-            a(:) = 0;
-            a_old(:) = 0;
-        end
+        % if dphi ~= 0
+        %     if verbose; fprintf("Step %d: Adjusting phi %.3e\n",step, dphi); end        
+        %     if ~strcmp(method, 'ADAM') && verbose
+        %         fprintf('Swithcing to Method: %s\n', 'Adam')
+        %     end
+        %     method = 'ADAM';
+        %     LastPhiUpdate = step;
+        %     if dphi > 0
+        %         alpha = min(alpha*1.25, alpha_max);
+        %     end
+        % end
+        % 
+        % 
+        % if step - LastPhiUpdate > 2500 && strcmp(method, 'ADAM')
+        %     if verbose
+        %         fprintf('Swithcing to Method: %s\n', 'AMSGrad')
+        %     end
+        %     method = 'AMSGrad';
+        % end
+        % 
+        % if step - LastPhiUpdate > 4000 && strcmp(method, 'AMSGrad')
+        %     if verbose
+        %         fprintf('Swithcing to Method: %s\n', 'Verlet')
+        %     end
+        %     method = 'Verlet';
+        % 
+        %     v_verlet(:) = 0;
+        %     a(:) = 0;
+        %     a_old(:) = 0;
+        % end
     
         %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
         %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
@@ -209,41 +223,37 @@ function [x, D, U_history, phi_history, F_history] = CreatePacking(x0, D, Box, w
         % Update timestep for bias correction
         t = t + 1;
     
-        % Decay learning rate
-        alpha = alpha*R;
-    
-        if dphi > 0
-            LastAlphaUpdate = step;
-        end
-        if step - LastAlphaUpdate > 500 && strcmp(method, 'ADAM')
-            trend = mean(U_history(step-450:step-250))/mean(U_history(step-75:step-1));        
-            if trend < .85
-                if verbose; fprintf('Step %d: Lowering Alpha by 2x\n', step); end
+        % % Decay learning rate
+        % alpha = alpha*R;
+        % 
+        % if dphi > 0
+        %     LastAlphaUpdate = step;
+        % end
+        if step - LastAlphaUpdate > 500 && strcmp(method, 'ADAM') && (mu_flag < 1 || phi - phi_history(max([step-250,1])) < 5E-4) && step > 4000
+            trend = mean(F_history(step-450:step-250))/mean(F_history(step-75:step-1));        
+            if trend < 0.85
+                % if verbose; fprintf('Step %d: Lowering Alpha by 2x\n', step); end
                 LastAlphaUpdate = step;
-                alpha = alpha/2.;
-            elseif step - LastAlphaUpdate > 4000
-                if verbose; fprintf('Step %d: Raising Alpha by 1.5x\n', step); end
-                trend = mean(U_history(step-200:step-1))/mean(U_history(step-3000:step-2500));
+                alpha = alpha/1.5;
+            elseif step - LastAlphaUpdate > 1500
+                % if verbose; fprintf('Step %d: Raising Alpha by 1.5x\n', step); end
+                trend = mean(F_history(step-200:step-1))/mean(F_history(step-3000:step-2500));
                 if trend > 0.5
                     LastAlphaUpdate = step;
-                    alpha = alpha*1.5;
+                    alpha = alpha*1.15;
                 end
-                
+
+            end
+            if mu_flag == 1
+                alpha = max([alpha, alpha_max/10]);
             end
         end
-    
-        if mod(step, 15000) == 0
-            alpha = min([alpha_max,100*alpha]);
+
+        alpha = min([alpha*R, alpha_max]);        
+        if mod(step, 500) == 0
+            alpha = min([alpha_max,1.1*alpha]);
         end
-        
-    
-        if alpha < 0.5E-5
-            alpha = alpha_max/10; 
-            % Reset particle positions and moment estimates
-            m = zeros(N, Ndim); % First moment for positions
-            v = zeros(N, Ndim); % Second moment for positions
-            t = 1; % Time step for bias correction
-        end
+
     
         %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
         %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
@@ -252,20 +262,54 @@ function [x, D, U_history, phi_history, F_history] = CreatePacking(x0, D, Box, w
         %%% Updating Phi
         %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
     
-        % First steps are really just getting particles separated and near rcp
-        % We are not jamemd withing 150 steps, so reset delta_phi to delta_phi0
-        if step == 150
-            delta_phi = delta_phi0;
-        end
-    
-        phi = max([phi + dphi, phi_min]);
-        [D, scale] = scale_diametersND(D, phi*phi_modifier, L, fix_height);
-        Dmin = Dmin*scale;
+        % Update Particle Diameters
+        D = DD*kappa;
+        Dmin_latest = min(D);
+
+        % Compute the current total volume of particles (ND hypersphere volume)
+        current_volume = sum((pi^(Ndim/2) / gamma(Ndim/2 + 1)) * (D / 2).^Ndim);
+        
+        % Compute the total box volume
+        box_volume = prod(L);
         if fix_height
-            L(end) = L(end)*scale;
+            L(end) = L0(end)*kappa;
         end
-        phi_history(step) = phi*phi_modifier;
+
+        %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+        %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
     
+        %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+        %%% mu Management
+        %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+        
+        phi = current_volume/box_volume;
+        phi_history(step) = phi/phi_modifier;
+
+
+        if phi > phi_max(1)
+            phi_max = [phi, step];
+        end
+        if step > 500 && mu_flag == 1
+            XX = phi_history(step-250:step);
+            delta_XX = max(XX)-min(XX);
+            if delta_XX < 1E-5 || step - phi_max(2) > max([2000, N/3])
+                mu = mu/10;
+                alpha = alpha/2;
+                mu_flag = 0;
+                mu_change = step;
+            end
+        end
+
+        
+        if step > 500 && mu_flag == 0 && step > mu_change+250
+            XX = phi_history(step-250:step);
+            delta_XX = max(XX)-min(XX);
+            if delta_XX < 1E-6
+                mu = mu/10;
+                mu_flag = -1;
+            end
+        end
+
         %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
         %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
     
@@ -274,13 +318,15 @@ function [x, D, U_history, phi_history, F_history] = CreatePacking(x0, D, Box, w
         %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
     
         % Full rebuild ever 750 steps or Diameters grew too much
-        if mod(step, 750) == 0 || Dmin_last/Dmin > 1.05
+        % if mod(step, 750) == 0 || Dmin_last/Dmin > 1.05
+        if Dmin_latest/Dmin > 1.05
             % reset refresh to 1
             for k = 1:N
                 refresh(k) = 1;
             end
             pairs = GetPairsND_3(N, x, D, L, pairs, refresh); 
             x_last = x;
+            Dmin = min(D);
         else    
             % reset refresh to 0
             for k = 1:N
@@ -300,7 +346,6 @@ function [x, D, U_history, phi_history, F_history] = CreatePacking(x0, D, Box, w
                 pairs = GetPairsND_3(N, x, D, L, pairs, refresh);
             end
         end
-        Dmin_last = Dmin;
         update_flag = false;
     
     
@@ -311,9 +356,21 @@ function [x, D, U_history, phi_history, F_history] = CreatePacking(x0, D, Box, w
         %%% Forces
         %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
     
-        [F, U, min_dist, Lc, z] = GetForcesND_3(pairs, x, D, F, L, walls);
-        F_magnitude = mean(sqrt(sum(F.^2,2)))/Lc/mean(z)*Ndim/sqrt(Ndim); % Compute mean force magnitude for update condition
+        [F, U, min_dist, Lc, z, dkappa, Fmean] = GetForcesND_3(pairs, x, D, F, L, walls, mu);
+        dkappa = dkappa/kappa;
+        %F_magnitude = mean(sqrt(sum(F.^2,2))sqrt(sum(F.^2,2)))/Lc/mean(z)*Ndim/sqrt(Ndim); % Compute mean force magnitude for update condition
+        F_magnitude = sqrt(sum(F.^2,2));        
+        F_magnitude = mean(F_magnitude(F_magnitude > 1E-16))/Fmean/sqrt(Ndim);
         F_history(step) = F_magnitude;
+
+        % Store energy
+        U_history(step) = U;
+        
+        % if F_magnitude < 1E-6 && phi > 0.76
+        % % if max(min_dist(:))/F_magnitude < 1E-2 && phi > 0.76
+        %     mu = mu*0.75;
+        %     % fprintf('step = %d, mu = %.2e \n', step, mu)
+        % end
         
         %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
         %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
@@ -327,17 +384,28 @@ function [x, D, U_history, phi_history, F_history] = CreatePacking(x0, D, Box, w
         v = beta2 * v + (1 - beta2) * (F.^2);
         v_max = max(v_max, v);                     % Element-wise max
     
+        m_kappa = beta1 * m_kappa - (1 - beta1) * dkappa;
+        v_kappa = beta2 * v_kappa + (1 - beta2) * (dkappa.^2);
+        
+
         % AMSGrad: Update maximum second moment estimate
         if strcmp(method, 'AMSGrad')
             v_update = v_max;                            % Use v_max in updates
+            v_update_kappa = v_kappa;
         else
             v_update = v;                                % Use standard v in ADAM
+            v_update_kappa = v_kappa;
         end
     
         % Compute adam bias-corrected moment estimates
         m_hat = m / (1 - beta1^t);
         v_hat = v_update / (1 - beta2^t);
     
+        m_hat_kappa = m_kappa / (1 - beta1^t);
+        v_hat_kappa = v_update_kappa / (1 - beta2^t);
+
+        kappa = kappa - alpha * m_hat_kappa ./ (sqrt(v_hat_kappa) + epsilon);
+
         % Update verlet accelerations
         a = F - verlet_drag * v_verlet;
     
@@ -355,48 +423,18 @@ function [x, D, U_history, phi_history, F_history] = CreatePacking(x0, D, Box, w
         %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
         %%% Termination and phi updating conditions
         %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
-    
-        % Adjust phi step size and direction
-        if U < U_threshold || max(min_dist(:)) < sqrt(U_threshold)*10
-            % Particles are not overlapping sufficiently; increase phi
-            dphi = delta_phi*(1+(rand(1)-0.5)/10);
-            direction_flag = 1;
-            count = count + 1;
-        elseif U > U_threshold && step > 125 && phi > phi_min
-            if F_magnitude < F_tol
-                % Forces balanced, reduce phi
-                if direction_flag == 1
-                    delta_phi = delta_phi * 0.5; % 3/4 the step size on reversal
-                end
-                dphi = -delta_phi/2*(1+(rand(1)-0.5)/10);
-                direction_flag = -1;
-            else
-                dphi = 0;
-            end
-            count = 0;
-        end
-    
-        % % Increase phi step size if no overlap issues persists 
-        if count > 10 && Ndim == 2
-            delta_phi = min(delta_phi * 1.5, delta_phi0);
-            count = 0;
-        end
-    
-        %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
-        %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
-    
-        %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
-        %%% Print some information and terminate
-        %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
-        
-        % Termination condition
-        if delta_phi < 5E-6 && (U < U_threshold || max(min_dist(:)) < sqrt(U_threshold)*10)
+
+
+        if mu_flag == -1 && F_history(step) < 5E-3 && max(min_dist(:)) > 1E-16 && std(phi_history(step-1000:step))/mean(phi_history(step-1000:step)) < 1E-6
             if verbose
                 fprintf('Success: Packing achieved.\n');
+                fprintf('Step %d: Phi = %.6f, mu = %.2e, min_dist = %.2e, |F|/<F> = %.2e, mu = %.2e \n', ...
+                        step, phi_history(step), mu, max(min_dist(:)), F_history(step), mu);
+
             end
             break;
         end
-    
+
         %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
         %%% Positions updates
         %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
@@ -415,23 +453,14 @@ function [x, D, U_history, phi_history, F_history] = CreatePacking(x0, D, Box, w
         %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
         %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
     
-        % Store energy
-        U_history(step) = U;
     
-        if dphi == 0 && delta_x < sqrt(U_threshold)/2500        
-            dphi = -delta_phi/2*(1+(rand(1)-0.5)/10);
-            if delta_phi < 5E-6 && (U < U_threshold || max(min_dist(:)) < sqrt(U_threshold)*10)
-                if verbose
-                    fprintf('Success: Packing achieved.\n');
-                end
-                break;
-            end        
-        end
         % Optional progress display
-        if (step < 100 || mod(step, 100) == 0) && verbose
-            fprintf('Step %d: Phi = %.4f, dPhi = %0.3e, U = %.2e, min_dist = %.2e, |F| = %.2e, Neighbors = %d, N changes = %d, alpha = %.2e, max d = %.2e \n', ...
-                    step, phi*phi_modifier, delta_phi*phi_modifier, U_history(step), max(min_dist(:)), F_history(step), max(pairs(:,1)), sum(refresh), alpha, delta_x);
+        if (mod(step, 500) == 0) && verbose
+            fprintf('Step %d: φ = %.6f, max overlap = %.2e, mu = %.2e, |F|/<F> = %.2e, Neighbors/changes = %d / %d, α = %.2e, max d = %.2e, κ = %.3e \n', ...
+                    step, phi_history(step), max(min_dist(:)), mu, F_history(step), max(pairs(:,1)), sum(refresh), alpha, delta_x, kappa);
         end
+        
+
     end
 
     % Trim histories to actual steps
@@ -592,7 +621,7 @@ function pairs = GetPairsND_3(N, x, D, L, pairs, refresh)
                     r_c = (D(i)+D(j))/2+t;
                     if abs(dx) > r_c_max  
                         j_list_flag = 0;
-                    elseif j_list_flag %abs(dx) < r_c
+                    elseif j_list_flag && abs(dx) < r_c
                         % Check if within cutoff in x-direction
                         if true %abs(dx) < r_c
                             proceed = true;
@@ -635,7 +664,7 @@ function pairs = GetPairsND_3(N, x, D, L, pairs, refresh)
     %"finished"
 end
 
-function [F, U, min_dist, Lc, z] = GetForcesND_3(pairs, x, D, F, L, walls)
+function [F, U, min_dist, Lc, z, dkappa, Fmean] = GetForcesND_3(pairs, x, D, F, L, walls, mu)
 %GETFORCESND Computes the pairwise forces, energy, and contact count for particles in ND.
 %
 % INPUTS:
@@ -678,10 +707,12 @@ function [F, U, min_dist, Lc, z] = GetForcesND_3(pairs, x, D, F, L, walls)
     %min_dist = 0;
     dx = zeros(1,Ndim);
     F(:) = 0;
+    Fmean = 0;
 
     wall_flag = max(walls);
     circle_flag = walls(1) < 0;
 
+    dkappa = 0;
     % Loop over all interacting pairs
     for i = 1:N
         % Particle indices
@@ -722,7 +753,8 @@ function [F, U, min_dist, Lc, z] = GetForcesND_3(pairs, x, D, F, L, walls)
                         F_mag = -K * (r_ij / d_ij - 1);
             
                         % Compute potential energy contribution
-                        U = U + (1 - d_ij/r_ij);
+                        % U = U + (1 - d_ij/r_ij);
+                        U = U + K*(d_ij - r_ij)^2/2;
                         count = count + 1;
                         min_dist(i,jdx) = (1 - d_ij/r_ij);
                         Lc = Lc + r_ij;
@@ -731,6 +763,10 @@ function [F, U, min_dist, Lc, z] = GetForcesND_3(pairs, x, D, F, L, walls)
                         F(i, :) = F(i, :) + F_mag * dx; % Force on particle i
                         F(j, :) = F(j, :) - F_mag * dx; % Reaction force on particle j                    
         
+                        dkappa = dkappa + r_ij*(d_ij - r_ij);%2*F_mag*r_ij;
+
+                        Fmean = Fmean + F_mag;
+
                     end
                 end
             end
@@ -750,11 +786,15 @@ function [F, U, min_dist, Lc, z] = GetForcesND_3(pairs, x, D, F, L, walls)
                             F_mag = -K * (r_ij / d_ij - 1);
         
                             % Compute potential energy contribution
-                            U = U + (1 - d_ij/r_ij);
+                            U = U + K*(d_ij - r_ij)^2/2;
                             count = count + 1;
         
                             % Update forces in all dimensions
                             F(i, M) = F(i, M) + F_mag * dx(M); % Force on particle i
+                            
+                            dkappa = dkappa + r_ij*(d_ij - r_ij);
+                            Fmean = Fmean + F_mag;
+                            
                         end                
                     end
                 end
@@ -784,19 +824,26 @@ function [F, U, min_dist, Lc, z] = GetForcesND_3(pairs, x, D, F, L, walls)
                 F_mag = -K * abs(r_ij / d_ij - 1);
 
                 % Compute potential energy contribution
-                U = U + (1 - d_ij/r_ij);
+                U = U + K*(d_ij - r_ij)^2/2;
                 count = count + 1;
 
                 % Update forces in all dimensions
                 for M=1:(-walls(1))
                     F(i, M) = F(i, M) + F_mag * dx(M); % Force on particle i
                 end
+                
+                dkappa = dkappa + K*r_ij*(d_ij - r_ij);
+                Fmean = Fmean + F_mag;
+
             end
         end
 
     end
-    U = (U/count)^2;
+    U = U^2 - mu*sum(D);
     Lc = Lc/count;
+    dkappa = dkappa + mu*sum(D);
+    Fmean = -Fmean/count;
+
 
 end
 

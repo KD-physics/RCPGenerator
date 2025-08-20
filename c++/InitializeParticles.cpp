@@ -59,11 +59,25 @@ std::vector<double> generate_diameter_distribution(
     }
     else if (dist.type == "lognormal") {
         std::lognormal_distribution<> ld(dist.mu, dist.sigma);
-        for (auto &v : D) v = ld(rng);
+        for (auto &v : D) {
+            double tmp = ld(rng);
+            v = std::clamp(tmp, 0.0025, 30.0);
+        }
     }
     else if (dist.type == "flat") {
         std::uniform_real_distribution<> ud(dist.d_min, dist.d_max);
         for (auto &v : D) v = ud(rng);
+        // --- Rescale to ensure min(D) = d_min and max(D) = d_max ---
+        double D_min = *std::min_element(D.begin(), D.end());
+        double D_max = *std::max_element(D.begin(), D.end());
+
+        if (D_max > D_min + 1e-12) {  // avoid divide-by-zero
+            for (size_t i = 0; i < N; ++i) {
+                D[i] = dist.d_min + (D[i] - D_min) * (dist.d_max - dist.d_min) / (D_max - D_min);
+            }
+        } else {
+            std::fill(D.begin(), D.end(), dist.d_min);  // fallback: all equal
+        }          
     }
     else if (dist.type == "powerlaw") {
         std::uniform_real_distribution<> ud(0.0,1.0);
@@ -77,6 +91,19 @@ std::vector<double> generate_diameter_distribution(
                 D[i] = std::pow(top * u + std::pow(dist.d_min, a), 1.0 / a);
             }
         }
+
+        // --- Rescale to ensure min(D) = d_min and max(D) = d_max ---
+        double D_min = *std::min_element(D.begin(), D.end());
+        double D_max = *std::max_element(D.begin(), D.end());
+
+        if (D_max > D_min + 1e-12) {  // avoid divide-by-zero
+            for (size_t i = 0; i < N; ++i) {
+                D[i] = dist.d_min + (D[i] - D_min) * (dist.d_max - dist.d_min) / (D_max - D_min);
+            }
+        } else {
+            std::fill(D.begin(), D.end(), dist.d_min);  // fallback: all equal
+        }        
+
     }
     else if (dist.type == "exponential") {
         double lambda = -std::log(0.5) / (dist.d_max - dist.d_min);
@@ -86,6 +113,18 @@ std::vector<double> generate_diameter_distribution(
             D[i] = dist.d_min - (1.0/lambda) * std::log(1.0 - u);
             if (D[i] > dist.d_max) D[i] = dist.d_max;
         }
+
+        // --- Rescale to ensure min(D) = d_min and max(D) = d_max ---
+        double D_min = *std::min_element(D.begin(), D.end());
+        double D_max = *std::max_element(D.begin(), D.end());
+
+        if (D_max > D_min + 1e-12) {  // avoid divide-by-zero
+            for (size_t i = 0; i < N; ++i) {
+                D[i] = dist.d_min + (D[i] - D_min) * (dist.d_max - dist.d_min) / (D_max - D_min);
+            }
+        } else {
+            std::fill(D.begin(), D.end(), dist.d_min);  // fallback: all equal
+        }           
     }
     else if (dist.type == "weibull") {
         std::weibull_distribution<> wd(dist.shape, dist.scale);
@@ -146,6 +185,11 @@ void initialize_positions_binned(
     size_t NB   = 1u << Ndim;  // 2^Ndim bins by midpoint cut per dim
     std::vector<std::vector<size_t>> bins(NB);
 
+    std::vector<double> bin_size(Ndim);
+    for (size_t d = 0; d < Ndim; ++d)
+        bin_size[d] = box[d] * 0.5;
+
+
     auto getBin = [&](const std::vector<double>& pt){
         size_t id = 0;
         for (size_t d = 0; d < Ndim; ++d)
@@ -156,17 +200,29 @@ void initialize_positions_binned(
     std::mt19937 rng{std::random_device{}()};
     std::uniform_real_distribution<> ud(0.0,1.0);
 
-    // place first particle
-    for (size_t d = 0; d < Ndim; ++d)
-        x[0][d] = ud(rng) * (box[d]-D[0]) + D[0]/2;
-    bins[getBin(x[0])].push_back(0);
+    // place first particle in a random bin
+    std::vector<double> xt0(Ndim);
+    size_t bin_id0 = rng() % NB;
+    for (size_t d = 0; d < Ndim; ++d) {
+        size_t in_bin = (bin_id0 >> d) & 1;
+        double origin = in_bin * bin_size[d];
+        xt0[d] = origin + D[0]/2 + ud(rng) * (bin_size[d] - D[0]);
+        x[0][d] = xt0[d];
+    }
+    bins[bin_id0].push_back(0);
 
+
+    
     size_t count = 1;
     while (count < N) {
         // propose a random position
         std::vector<double> xt(Ndim);
-        for (size_t d = 0; d < Ndim; ++d)
-            xt[d] = ud(rng) * (box[d]-D[count]) + D[count]/2;
+        size_t bin_id = rng() % NB;
+        for (size_t d = 0; d < Ndim; ++d) {
+            size_t in_bin = (bin_id >> d) & 1;
+            double origin = in_bin * bin_size[d];
+            xt[d] = origin + D[count]/2 + ud(rng) * (bin_size[d] - D[count]);
+        }
 
         size_t b = getBin(xt);
         bool ok = true;
@@ -249,27 +305,31 @@ void initialize_positions_naive(
 }
 
 void print_help(const char* prog) {
-    std::cout
-        << "Usage: " << prog << " --phi <0-1> --N <#particles> --Ndim <dim>"
-        << " [--box x,y,...] --dist <type> [--param value ...] --fix_height <true/false> \n\n"
-        << "Flags:\n"
-        << "  --phi     target packing fraction (default=0.05)\n"
-        << "  --N       number of particles\n"
-        << "  --Ndim    dimension (>=2)\n"
-        << "  --box     dims (default=1 repeated Ndim)\n"
-        << "  --dist    distribution: mono, bidisperse, gaussian, biGaussian,\n"
-        << "            lognormal, flat, powerlaw, exponential, weibull, custom\n"
-        << "Params for distributions:\n"
-        << "  mono:      --d <diam>\n"
-        << "  bidisperse:--d1 <d1> --d2 <d2> --p <fraction>\n"
-        << "  gaussian:  --mu <mu> --sigma <sigma>\n"
-        << "  biGaussian:--mu1 <mu1> --sigma1 <sig1> --mu2 <mu2> --sigma2 <sig2> --p <p>\n"
-        << "  flat:      --d_min <min> --d_max <max>\n"
-        << "  powerlaw:  --d_min <min> --d_max <max> --exponent <exp>\n"
-        << "  exponential:--d_min <min> --d_max <max>\n"
-        << "  weibull:   --scale <s> --shape <k>\n"
-        << "  custom:    --custom_list <v1,v2,...>\n"
-        << "  --help    show this help\n";
+    std::cout << "Usage: " << prog
+              << " --phi <0-1> --N <#particles> --Ndim <dim>"
+              << " [--box x,y,...] --dist <type> [--param value ...] --fix_height <true/false>\n\n";
+    std::cout << "Flags:\n";
+    std::cout << "  --phi        target packing fraction (default=0.05)\n";
+    std::cout << "  --N          number of particles\n";
+    std::cout << "  --Ndim       dimension (>=2)\n";
+    std::cout << "  --box        box dimensions comma-separated (default=1 repeated Ndim)\n";
+    std::cout << "  --dist       distribution type: mono, bidisperse, gaussian, biGaussian,\n";
+    std::cout << "               lognormal, flat, powerlaw, exponential, weibull, custom\n";
+    std::cout << "  --fix_height fix particle heights? true/false (default=false)\n\n";
+    std::cout << "Params for distributions:\n";
+    std::cout << "  mono:           --d <value>\n";
+    std::cout << "  bidisperse:     --d1 <value> --d2 <value> --p <fraction>\n";
+    std::cout << "  gaussian:       --mu <value> --sigma <value>\n";
+    std::cout << "  biGaussian:     --mu1 <value> --sigma1 <value> --mu2 <value> --sigma2 <value> --p <fraction>\n";
+    std::cout << "  lognormal:      --mu <value> --sigma <value>\n";
+    std::cout << "                  (mu and sigma of underlying normal, diameters = exp(N(mu, sigma^2)))\n";
+    std::cout << "  flat:           --d_min <min> --d_max <max>\n";
+    std::cout << "  powerlaw:       --d_min <min> --d_max <max> --exponent <exp>\n";
+    std::cout << "  exponential:    --d_min <min> --d_max <max>\n";
+    std::cout << "  weibull:        --scale <value> --shape <value>\n";
+    std::cout << "  custom:         --custom <file> (file with N diameters)\n";
+    std::cout << "\n";
+    std::exit(0);
 }
 
 std::vector<double> parse_box(const std::string& s) {

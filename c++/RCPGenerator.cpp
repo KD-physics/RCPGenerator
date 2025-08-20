@@ -10,6 +10,8 @@
 #include <cmath>
 #include <cstdint>
 #include <iomanip>
+#include <thread>
+
 
 //------------------------------------------------------------------------------
 // System parameters (from MATLAB Initialization)
@@ -18,7 +20,7 @@ static constexpr double ALPHA_MAX     = 0.0025;        // Adam learning rate
 static constexpr double BETA1        = 0.9;           // Exponential decay rate for first moment
 static constexpr double BETA2        = 0.999;         // Exponential decay rate for second moment
 static constexpr double EPSILON      = 1e-8;          // Small value to prevent division by zero
-static constexpr size_t N_STEPS      = 150000;         // Max optimization steps
+static constexpr size_t N_STEPS      = 60000;         // Max optimization steps
 static constexpr double DT           = 0.1;           // Time step for Verlet
 static const std::string METHOD      = "ADAM";       // Optimization method
 static const std::vector<uint32_t> MAX_NEIGHBORS = {300, 750, 5500, 5500};
@@ -66,7 +68,9 @@ void printStatus(
     size_t max_neighbors,
     size_t num_changes,
     double alpha,
-    double max_delta_x
+    double max_delta_x,
+    double mu,
+    double kappa
 );
 
 double delta_x(
@@ -132,6 +136,9 @@ void GetForcesND_3(
     std::vector<std::vector<double>>         &min_dist,
     double                                   &max_min_dist, 
     double                                   &Lc,
+    double                                   &Fmean,
+    double                                   mu,
+    double                                   &dkappa,
     std::vector<size_t>                      &z);
 
 void AdamUpdate(
@@ -139,6 +146,7 @@ void AdamUpdate(
     size_t N,
     size_t Ndim,
     const std::vector<std::vector<double>> &F,
+    double dkappa,
     double beta1,
     double beta2,
     size_t t,
@@ -152,7 +160,17 @@ void AdamUpdate(
     std::vector<std::vector<double>> &v_hat,
     std::vector<std::vector<double>> &a,
     std::vector<std::vector<double>> &v_verlet,
-    std::vector<std::vector<double>> &a_old);
+    std::vector<std::vector<double>> &a_old,
+    double                           &m_kappa,
+    double                           &v_kappa,
+    double                           &v_update_kappa,
+    double                           &m_hat_kappa,
+    double                           &v_hat_kappa);
+
+double mean(const std::vector<double>& vec, int start, int end) {
+    double sum = std::accumulate(vec.begin() + start, vec.begin() + end + 1, 0.0);
+    return sum / (end - start + 1);
+}
 
 //------------------------------------------------------------------------------
 int main(int argc, char** argv) {
@@ -177,6 +195,7 @@ int main(int argc, char** argv) {
     size_t N = 0, Ndim = 0;
     std::vector<std::vector<double>> x;
     std::vector<double> D;
+    std::vector<double> D0;
     loadData(filePath, N, Ndim, x, D);
     std::vector<std::vector<double>> x_last = x;
 
@@ -217,15 +236,14 @@ int main(int argc, char** argv) {
     else if (Ndim == 3) phi = 0.33;
     else if (Ndim == 4) phi = 0.15;
     else if (Ndim == 5) phi = 0.10;
-    else if (Ndim > 5)  phi = 0.10 / std::sqrt(double(Ndim));
+    else if (Ndim > 5)  phi = 0.10 / std::pow(2,(Ndim-4));
     double delta_phi0 = DELTA_PHI0;
     double delta_phi = DELTA_PHI0;
     double dphi = 0.0;
     size_t count = 0;
     bool update_flag = false;
     int direction_flag = 0;
-    double U_threshold = (2.5E-4)*(2.5E-4); //% Energy threshold for minimal overlap
-    double F_tol = std::sqrt(U_threshold)/50; //% Force threshold for concluding phi too large and needs to be lowered    
+    double F_magnitude = 0.0;
     // D = scale_diametersND(D, phi, box, Ndim);
     auto [D_scaled, factor] = scale_diametersND(D, phi*phi_modifier, box, Ndim, fix_height);
     if (fix_height){
@@ -236,12 +254,24 @@ int main(int argc, char** argv) {
         }
     }
     D = D_scaled;
+    double coeff = std::pow(M_PI, Ndim / 2.0) / std::tgamma(Ndim / 2.0 + 1.0);
+    double current_volume = 0.0;
+    for (size_t i = 0; i < D.size(); ++i) {
+        current_volume += coeff * std::pow(D[i] / 2.0, Ndim);
+    }
+
+    // 4. Compute total box volume
+    double box_volume = std::accumulate(box.begin(), box.end(), 1.0, std::multiplies<double>());
+    phi = current_volume/box_volume/phi_modifier;
+    phi0 = phi;
+
     double Dmin=0;
     auto it = std::min_element(D.begin(), D.end());
     Dmin = *std::min_element(D.begin(), D.end());
     double Dmin_last = Dmin;
     double max_min_dist = 0;
     if (verbose) std::cout<<"Initial phi0="<<phi0<<std::endl;
+    if (verbose) std::cout << "Allocating Memory" << std::endl;
 
     // 5) Default NeighborMax if unset, based on Ndim
     if (neighborMax == 0) {
@@ -280,6 +310,8 @@ int main(int argc, char** argv) {
         v_verlet(N, std::vector<double>(Ndim,0.0)),
         a_old(N, std::vector<double>(Ndim,0.0));
 
+    double m_kappa = 0, v_kappa = 0, v_update_kappa = 0, m_hat_kappa = 0, v_hat_kappa = 0;
+
     size_t LastPhiUpdate = 0;
     size_t LastAlphaUpdate = 0;
     // Allocate and zero‐initialize U_history to length N_steps
@@ -290,12 +322,43 @@ int main(int argc, char** argv) {
     std::vector<double> F_history(N_steps,   0.0);
 
     double phi_min = 0.8;
-    if (Ndim == 2){ phi_min = 0.80; }
-    if (Ndim == 3){ phi_min = 0.61; }
-    if (Ndim == 4){ phi_min = 0.43; }
-    if (Ndim == 5){ phi_min = 0.28; }
-    if (Ndim > 5){ phi_min = 0.28/(Ndim-4); }
+    if (Ndim == 2){ phi_min = 0.76; }
+    if (Ndim == 3){ phi_min = 0.45; }
+    if (Ndim == 4){ phi_min = 0.15; }
+    if (Ndim == 5){ phi_min = 0.1; }
+    if (Ndim > 5){ phi_min = 0.1/std::pow(2,(Ndim-4)); }
     
+    double dkappa = 1.0;
+    double kappa = 1.0;
+    double mu = 5E-4;
+    int mu_flag = 1;
+    double Fmean = 0.0;
+    double mu_change = 0.;
+
+    std::pair<double, size_t> phi_max = {0.0, 0};  
+
+    D0 = D;
+    // if (Ndim < 5){
+    //     alpha = 0.005;
+    //     alpha_max = 0.005;
+    // }
+    // else{
+    //     alpha = 0.0025;
+    //     alpha_max = 0.0025;
+    // }
+
+    alpha = 0.005;
+    alpha_max = 0.005;    
+    if (Ndim == 2){ alpha = 0.005;  alpha_max = 0.005;}
+    if (Ndim == 3){ alpha = 0.0045; alpha_max = 0.0045;}
+    if (Ndim == 4){ alpha = 0.0035; alpha_max = 0.0035;}
+    if (Ndim == 5){ alpha = 0.0025; alpha_max = 0.0025;}
+    if (Ndim > 5 ){ alpha = 0.0025;  alpha_max = 0.0025;}
+    std::cout << "alpha: " << alpha << std::endl;
+    
+    
+
+
     // ----
 
     // ###################################################
@@ -303,93 +366,156 @@ int main(int argc, char** argv) {
     // ###################################################
 
     // Build and set parameters
+    if (verbose) std::cout << "Building Pairs List" << std::endl;
     GetPairsND_3(N, Ndim, x, D, box, walls, refresh, neighborMax, pairs);
 
-    GetForcesND_3(pairs, x, D, box, walls, F, U, min_dist, max_min_dist, Lc, z); 
+    GetForcesND_3(pairs, x, D, box, walls, F, U, min_dist, max_min_dist, Lc, Fmean, mu, dkappa, z); 
     
+    if (verbose) std::cout << "Starting Packing Optimization" << std::endl;
+
     // AdamStep(method, N, Ndim, F, beta1, beta2, t, dt, verlet_drag, m, v, v_max, v_update, m_hat, v_hat,a, v_verlet, a_old);
 
     size_t steps = 0;
     for (size_t step = 1; step <= N_steps; ++step) {
         // --- Set Optimizer Given Current Conditions ---
         steps = step;
-        if (dphi != 0) {
-            if (method != "ADAM") {
-                method = "ADAM";
-                LastPhiUpdate = step;
-            }
-            if (dphi > 0) {
-                alpha = std::min(alpha * 1.25, alpha_max);
-            }
-        }
-        if (step - LastPhiUpdate > 2500 && method == "ADAM") {
-            method = "AMSGrad";
-        }
-        if (step - LastPhiUpdate > 4000 && method == "AMSGrad") {
-            method = "Verlet";
-            for (size_t k = 0; k < N; ++k) {
-                std::fill(v_verlet[k].begin(), v_verlet[k].end(), 0.0);
-                std::fill(a[k].begin(), a[k].end(), 0.0);
-                std::fill(a_old[k].begin(), a_old[k].end(), 0.0);
-            }
-        }
+
+
+        // if (dphi != 0) {
+        //     if (method != "ADAM") {
+        //         method = "ADAM";
+        //         LastPhiUpdate = step;
+        //     }
+        //     if (dphi > 0) {
+        //         alpha = std::min(alpha * 1.25, alpha_max);
+        //     }
+        // }
+        // if (step - LastPhiUpdate > 2500 && method == "ADAM") {
+        //     method = "AMSGrad";
+        // }
+        // if (step - LastPhiUpdate > 4000 && method == "AMSGrad") {
+        //     method = "Verlet";
+        //     for (size_t k = 0; k < N; ++k) {
+        //         std::fill(v_verlet[k].begin(), v_verlet[k].end(), 0.0);
+        //         std::fill(a[k].begin(), a[k].end(), 0.0);
+        //         std::fill(a_old[k].begin(), a_old[k].end(), 0.0);
+        //     }
+        // }
     
+        // --------------------------------------------
         // --- Learning Rate Management ---
+        // --------------------------------------------
         t += 1;
-        alpha *= R;
-        if (dphi > 0) {
-            LastAlphaUpdate = step;
-        }
-        if (step - LastAlphaUpdate > 500 && method == "ADAM") {
-            double trend1 = mean(U_history, step-450, step-250);
-            double trend2 = mean(U_history, step-75,  step-1);
-            if (trend1 / trend2 < 0.85) {
+
+        if ((step - LastAlphaUpdate > 500) &&
+            (method == "ADAM") &&
+            ((phi - phi_history[std::max<size_t>(step - 250, 1)]) < 5e-4) &&
+            (step > 2500) && step > mu_change + 500) {
+            
+            double trend1 = mean(F_history, step - 450, step - 250) / mean(F_history, step - 75, step - 1);
+            double trend2 = (phi - phi_history[std::max<size_t>(step - 250, 1)]); //mean(phi_history, step - 75, step - 1) - mean(phi_history, step - 450, step - 250);
+            
+            if ((mu_flag < 1 && trend1 < 0.85) || trend2 < -5E-4) {
+                // if (verbose) std::cout << "Step " << step << ": Lowering Alpha by 2x\n";
                 LastAlphaUpdate = step;
-                alpha *= 0.5;
+                alpha /= 1.5;
             }
-            else if (step - LastAlphaUpdate > 4000) {
-                double trend3 = mean(U_history, step-200, step-1);
-                double trend4 = mean(U_history, step-3000, step-2500);
-                if (trend3 / trend4 > 0.5) {
+            else if (mu_flag < 1 && step - LastAlphaUpdate > 1500) {
+                // if (verbose) std::cout << "Step " << step << ": Raising Alpha by 1.5x\n";
+                trend1 = mean(F_history, step - 200, step - 1) / mean(F_history, step - 3000, step - 2500);
+                if (trend1 > 0.5) {
                     LastAlphaUpdate = step;
-                    alpha *= 1.5;
+                    alpha *= 1.15;
                 }
             }
-        }
-        if (step % 15000 == 0) {
-            alpha = std::min(alpha_max, 100*alpha);
-        }
-        if (alpha < 0.5e-5) {
-            alpha = alpha_max/10;
-            for (size_t k = 0; k < N; ++k)
-                std::fill(m[k].begin(), m[k].end(), 0.0),
-                std::fill(v[k].begin(), v[k].end(), 0.0);
-            t = 1;
-        }
-    
-        // --- Updating Phi ---
-        if (step == 150) {
-            delta_phi = delta_phi0;
-        }
-        phi = std::max(phi + dphi, phi_min);
-        // D_new = scale_diametersND(D, phi, box);
-        auto [D_new, scale] = scale_diametersND(D, phi*phi_modifier, box, Ndim, fix_height);
-        if (fix_height){
-            box[Ndim-1] = box[Ndim-1]*scale;
-            for (size_t i = 0; i<N; ++i)
-            {
-                x[i][Ndim-1] = x[i][Ndim-1]*scale;
+
+            if (mu_flag == 1) {
+                alpha = std::max(alpha, alpha_max / 10.0);
             }
         }
-        D = D_new;
-        Dmin *= scale;
-        phi_history[step-1] = phi;
+
+        alpha = std::min(alpha * R, alpha_max);
+
+        if (step % 500 == 0) {
+            alpha = std::min(alpha_max, 1.1 * alpha);
+        }
     
+        // --------------------------------------------
+        // --- Updating Phi ---
+        // --------------------------------------------
+
+        for (size_t i = 0; i < D0.size(); ++i) {
+            D[i] = D0[i] * kappa;
+        }
+        double Dmin_lastest = *std::min_element(D.begin(), D.end());
+
+        coeff = std::pow(M_PI, Ndim / 2.0) / std::tgamma(Ndim / 2.0 + 1.0);
+        current_volume = 0.0;
+        for (size_t i = 0; i < D.size(); ++i) {
+            current_volume += coeff * std::pow(D[i] / 2.0, Ndim);
+        }
+
+        // 4. Compute total box volume
+        box_volume = std::accumulate(box.begin(), box.end(), 1.0, std::multiplies<double>());
+
+        if (fix_height){
+            box[Ndim-1] = box[Ndim-1]*kappa;
+            for (size_t i = 0; i<N; ++i)
+            {
+                x[i][Ndim-1] = x[i][Ndim-1]*kappa;
+            }
+        }
+
+        phi = current_volume/box_volume;
+        phi_history[step-1] = phi/phi_modifier;
+
+
+        // --------------------------------------------
+        // --- Managing mu ---
+        // --------------------------------------------
+        // 1. Track phi_max
+        if (phi > phi_max.first) {
+            phi_max = std::make_pair(phi, step);
+        }
+
+        // 2. First mu adjustment block
+        if ((step > 500 && mu_flag == 1)) {
+            std::vector<double> XX(phi_history.begin() + step - 250, phi_history.begin() + step - 1);
+            double delta_XX = *std::max_element(XX.begin(), XX.end()) - *std::min_element(XX.begin(), XX.end());
+
+            if (delta_XX < 5e-6 || step - phi_max.second > 3500 || (step > std::max(15000, static_cast<int>(N / 3)))) {
+                mu    /= 10.0;
+                alpha /= 2.0;
+                mu_flag = 0;
+                mu_change = step;
+            }
+        }
+
+        // 3. Second and final mu adjustment block
+        if (mu_flag == 0 && step == 45000){alpha = alpha/10;}
+        if (mu_flag == 0 && step == 55000){alpha = alpha/10;}
+        if (mu_flag == 1 && step == 60000){alpha = alpha/10;}
+        if (step > 500 && mu_flag == 0 && step > mu_change + 250) {
+            std::vector<double> XX(phi_history.begin() + step - 250, phi_history.begin() + step - 1);
+            double delta_XX = *std::max_element(XX.begin(), XX.end()) - *std::min_element(XX.begin(), XX.end());
+
+            if (delta_XX < 5e-6) {
+                mu /= 10.0;
+                alpha /= 2.0;
+                mu_flag = -1;
+                mu_change = step;
+            }
+        }
+
+        // --------------------------------------------
         // --- Managing Pairs List ---
-        if (step % 750 == 0 || Dmin_last / Dmin > 1.05) {
+        // --------------------------------------------
+        if (Dmin_lastest / Dmin > 1.05) {
+            if (verbose) std::cout << "Step " << step <<": Full Rebuild of Pairs List Due to Diameter Expansion" << std::endl;
             std::fill(refresh.begin(), refresh.end(), 1u);
             GetPairsND_3(N, Ndim, x, D, box, walls, refresh, neighborMax, pairs);
             x_last = x;
+            Dmin = Dmin_lastest;
         } else {
             std::fill(refresh.begin(), refresh.end(), 0u);
             for (size_t k = 0; k < N; ++k) {
@@ -403,54 +529,88 @@ int main(int argc, char** argv) {
                 GetPairsND_3(N, Ndim, x, D, box, walls, refresh, neighborMax, pairs);
             }
         }
-        Dmin_last = Dmin;
         update_flag = false;
     
+        // --------------------------------------------
         // --- Forces ---
-        GetForcesND_3(pairs, x, D, box, walls, F, U, min_dist, max_min_dist, Lc, z);
-        double F_magnitude = computeMeanForce(F, Lc, z, Ndim);
+        // --------------------------------------------
+        GetForcesND_3(pairs, x, D, box, walls, F, U, min_dist, max_min_dist, Lc, Fmean, mu, dkappa, z);
+        // dkappa = dkappa/kappa;
+        F_magnitude = computeMeanForce(F, Lc, z, Ndim)/Fmean;
         F_history[step-1] = F_magnitude;
  
 
+        // --------------------------------------------
         // --- Optimizer updates ---
+        // --------------------------------------------
         AdamUpdate(method, N, Ndim,
-                 F, beta1, beta2, t, dt, verlet_drag,
+                 F, dkappa, beta1, beta2, t, dt, verlet_drag,
                  m, v, v_max, v_update,
                  m_hat, v_hat,
-                 a, v_verlet, a_old);
+                 a, v_verlet, a_old,
+                 m_kappa, v_kappa, v_update_kappa,
+                 m_hat_kappa, v_hat_kappa);
     
         // --- Termination and phi updating conditions ---
-        if (U < U_threshold || max_min_dist < std::sqrt(U_threshold)*10) {
-            dphi = delta_phi; //* (1 + (randUniform()-0.5)/10);
-            if ( verbose){
-                std::cout << "Increasing phi:" << std::endl;
-                printStatus(step, phi, delta_phi, U, max_min_dist, F_magnitude, computeMaxNeighbors(pairs), computeNumChanges(refresh), alpha, 0);
-            }
-            direction_flag = 1;
-            ++count;
-        } else if (U > U_threshold && step > 125 && phi > phi_min) {
-            if (F_magnitude < F_tol) {
-                if (direction_flag == 1)
-                    delta_phi *= 0.5;
-                dphi = -delta_phi/2; // * (1 + (randUniform()-0.5)/10);
-                direction_flag = -1;
-            } else {
-                dphi = 0;
-            }
-            count = 0;
-        }
-        if (count > 10 && Ndim == 2) {
-            delta_phi = std::min(delta_phi * 1.5, delta_phi0);
-            count = 0;
-        }
+        // if (U < U_threshold || max_min_dist < std::sqrt(U_threshold)*10) {
+        //     dphi = delta_phi; //* (1 + (randUniform()-0.5)/10);
+        //     if ( verbose){
+        //         std::cout << "Increasing phi:" << std::endl;
+        //         printStatus(step, phi, delta_phi, U, max_min_dist, F_magnitude, computeMaxNeighbors(pairs), computeNumChanges(refresh), alpha, 0);
+        //     }
+        //     direction_flag = 1;
+        //     ++count;
+        // } else if (U > U_threshold && step > 125 && phi > phi_min) {
+        //     if (F_magnitude < F_tol) {
+        //         if (direction_flag == 1)
+        //             delta_phi *= 0.5;
+        //         dphi = -delta_phi/2; // * (1 + (randUniform()-0.5)/10);
+        //         direction_flag = -1;
+        //     } else {
+        //         dphi = 0;
+        //     }
+        //     count = 0;
+        // }
+        // if (count > 10 && Ndim == 2) {
+        //     delta_phi = std::min(delta_phi * 1.5, delta_phi0);
+        //     count = 0;
+        // }
     
-        // --- Print / Terminate if converged ---
-        if (delta_phi < 5e-6 &&
-           (U < U_threshold || max_min_dist < std::sqrt(U_threshold)*10)) {
-            break;
-        }
+        // // --- Print / Terminate if converged ---
+        // if (delta_phi < 5e-6 &&
+        //    (U < U_threshold || max_min_dist < std::sqrt(U_threshold)*10)) {
+        //     break;
+        // }
     
+        if (step > 1100){
+            if (mu_flag == -1 &&
+                F_history[step-1] < 5.e-3 &&
+                max_min_dist > 1e-16 && 
+                step > mu_change + 250) {
+                
+                std::vector<double> XX(phi_history.begin() + step - 1000, phi_history.begin() + step - 1);
+                double delta_XX = *std::max_element(XX.begin(), XX.end()) - *std::min_element(XX.begin(), XX.end());
+
+
+                if (delta_XX < 2.5e-6) {
+                    if (verbose) {
+                        std::cout << "Success: Packing achieved.\n";
+                        std::cout << "Step " << step
+                                << ": Phi = " << phi_history[step-1]
+                                << ", mu = " << mu
+                                << ", max overlap = " << max_min_dist
+                                << ", |F|/<F> = " << F_history[step-1]
+                                << ", mu = " << mu << "\n";
+                    }
+                    break;
+                }
+            }
+        }
+
+        // --------------------------------------------
         // --- Positions updates ---
+        // --------------------------------------------
+        kappa = kappa - alpha * m_hat_kappa / (std::sqrt(v_hat_kappa) + epsilon);
         auto x_old = x;
         if (method != "Verlet") {
             for (size_t k = 0; k < N; ++k)
@@ -461,22 +621,35 @@ int main(int argc, char** argv) {
                 for (size_t d = 0; d < Ndim; ++d)
                     x[k][d] += v_verlet[k][d]*dt + 0.5*a_old[k][d]*dt*dt;
         }
+
+        //put particles back into container
         for (size_t k = 0; k < N; ++k)
             for (size_t d = 0; d < Ndim; ++d)
                 x[k][d] = std::fmod(x[k][d] + box[d], box[d]);
     
         U_history[step-1] = U;
     
-        if (dphi == 0 && delta_x(x, x_old, D) < std::sqrt(U_threshold)/2500) {
-            dphi = -delta_phi/2; //* (1 + (randUniform()-0.5)/10);
-            if (delta_phi < 5e-6 &&
-               (U < U_threshold || max_min_dist < std::sqrt(U_threshold)*10)) {
-                break;
-            }
+        if ((step == 25 || step % 500 == 0) && verbose) {
+            // printStatus(step, phi, delta_phi, U, max_min_dist, F_magnitude, computeMaxNeighbors(pairs), computeNumChanges(refresh), alpha, delta_x(x, x_old, D));
+            printStatus(
+                step,
+                phi_history[step-1],
+                delta_phi,
+                U,
+                max_min_dist,
+                F_history[step-1],
+                computeMaxNeighbors(pairs),
+                computeNumChanges(refresh),
+                alpha,
+                delta_x(x, x_old, D),
+                mu,
+                kappa
+            );
         }
-    
-        if ((step < 100 || step % 1000 == 0) && verbose) {
-            printStatus(step, phi, delta_phi, U, max_min_dist, F_magnitude, computeMaxNeighbors(pairs), computeNumChanges(refresh), alpha, delta_x(x, x_old, D));
+
+        // Yield to cpu to let it do other critical task to prevent CLOCK_WATCHDOG_TIMEOUT, UI freeze, or kernel panic
+        if (step % 5000 == 0) {
+            std::this_thread::yield();
         }
 
         // every save_interval steps, dump out a file
@@ -506,6 +679,7 @@ int main(int argc, char** argv) {
         }
         std::cout << "Final Packing Fraction " << phi << std::endl;
         std::cout << "Max overlap: " << max_min_dist << std::endl;
+        std::cout << "|F|/<F>: " << F_magnitude << std::endl;
 
         writePositions(outPath, x, D);
         std::cout << "Output written to " << outPath << ".txt" << std::endl;
@@ -702,6 +876,7 @@ void writePositions(
     const size_t Ndim = x.empty() ? 0 : x[0].size();
 
     std::ofstream fout(outPath);
+    fout << std::setprecision(17); 
     if (!fout) {
         std::cerr << "Cannot open output file: " << outPath << std::endl;
         std::exit(EXIT_FAILURE);
@@ -738,22 +913,25 @@ void printStatus(
     size_t max_neighbors,
     size_t num_changes,
     double alpha,
-    double max_delta_x
+    double max_delta_x,
+    double mu,
+    double kappa
 ) {
-    std::printf(
-        "Step %zu: Phi = %.4f, dPhi = %0.3e, U = %.2e, min_dist = %.2e, "
-        "|F| = %.2e, Neighbors = %zu, N changes = %zu, alpha = %.2e, max d = %.2e\n",
-        step,
-        phi,
-        dphi,
-        U,
-        max_min_dist,
-        F_mag,
-        max_neighbors,
-        num_changes,
-        alpha,
-        max_delta_x
-    );
+std::printf(
+    "Step %zu: φ = %.6f, U = %.2e, max overlap = %.2e, "
+    "mu = %.2e, |F|/<F> = %.2e, Neighbors/changes = %zu / %zu, α = %.2e, max d = %.2e, κ = %.3e\n",
+    step,
+    phi,
+    U,
+    max_min_dist,
+    mu,
+    F_mag,
+    max_neighbors,
+    num_changes,
+    alpha,
+    max_delta_x,
+    kappa
+);
 }
 
 double delta_x(
@@ -816,20 +994,23 @@ double computeMeanForce(
     double sum_mag = 0.0;
     double sum_z   = 0.0;
 
+    uint32_t count = 0;
+
     for (size_t i = 0; i < N; ++i) {
         // compute ||F[i]||₂
         double d2 = 0.0;
         for (size_t d = 0; d < Ndim; ++d) {
             d2 += F[i][d] * F[i][d];
         }
-        sum_mag += std::sqrt(d2);
-        sum_z   += double(z[i]);
+        if (d2 > 1.0E-16){
+            sum_mag += std::sqrt(d2);
+            ++count;
+        }
     }
 
-    double mean_mag = sum_mag / double(N);
-    double mean_z   = sum_z   / double(N);
+    double mean_mag = sum_mag / double(count);
 
-    return mean_mag / Lc / mean_z * double(Ndim) / std::sqrt(double(Ndim));
+    return mean_mag / std::sqrt(double(Ndim));
 }
 
 double maxElem(const std::vector<std::vector<double>> &M) {
@@ -974,7 +1155,9 @@ void GetPairsND_3(
     std::vector<double> Dsorted = D;
     std::sort(Dsorted.begin(), Dsorted.end());
     double median = Dsorted[N/2];
-    double t = std::min(std::max(median*1.05, Dmin*3.0), Dmax);
+    // double t = std::min(std::max(median*1.05, Dmin*3.0), Dmax);
+    double t = std::min(std::max(median*1.02, Dmin*2.25), Dmax)*0.5;
+    
 
     auto sort_idx = sortIndicesByColumn(x, 0);
     std::vector<size_t> sort_loc(N);
@@ -999,19 +1182,26 @@ void GetPairsND_3(
                 size_t j = sort_idx[pos];
 
                 double dx = x[j][0] - x[i][0];
-                if (walls[0] < 10){dx -= std::round(dx / box[0]) * box[0];}
+                // if (walls[0] < 10){dx -= std::round(dx / box[0]) * box[0];}
+                dx -= std::round(dx / box[0]) * box[0];
                 if (std::abs(dx) > r_c_max) { go = false; break; }
 
                 double r_c = (D[i] + D[j]) / 2 + t;
                 if (std::abs(dx) < r_c) {
                     bool proceed = true;
                     double d2 = dx * dx;
+                    // for (size_t d = 1; d < Ndim; ++d) {
+                    //     double dz = x[j][d] - x[i][d];
+                    //     if (walls[d] < 10){dz -= std::round(dz / box[d]) * box[d];}
+                    //     if (std::abs(dz) > r_c) { proceed = false; break; }
+                    //     d2 += dz * dz;
+                    // }
                     for (size_t d = 1; d < Ndim; ++d) {
                         double dz = x[j][d] - x[i][d];
-                        if (walls[d] < 10){dz -= std::round(dz / box[d]) * box[d];}
-                        if (std::abs(dz) > r_c) { proceed = false; break; }
+                        dz -= std::round(dz / box[d]) * box[d];
+                        if (std::abs(dz) > r_c) { proceed = false;} // break; }
                         d2 += dz * dz;
-                    }
+                    }                    
                     if (!proceed) continue;
 
                     uint32_t &cnt = pairs[i][0];
@@ -1063,11 +1253,16 @@ void GetForcesND_3(
     std::vector<std::vector<double>>         &min_dist,
     double                                   &max_min_dist, 
     double                                   &Lc,
+    double                                   &Fmean,
+    double                                   mu,
+    double                                   &dkappa,
     std::vector<size_t>                      &z)
 {
     size_t N      = pairs.size();
     size_t Ndim   = x[0].size();
     size_t Mplus1 = pairs[0].size();
+    double K = 1.0;
+
 
     // init outputs
     F.assign(N, std::vector<double>(Ndim, 0.0));
@@ -1082,6 +1277,16 @@ void GetForcesND_3(
     max_min_dist = 0;
     bool circle_flag = (walls[0] < 0);
 
+    bool no_walls = true;
+    for (size_t d = 0; d < Ndim; ++d) {
+    	if (walls[d] != 0){
+            no_walls = false;
+        }
+    }
+
+    dkappa = 0;
+    Fmean = 0;
+
     for (size_t i = 0; i < N; ++i) {
         uint32_t numNbr = pairs[i][0];
         for (uint32_t jdx = 1; jdx <= numNbr; ++jdx) {
@@ -1093,20 +1298,30 @@ void GetForcesND_3(
             double d2   = 0.0;
 
             // PBC wrap using floor(m + 0.5) to match MATLAB round
+            // for (size_t d = 0; d < Ndim; ++d) {
+            //     double delta = x[j][d] - x[i][d];
+            //     if (walls[d] < 10){
+            //         double m     = delta / box[d];
+            //         delta       -= std::floor(m + 0.5) * box[d];
+            //     }
+            //     dx[d]        = delta;
+            //     if (flag) {
+            //         if (std::abs(delta) > r_ij) {
+            //             flag = false;
+            //         }
+            //         d2 += delta * delta;
+            //     }
+            // }
             for (size_t d = 0; d < Ndim; ++d) {
                 double delta = x[j][d] - x[i][d];
-                if (walls[d] < 10){
-                    double m     = delta / box[d];
-                    delta       -= std::floor(m + 0.5) * box[d];
+                delta       -= std::floor(delta / box[d] + 0.5) * box[d];
+                if (delta > r_ij | delta < -r_ij) {
+                    flag  = false;
                 }
-                dx[d]        = delta;
-                if (flag) {
-                    if (std::abs(delta) > r_ij) {
-                        flag = false;
-                    }
-                    d2 += delta * delta;
-                }
+                dx[d] = delta;
+                d2 += delta * delta;
             }
+
 
             if (flag) {
                 double dist = std::sqrt(d2);
@@ -1114,7 +1329,7 @@ void GetForcesND_3(
                     // update contacts & energy
                     z[i]++; 
                     z[j]++;
-                    double F_mag = - (r_ij / dist - 1.0);
+                    double F_mag = - K * (r_ij / dist - 1.0);
                     U          += (1.0 - dist/r_ij);
                     ++count;
                     min_dist[i][jdx] = (1.0 - dist/r_ij);
@@ -1127,75 +1342,99 @@ void GetForcesND_3(
                         F[i][d]     += fcomp;
                         F[j][d]     -= fcomp;
                     }
+
+                    dkappa = dkappa + K*r_ij*(dist - r_ij);
+                    Fmean = Fmean + F_mag;
+
                }
             }
         }
+    }
 
-        //Boundary
-        //Loop dimensions
-        for (size_t d = 0; d < Ndim; ++d) {
-            if (walls[d] == 1)
+    if (~no_walls){
+
+        for (size_t i = 0; i < N; ++i) {
+            //Boundary
+            //Loop dimensions
+            for (size_t d = 0; d < Ndim; ++d) {
+                if (walls[d] == 1)
+                {
+                    double r_ij = D[i]/2;
+                    //Loop two ends of box
+                    for (size_t wall = 0; wall < 2; ++wall) {
+                        dx[d] = box[d]*wall - x[i][d];
+                        double dist = std::abs(dx[d]);
+                        if (dist < r_ij) {
+                            // update contacts & energy
+                            double F_mag = - 2.0*K*(r_ij / dist - 1.0); 
+                            U          += 2.0*(1.0 - dist/r_ij);
+                            ++count;
+                            // update forces
+                            double fcomp = F_mag * dx[d]; //since dx is half the size spring constant K = 2.0
+                            F[i][d]     += fcomp;
+                            dkappa = dkappa + 2*K*r_ij*(dist - r_ij);
+                            Fmean = Fmean + F_mag;
+                        }
+                    }
+                }
+            }
+            
+            if (circle_flag)
             {
                 double r_ij = D[i]/2;
-                //Loop two ends of box
-                for (size_t wall = 0; wall < 2; ++wall) {
-                    dx[d] = box[d]*wall - x[i][d];
-                    double dist = std::abs(dx[d]);
-                    if (dist < r_ij) {
-                        // update contacts & energy
-                        double F_mag = - 2.0*(r_ij / dist - 1.0); 
-                        U          += 2.0*(1.0 - dist/r_ij);
-                        ++count;
-                        // update forces
-                        double fcomp = F_mag * dx[d]; //since dx is half the size spring constant K = 2.0
-                        F[i][d]     += fcomp;
-                        }
-                }
-            }
-        }
-        
-        if (circle_flag)
-        {
-            double r_ij = D[i]/2;
-            double d_ij = 0;
-            double R = box[0]/2;
-            for (size_t M = 0; M < -walls[0]; ++M)
-            {
-                d_ij = d_ij + (x[i][M]-R)*(x[i][M]-R);
-            }
-            d_ij = std::sqrt(d_ij);
-            double delta = R - d_ij;
-            if (delta < r_ij)
-            {
-                delta = d_ij;
-                d_ij = 0;
+                double d_ij = 0;
+                double R = box[0]/2;
                 for (size_t M = 0; M < -walls[0]; ++M)
                 {
-                    dx[M] = std::abs(R/delta - 1)*(x[i][M]-R);
-                    d_ij = d_ij + dx[M]*dx[M];
+                    d_ij = d_ij + (x[i][M]-R)*(x[i][M]-R);
                 }
-                d_ij = sqrt(d_ij);
-
-                // Compute pairwise force magnitude
-                double F_mag = - 2.0*std::abs(r_ij / d_ij - 1.0);  //abs ensures force always two center of container even if particle were outside container
-
-                // Compute potential energy contribution
-                U = U + (1 - d_ij/r_ij);
-                ++count;
-
-                // Update forces in all dimensions
-                for (size_t M = 0; M < -walls[0]; ++M)
+                d_ij = std::sqrt(d_ij);
+                double delta = R - d_ij;
+                if (delta < r_ij)
                 {
-                    F[i][M] = F[i][M] + F_mag * dx[M]; // Force on particle i
-                }
-        }
-        }
+                    delta = d_ij;
+                    d_ij = 0;
+                    for (size_t M = 0; M < -walls[0]; ++M)
+                    {
+                        dx[M] = std::abs(R/delta - 1)*(x[i][M]-R);
+                        d_ij = d_ij + dx[M]*dx[M];
+                    }
+                    d_ij = sqrt(d_ij);
+
+                    // Compute pairwise force magnitude
+                    double F_mag = - 2.0*K*std::abs(r_ij / d_ij - 1.0);  //abs ensures force always two center of container even if particle were outside container
+
+                    // Compute potential energy contribution
+                    U = U + (1 - d_ij/r_ij);
+                    ++count;
+
+                    // Update forces in all dimensions
+                    for (size_t M = 0; M < -walls[0]; ++M)
+                    {
+                        F[i][M] = F[i][M] + F_mag * dx[M]; // Force on particle i
+                    }
+                    dkappa = dkappa + 2*K*r_ij*(d_ij - r_ij);
+                    Fmean = Fmean + F_mag;
+
+            }
+            }
 
 
+        }
     }
 
     U  = std::pow(U / double(count), 2);
     Lc = Lc / double(count);
+
+    double sumD = 0.0;
+    for (double Di : D) {
+        sumD += Di;
+    }
+
+    dkappa = dkappa + mu*sumD;
+    Fmean = -Fmean/count;
+
+
 }
 
 
@@ -1207,6 +1446,7 @@ void AdamUpdate(
     size_t N,
     size_t Ndim,
     const std::vector<std::vector<double>> &F,
+    double dkappa, 
     double beta1,
     double beta2,
     size_t t,
@@ -1220,18 +1460,31 @@ void AdamUpdate(
     std::vector<std::vector<double>> &v_hat,
     std::vector<std::vector<double>> &a,
     std::vector<std::vector<double>> &v_verlet,
-    std::vector<std::vector<double>> &a_old) {
+    std::vector<std::vector<double>> &a_old,
+    double                           &m_kappa,
+    double                           &v_kappa,
+    double                           &v_update_kappa,
+    double                           &m_hat_kappa,
+    double                           &v_hat_kappa) {
+        
     for(size_t k=0;k<N;++k){
         for(size_t kk=0;kk<Ndim;++kk){ size_t idx=k*Ndim+kk; double Fkd=F[k][kk];
             m[k][kk]=beta1*m[k][kk] - (1.0-beta1)*Fkd;
             v[k][kk]=beta2*v[k][kk] + (1.0-beta2)*Fkd*Fkd;
-            v_max[k][kk]=std::max(v_max[k][kk],v[k][kk]);
-            if(method=="AMSGrad") v_update[k][kk]=v_max[k][kk]; else v_update[k][kk]=v[k][kk];
+            // v_max[k][kk]=std::max(v_max[k][kk],v[k][kk]);
+            v_update[k][kk]=v[k][kk];
             m_hat[k][kk]=m[k][kk]/(1.0-std::pow(beta1,double(t)));
             v_hat[k][kk]=v_update[k][kk]/(1.0-std::pow(beta2,double(t)));
-            a[k][kk] = Fkd - verlet_drag*v_verlet[k][kk];
-            v_verlet[k][kk] += 0.5*(a_old[k][kk]+a[k][kk])*dt;
-            a_old[k][kk] = a[k][kk];
+            // a[k][kk] = Fkd - verlet_drag*v_verlet[k][kk];
+            // v_verlet[k][kk] += 0.5*(a_old[k][kk]+a[k][kk])*dt;
+            // a_old[k][kk] = a[k][kk];
         }
     }
+    
+    m_kappa = beta1 * m_kappa - (1 - beta1) * dkappa;
+    v_kappa = beta2 * v_kappa + (1 - beta2) * (dkappa*dkappa);
+    v_update_kappa = v_kappa;
+    m_hat_kappa = m_kappa / (1.0-std::pow(beta1,double(t)));
+    v_hat_kappa = v_update_kappa / (1.0-std::pow(beta2,double(t)));
+
 }

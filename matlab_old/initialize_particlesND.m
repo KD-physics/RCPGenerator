@@ -118,7 +118,6 @@ switch dist_type
     case 'flat'
         % Flat distribution: d_min, d_max
         D = distribution.d_min + (distribution.d_max - distribution.d_min) * rand(1, N);
-        D = distribution.d_min + (D - min(D)) * (distribution.d_max - distribution.d_min) / (max(D) - min(D));
 
     case 'powerlaw'
         % Power-law distribution: d_min, d_max, exponent
@@ -134,8 +133,6 @@ switch dist_type
             % General power-law case
             D = ((d_max^(exponent + 1) - d_min^(exponent + 1)) * u + d_min^(exponent + 1)).^(1 / (exponent + 1));
         end
-        D = d_min + (D - min(D)) * (d_max - d_min) / (max(D) - min(D));
-        
 
     case 'exponential'
         % Exponential distribution: d_min, d_max
@@ -143,7 +140,6 @@ switch dist_type
         d_max = distribution.d_max;
         lambda = -log(0.5) / (d_max - d_min); % Decay rate for the range
         D = d_min + (-1 / lambda) * log(1 - rand(1, N));
-        D = d_min + (D - min(D)) * (d_max - d_min) / (max(D) - min(D));
 
     case 'weibull'
         % Weibull distribution: scale, shape
