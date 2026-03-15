@@ -12,7 +12,7 @@
 
 ## Description
 
-RCPGenerator is a hard particle packing algorithm that provides a fast, flexible tool for generating random close packings, including 2D disk random packings and 3D sphere random packings, with algorithms tested up to 7 dimensions and generalized to arbitrary dimension. It can be used as a sphere-packing generator and particle-packing simulation tool for computational physics, granular materials, and packing-algorithm research.
+RCPGenerator is a hard particle packing algorithm that provides a fast, flexible tool for generating random close packings, including 2D disk random packings and 3D sphere random packings, with algorithms tested up to 7 dimensions and generalized to arbitrary dimension. This code can be used as a sphere packing generator and particle packing simulation tool for computational physics, granular materials, and packing-algorithm research.
 - **C++** executables for seeding and generating dense packings via ADAM/Verlet optimizer.
 - **MATLAB** for seeding and generating dense packings via ADAM/Verlet optimizer, along with scripts for visualization.
 - Supports initial particle configurations, arbitrary and pre-defined particle size distributions, periodic/hard‑wall boundaries, and rectangular, cylindrical, and spherical container geometries for physics simulations, 3D printing, and modeling of powders, colloids, and granular media.
