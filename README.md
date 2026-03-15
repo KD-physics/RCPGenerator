@@ -1,6 +1,6 @@
 [🏠 Home](https://kd-physics.github.io/)
 
-# N‑Dimensional Random Close Packing Generator
+# N‑Dimensional Random Close Packing Generator 
 
 ![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)
 
@@ -12,7 +12,7 @@
 
 ## Description
 
-RCPGenerator provides a fast, flexible tool for generating random close packings, dense packings, and jammed states of spheres in 2–N dimensions.
+RCPGenerator is a hard particle packing algorithm that provides a fast, flexible tool for generating random close packings, including 2D disk packings and 3D sphere packings, with algorithms tested up to 7 dimensions and generalized to arbitrary dimension. It can be used as a sphere-packing generator and particle-packing simulation tool for computational physics, granular materials, and packing-algorithm research.
 - **C++** executables for seeding and generating dense packings via ADAM/Verlet optimizer.
 - **MATLAB** for seeding and generating dense packings via ADAM/Verlet optimizer, along with scripts for visualization.
 - Supports initial particle configurations, arbitrary and pre-defined particle size distributions, periodic/hard‑wall boundaries, and rectangular, cylindrical, and spherical container geometries for physics simulations, 3D printing, and modeling of powders, colloids, and granular media.
@@ -20,12 +20,12 @@ RCPGenerator provides a fast, flexible tool for generating random close packings
 
 | ![Ex1](Images/example1.png) | ![Ex2](Images/example2.png) | ![Ex3](Images/example3.png) | ![Ex4](Images/example4.png) |
 |:---------------------------:|:---------------------------:|:---------------------------:|:---------------------------:|
-| Cropped rcp; periodic boundary in x, hard boundary in y, and constrained height to be fixed multiple of largest diameter. | Dense packing confined within circular container                  | Cylindrically confined packing with upper and lower hard boundaries.                   | Spherically confined packing.                  |
+| Cropped rcp; periodic boundary in x, hard boundary in y, and constrained height to be fixed multiple of largest diameter. | Dense hard 2D disk packing confined within circular container                  | Cylindrically confined packing of 3D particles with upper and lower hard boundaries.                   | 3D packing of hard spheres, confined to a spherical container.                  |
 
 
 ## Features
 
-- Generate packings via an iterative expansion–contraction scheme (Desmond & Weeks 2009).
+- Generate packings via an algorithm using an iterative expansion–contraction scheme (Desmond & Weeks 2009).
 - Support for various particle size distributions (monodisperse, bidisperse, Gaussian, power‑law, custom, and more).
 - Periodic or hard‑wall boundary conditions (including circular, cylindrical, or spherical containers).
 - Optionally fix container height as a multiple of the first particle diameter.
@@ -280,7 +280,7 @@ All MATLAB scripts mirror the C++ functionality. See example.m script for comple
 
 ## Brief Overview of Packing Protocol (ADAM, AMSGrad, Verlet)
 
-RCPGenerator implements an iterative expansion–relaxation scheme described in Desmond & Weeks (2009) [arXiv:0903.0864]. Starting from an initial set of particle positions and diameters, the algorithm alternates between expanding or contracting particle sizes and minimizing the overlap energy, gradually increasing the packing fraction until a jammed state is reached. At each set of steps once energy minimization is reached (determined by the degree to which forces are sufficiently balanced) the particle diameters expaned if particle overlap is mininal, otherwise particle diameters contract. Expansion and contraction rates decrease over time until the diameter adjustment step falls below a tolerance, at which point the algorithm terminates and returns the positions and diameters.
+RCPGenerator implements an iterative expansion–relaxation scheme described in Desmond & Weeks (2009) [arXiv:0903.0864]. Starting from an initial set of particle positions and diameters, the algorithm alternates between expanding or contracting particle sizes and minimizing the overlap energy, gradually increasing the packing fraction until a jammed state is reached. At each set of steps once energy minimization is reached (determined by the degree to which forces are sufficiently balanced) the particle diameters expaned if particle overlap is mininal, otherwise particle diameters contract. Expansion and contraction rates decrease over time until the diameter adjustment step falls below a tolerance, at which point the algorithm terminates and returns the hard particle packing as the particle positions and diameters.
 
 Energy minimization was originally implemented using a conjugate‑gradient solver in Desmond & Weeks (2009). Since then the ADAM optimizer was introduced for neural netork training, and here we find it performs much faster. As such, the ADAM optimize is utilized for rapid initial convergence, followed by AMSGrad for stability when ADAM stalls, and finally overdamped Verlet integrator if overlaps persist. If overlaps still persist it gives up and contracts the particle diameters. In practice, ADAM quickly removes most overlaps, but AMSGrad and Verlet help in reducing overlaps even more.
 
