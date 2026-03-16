@@ -4,13 +4,52 @@
 
 ![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)
 
-## Description
+# RCPGenerator
 
-RCPGenerator is a fast random close packing and hypersphere packing generator with Python, C++, and MATLAB interfaces. It can generate dense sphere packings in 3D, disk packings in 2D, and hypersphere packings in arbitrary dimension (tested up to 7 dimensions and generalized to arbitrary dimension). The boundaries can be flat or spherical.
+**RCPGenerator** is a particle packing algorithm implemented in **Python, C++, and MATLAB** for generating **random close packings (dense particle packings)** of hard particles.
 
-The software can be used as a particle packing generator for computational physics, granular materials, powder simulations, and sphere packing studies.
+It supports:
 
-- **Python** interface wrapping the validated C++ packing engine via pybind11, providing a high-level `rcpgenerator.Packing` API, visualization utilities, and example workflows for particle packing in boxes and curved containers. See the `python/` directory and the `getting_started.ipynb` notebook above for installation and tutorial examples. Code can find packings close to jamming or target a packing density with some overlap or no overlap (i.e. above or below jamming point).
+- **2D disk packings**, **3D sphere packings**, and **hypersphere packings in arbitrary dimensions**
+- **Periodic or hard-wall boundary conditions**
+- **Flat and curved container geometries** including boxes, circles, cylinders, and spheres
+- **Highly polydisperse particle distributions**
+
+RCPGenerator can be used both as a **sphere packing generator** and as a **particle packing simulation tool** for computational physics and materials modeling.
+
+Key capabilities include:
+
+- **Higher-dimensional packing algorithms** (tested up to **7 dimensions**)
+- **Initial particle configuration seeding**
+- **Arbitrary and predefined particle size distributions**
+- **Periodic and hard-wall boundary conditions**
+- **Rectangular, cylindrical, and spherical container geometries**
+- **Very high polydispersity**, converging for **size ratios greater than 100 in 2D**
+
+The code is suitable for research and simulations involving:
+
+- granular materials
+- colloids
+- dense particle systems
+- physics simulations
+- 3D printing and powder modeling
+
+---
+
+# Python Interface
+
+The repository includes a **Python interface** that wraps the validated C++ packing engine using **pybind11**.
+
+The Python API provides:
+
+- a high-level `rcpgenerator.Packing` class
+- visualization utilities for 2D and 3D packings
+- example workflows for packings in **boxes and curved containers**
+- notebook-based tutorials and demonstrations
+
+See the `python/` directory and the **`getting_started.ipynb` notebook** for installation instructions and interactive examples.
+
+### Example: Generating Dense Sphere Packing in Python
 
 ```python
 # Python code snippet to generate dense 3D sphere packing in unit box
@@ -21,8 +60,15 @@ p.pack() # Generating densing packing of spheres
 p.show_packing() # Display dense packing
 ```
 
-- **C++** executables for seeding and generating dense packings via ADAM/Verlet optimizer. (see below for more details)
-- **MATLAB** for seeding and generating dense packings via ADAM/Verlet optimizer, along with scripts for visualization.
+## c++ Interface
+
+The original C++ implementation provides executables for generating dense packings using an ADAM / Verlet optimization algorithm.
+
+These tools are designed for large-scale packing generation and high-dimensional studies.
+
+## Matlab Interface
+
+The repository also includes a MATLAB interface for generating packings and visualizing results.
 
 ```Matlab
 # Matlab code snippet to generate dense 3D sphere packing (variable initialization required, see matalb/examples for more details)
@@ -38,8 +84,9 @@ plot_particles_periodic(x0, D0, Box)
 plot_particles_periodic(x, D, Box)
 ```
 
-- Supports initial particle configurations, arbitrary and pre-defined particle size distributions, periodic/hard‑wall boundaries, and rectangular, cylindrical, and spherical container geometries for physics simulations, 3D printing, and modeling of powders, colloids, and granular media.
-- Supports arbitrary particle size distributions and able to converge with very large size ratios of greater than 100 in 2D 
+See the matlab/examples directory for full usage examples.
+
+
 
 | ![Ex1](Images/example1.png) | ![Ex2](Images/example2.png) | ![Ex3](Images/example3.png) | ![Ex4](Images/example4.png) |
 |:---------------------------:|:---------------------------:|:---------------------------:|:---------------------------:|
