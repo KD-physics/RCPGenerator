@@ -25,7 +25,7 @@ p.show_packing() # Display dense packing
 - **MATLAB** for seeding and generating dense packings via ADAM/Verlet optimizer, along with scripts for visualization.
 
 ```Matlab
-# Python code snippet to generate dense 3D sphere packing (variable initialization required, see matalb/examples for more details)
+# Matlab code snippet to generate dense 3D sphere packing (variable initialization required, see matalb/examples for more details)
 % Initialize Particles
 [x0, D0] = initialize_particlesND(phi, N, Box, distribution);
 
