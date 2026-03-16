@@ -4,16 +4,19 @@
 
 ![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)
 
-## Webapp for Visualization
-
-[Link to WebApp](https://kd-physics.github.io/RCPGenerator/webapp/index.html)
-
-![Ex1](Images/WebApp.png)
-
 ## Description
 
 RCPGenerator is a particle packing algorithm that provides a fast, flexible tool for generating random close packings (dense particle packings), including 2D disk random packings and 3D sphere random packings, with algorithms tested up to 7 dimensions and generalized to arbitrary dimension. This code can be used as a sphere packing generator and particle packing simulation tool for computational physics, granular materials, and packing-algorithm research.
 - **Python** interface wrapping the validated C++ packing engine via pybind11, providing a high-level `rcpgenerator.Packing` API, visualization utilities, and example workflows for particle packing in boxes and curved containers. See the `python/` directory and the `getting_started.ipynb` notebook above for installation and tutorial examples.
+
+```python
+from rcpgenerator import Packing
+
+p = Packing(N=500, Ndim=3, box=[1,1,1]) # Initialize a unit box with 500 spherical particles in 3D
+p.pack() # Generating densing packing of spheres
+p.show_packing() # Display dense packing
+```
+
 - **C++** executables for seeding and generating dense packings via ADAM/Verlet optimizer.
 - **MATLAB** for seeding and generating dense packings via ADAM/Verlet optimizer, along with scripts for visualization.
 - Supports initial particle configurations, arbitrary and pre-defined particle size distributions, periodic/hard‑wall boundaries, and rectangular, cylindrical, and spherical container geometries for physics simulations, 3D printing, and modeling of powders, colloids, and granular media.
@@ -23,6 +26,11 @@ RCPGenerator is a particle packing algorithm that provides a fast, flexible tool
 |:---------------------------:|:---------------------------:|:---------------------------:|:---------------------------:|
 | Cropped rcp; periodic boundary in x, hard boundary in y, and constrained height to be fixed multiple of largest diameter. | Dense hard 2D disk packing confined within circular container                  | Cylindrically confined packing of 3D particles with upper and lower hard boundaries.                   | 3D packing of hard spheres, confined to a spherical container.                  |
 
+## Webapp for Visualization
+
+[Link to WebApp](https://kd-physics.github.io/RCPGenerator/webapp/index.html)
+
+![Ex1](Images/WebApp.png)
 
 ## Features
 
