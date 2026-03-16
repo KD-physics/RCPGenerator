@@ -6,10 +6,14 @@
 
 ## Description
 
-RCPGenerator is a particle packing algorithm that provides a fast, flexible tool for generating random close packings (dense particle packings), including 2D disk random packings and 3D sphere random packings, with algorithms tested up to 7 dimensions and generalized to arbitrary dimension. This code can be used as a sphere packing generator and particle packing simulation tool for computational physics, granular materials, and packing-algorithm research.
-- **Python** interface wrapping the validated C++ packing engine via pybind11, providing a high-level `rcpgenerator.Packing` API, visualization utilities, and example workflows for particle packing in boxes and curved containers. See the `python/` directory and the `getting_started.ipynb` notebook above for installation and tutorial examples.
+RCPGenerator is a fast random close packing and hypersphere packing generator with Python, C++, and MATLAB interfaces. It can generate dense sphere packings in 3D, disk packings in 2D, and hypersphere packings in arbitrary dimension (tested up to 7 dimensions and generalized to arbitrary dimension). The boundaries can be flat or spherical.
+
+The software can be used as a particle packing generator for computational physics, granular materials, powder simulations, and sphere packing studies.
+
+- **Python** interface wrapping the validated C++ packing engine via pybind11, providing a high-level `rcpgenerator.Packing` API, visualization utilities, and example workflows for particle packing in boxes and curved containers. See the `python/` directory and the `getting_started.ipynb` notebook above for installation and tutorial examples. Code can find packings close to jamming or target a packing density with some overlap or no overlap (i.e. above or below jamming point).
 
 ```python
+# Python code snippet to generate dense 3D sphere packing in unit box
 from rcpgenerator import Packing
 
 p = Packing(N=500, Ndim=3, box=[1,1,1]) # Initialize a unit box with 500 spherical particles in 3D
@@ -17,14 +21,29 @@ p.pack() # Generating densing packing of spheres
 p.show_packing() # Display dense packing
 ```
 
-- **C++** executables for seeding and generating dense packings via ADAM/Verlet optimizer.
+- **C++** executables for seeding and generating dense packings via ADAM/Verlet optimizer. (see below for more details)
 - **MATLAB** for seeding and generating dense packings via ADAM/Verlet optimizer, along with scripts for visualization.
+
+```Matlab
+# Python code snippet to generate dense 3D sphere packing (variable initialization required, see matalb/examples for more details)
+% Initialize Particles
+[x0, D0] = initialize_particlesND(phi, N, Box, distribution);
+
+plot_particles_periodic(x0, D0, Box)
+
+% Create Packing
+[x, D, U_history, phi_history, Fx] = CreatePacking(x0, D0, Box, walls, fix_height, verbose);
+
+% Plot packing
+plot_particles_periodic(x, D, Box)
+```
+
 - Supports initial particle configurations, arbitrary and pre-defined particle size distributions, periodic/hard‑wall boundaries, and rectangular, cylindrical, and spherical container geometries for physics simulations, 3D printing, and modeling of powders, colloids, and granular media.
 - Supports arbitrary particle size distributions and able to converge with very large size ratios of greater than 100 in 2D 
 
 | ![Ex1](Images/example1.png) | ![Ex2](Images/example2.png) | ![Ex3](Images/example3.png) | ![Ex4](Images/example4.png) |
 |:---------------------------:|:---------------------------:|:---------------------------:|:---------------------------:|
-| Cropped rcp; periodic boundary in x, hard boundary in y, and constrained height to be fixed multiple of largest diameter. | Dense hard 2D disk packing confined within circular container                  | Cylindrically confined packing of 3D particles with upper and lower hard boundaries.                   | 3D packing of hard spheres, confined to a spherical container.                  |
+| Cropped dense rcp 2D packing; periodic boundary in x, hard boundary in y, and constrained height to be fixed multiple of largest diameter. | Dense 2D disk packing confined within circular container                  | Cylindrically confined packing of 3D spherical particles with upper and lower hard boundaries.                   | 3D packing of hard spheres, confined to a spherical container.                  |
 
 ## Webapp for Visualization
 
