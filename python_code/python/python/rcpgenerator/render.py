@@ -3,11 +3,27 @@
 from __future__ import annotations
 
 from pathlib import Path
+import os
 from typing import Iterable
 
 import matplotlib
 
-matplotlib.use("Agg")
+
+def _should_force_agg() -> bool:
+    try:
+        from IPython import get_ipython
+    except Exception:
+        get_ipython = None
+
+    if get_ipython is not None and get_ipython() is not None:
+        return False
+    if os.name == "nt":
+        return False
+    return not bool(os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY"))
+
+
+if _should_force_agg():
+    matplotlib.use("Agg")
 
 import matplotlib.pyplot as plt
 from matplotlib import animation
@@ -96,6 +112,29 @@ def _draw_2d_boundary(ax: plt.Axes, box: list[float], walls: list[int]) -> None:
         ax.plot(x, y, color="black", linewidth=2.0)
 
 
+def _periodic_shifts_2d(center: np.ndarray, radius: float, box: list[float], walls: list[int]) -> list[tuple[float, float]]:
+    shifts_x = [0.0]
+    shifts_y = [0.0]
+
+    if int(walls[0]) == 0:
+        if center[0] - radius < 0.0:
+            shifts_x.append(box[0])
+        if center[0] + radius > box[0]:
+            shifts_x.append(-box[0])
+
+    if int(walls[1]) == 0:
+        if center[1] - radius < 0.0:
+            shifts_y.append(box[1])
+        if center[1] + radius > box[1]:
+            shifts_y.append(-box[1])
+
+    shifts = []
+    for dx in shifts_x:
+        for dy in shifts_y:
+            shifts.append((dx, dy))
+    return shifts
+
+
 def _draw_box_wireframe(ax: plt.Axes, box: list[float]) -> None:
     lx, ly, lz = box
     corners = np.array(
@@ -163,14 +202,16 @@ def _plot_2d(packing, palette_choice: int) -> plt.Figure:
     colors = _particle_colors(len(diameters), palette_choice)
 
     for i in range(len(diameters)):
-        circle = Circle(
-            (positions[i, 0], positions[i, 1]),
-            diameters[i] / 2.0,
-            facecolor=colors[i],
-            edgecolor="black",
-            linewidth=0.6,
-        )
-        ax.add_patch(circle)
+        radius = diameters[i] / 2.0
+        for dx, dy in _periodic_shifts_2d(positions[i], radius, list(packing.box), list(packing.walls)):
+            circle = Circle(
+                (positions[i, 0] + dx, positions[i, 1] + dy),
+                radius,
+                facecolor=colors[i],
+                edgecolor="black",
+                linewidth=0.6,
+            )
+            ax.add_patch(circle)
 
     _draw_2d_boundary(ax, list(packing.box), list(packing.walls))
     ax.set_xlim(0.0, packing.box[0])
