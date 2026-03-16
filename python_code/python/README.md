@@ -1,29 +1,33 @@
 # RCPGenerator Python
 
-RCPGenerator is a Python interface for random close packing and hypersphere packing based on the validated legacy C++ implementation in this repository. It is aimed at users who want Python particle packing workflows, including sphere packing in a box, particle packing in curved containers, staged target packing fraction workflows, and inline visualization from notebooks or Colab.
+**RCPGenerator** provides a Python interface for random close packing and hypersphere packing based on the validated legacy C++ implementation contained in this repository. It is intended for users who want Python-based particle packing workflows, including sphere packing in boxes, particle packing in curved containers, staged target packing-fraction workflows, and inline visualization from notebooks or Google Colab.
+
+The Python interface was generated through a large-scale refactoring of the original C++ code using **OpenAI Codex (GPT-5.4)**. Codex produced the Python bindings, CMake build system, high-level Python API, and example workflows, including the `getting_started.ipynb` notebook and much of this README. While the underlying packing engine is the original validated C++ implementation, the Python interface and surrounding tooling were automatically constructed from it. Minor rough edges may remain, and users interested in the algorithmic details should consult the README in the repository root for a conceptual description of the algorithm. This README focuses primarily on the Python interface, features, and exposed parameters.
 
 If you are searching for:
-- Python particle packing
-- Python random close packing
-- Python sphere packing
-- Python code to pack particles in a box
-- Python code to pack spheres in a box
-- hypersphere packing in Python
 
-this package is the user-facing Python entry point for those workflows.
+- Python particle packing  
+- Python random close packing  
+- Python sphere packing  
+- Python code to pack particles in a box  
+- Python code to pack spheres in a box  
+- hypersphere packing in Python  
 
-## Overview
+this package provides a Python entry point for those workflows.
+
+---
+
+# Overview
 
 The `python/` package wraps the validated C++ packing engine with:
-- a thin pybind11 binding layer
+
+- a thin **pybind11 binding layer**
 - a stateful pure-Python `rcpgenerator.Packing` API
-- rendering helpers for 2D and 3D packings
-- optional trajectory capture and 2D animation
-- example scripts covering boxes, curved containers, multiple distributions, and staged target-phi workflows
+- rendering utilities for **2D and 3D packings**
+- optional **trajectory capture and animation**
+- example scripts covering boxes, curved containers, multiple particle distributions, and staged target packing-fraction workflows
 
-The main public API is `rcpgenerator.Packing`.
-
-The original C++ code path was used for high-dimensional packing studies and was tested in the original project up to `7D`, so the implementation lineage is not limited to 2D and 3D sphere packing.
+The primary user-facing API is: rcpgenerator.Packing
 
 ## Features
 
