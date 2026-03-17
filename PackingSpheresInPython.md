@@ -9,9 +9,9 @@ To generate dense packings, the system must **evolve** toward a jammed state usi
 
 `rcpgenerator` is an open-source Python library developed to generate dense, jammed packings of non-overlapping spheres. Unlike simple rejection-sampling methods that fail at high volume fractions, this toolkit uses an **optimization-based "inflation" approach** to reach the **Random Close Packing (RCP) limit** ($\phi \approx 0.64$).
 
-* **GitHub Repository:** [rcpgenerator: Fast RCP Sphere Packing](https://github.com/KD-physics/RCPGenerator)
-* **Key Features:** Support for polydisperse distributions, custom container geometries (box, cylinder, sphere), and $O(N \log N)$ scaling.
-* **Background:** This library refactors the core algorithms used in my research on granular materials and soft-matter physics.
+* **GitHub Repository:** [rcpgenerator: Fast Spehere Packing Generating](https://github.com/KD-physics/RCPGenerator)
+* **Key Features:** Support for polydisperse distributions, custom container geometries (box, cylinder, sphere), and higher dimensions (tested up to 7).
+
 
 ### Quick Start
 ```python
