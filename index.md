@@ -3,31 +3,116 @@ description: "Fast, multi‑language toolkit to generate random close packings, 
 keywords: ["random close packing", "jammed state", "dense packing", "particle configurations", "hypersphere packing", "C++", "MATLAB", "Python"]
 ---
 
-# N‑Dimensional Random Close Packing Generator
+[🏠 Home](https://kd-physics.github.io/)
+
+# N‑Dimensional Random Close Packing Generator 
 
 ![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)
 
-## Description
+# RCPGenerator
 
-RCPGenerator provides a fast, flexible tool for generating random close packings, dense packings, and jammed states of spheres in 2–N dimensions.
-- **C++** executables for seeding and optimizing packings with ADAM/Verlet.
-- **MATLAB** for seeding and optimizing packings with ADAM/Verlet and scripts for visualization.
-- Supports initial particle configurations, arbitrary and pre-defined particle size distributions, periodic/hard‑wall boundaries, and rectangular, cylindrical, and spherical container geometries for physics simulations, 3D printing, and modeling of poweders, colloids, and granular media.
+**RCPGenerator** is a particle packing algorithm implemented in **Python, C++, and MATLAB** for generating **random close packings (dense particle packings)** of hard particles.
+
+It supports:
+
+- **2D disk packings**, **3D sphere packings**, and **hypersphere packings in arbitrary dimensions**
+- **Periodic or hard-wall boundary conditions**
+- **Flat and curved container geometries** including boxes, circles, cylinders, and spheres
+- **Highly polydisperse particle distributions**
+
+RCPGenerator can be used both as a **sphere packing generator** and as a **particle packing simulation tool** for computational physics and materials modeling.
+
+Key capabilities include:
+
+- **Higher-dimensional packing algorithms** (tested up to **7 dimensions**)
+- **Initial particle configuration seeding**
+- **Arbitrary and predefined particle size distributions**
+- **Periodic and hard-wall boundary conditions**
+- **Rectangular, cylindrical, and spherical container geometries**
+- **Very high polydispersity**, converging for **size ratios greater than 100 in 2D**
+
+The code is suitable for research and simulations involving:
+
+- granular materials
+- colloids
+- dense particle systems
+- physics simulations
+- 3D printing and powder modeling
+
+---
+
+# Python Interface
+
+The repository includes a **Python interface** that wraps the validated C++ packing engine using **pybind11**.
+
+The Python API provides:
+
+- a high-level `rcpgenerator.Packing` class
+- visualization utilities for 2D and 3D packings
+- example workflows for packings in **boxes and curved containers**
+- notebook-based tutorials and demonstrations
+
+See the `python/` directory and the **`getting_started.ipynb` notebook** for installation instructions and interactive examples.
+
+### Example: Generating Dense Sphere Packing in Python
+
+```python
+# Python code snippet to generate dense 3D sphere packing in unit box
+from rcpgenerator import Packing
+
+p = Packing(N=500, Ndim=3, box=[1,1,1]) # Initialize a unit box with 500 spherical particles in 3D
+p.pack() # Generating densing packing of spheres
+p.show_packing() # Display dense packing
+```
+
+## c++ Interface
+
+The original C++ implementation provides executables for generating dense packings using an ADAM / Verlet optimization algorithm.
+
+These tools are designed for large-scale packing generation and high-dimensional studies.
+
+## Matlab Interface
+
+The repository also includes a MATLAB interface for generating packings and visualizing results.
+
+```Matlab
+# Matlab code snippet to generate dense 3D sphere packing (variable initialization required, see matalb/examples for more details)
+% Initialize Particles
+[x0, D0] = initialize_particlesND(phi, N, Box, distribution);
+
+plot_particles_periodic(x0, D0, Box)
+
+% Create Packing
+[x, D, U_history, phi_history, Fx] = CreatePacking(x0, D0, Box, walls, fix_height, verbose);
+
+% Plot packing
+plot_particles_periodic(x, D, Box)
+```
+
+See the matlab/examples directory for full usage examples.
+
+
 
 | ![Ex1](Images/example1.png) | ![Ex2](Images/example2.png) | ![Ex3](Images/example3.png) | ![Ex4](Images/example4.png) |
 |:---------------------------:|:---------------------------:|:---------------------------:|:---------------------------:|
-| Cropped 2D rcp with periodic boundary in x and hard boundary in y. Constraint is applied to ensure container height is fixed to a multiple of the largest particle diameter. | Dense packing confined within circular container                  | Cylindrically confined packing with upper and lower hard boundaries.                   | Spherically confined packing.                  |
+| Cropped dense rcp 2D packing; periodic boundary in x, hard boundary in y, and constrained height to be fixed multiple of largest diameter. | Dense 2D disk packing confined within circular container                  | Cylindrically confined packing of 3D spherical particles with upper and lower hard boundaries.                   | 3D packing of hard spheres, confined to a spherical container.                  |
 
+## Webapp for Visualization
+
+[Link to WebApp](https://kd-physics.github.io/RCPGenerator/webapp/index.html)
+
+![Ex1](Images/WebApp.png)
 
 ## Features
 
-- Generate packings via an iterative expansion–contraction scheme (Desmond & Weeks 2009).
+- Generate packings via an algorithm using an iterative expansion–contraction scheme (Desmond & Weeks 2009).
 - Support for various particle size distributions (monodisperse, bidisperse, Gaussian, power‑law, custom, and more).
 - Periodic or hard‑wall boundary conditions (including circular, cylindrical, or spherical containers).
 - Optionally fix container height as a multiple of the first particle diameter.
 - If computer resources are sufficient, can generate packings in any arbitrary dimension of size 2 or greater
 - Export and import packing data in plain‑text format.
-- Both C++ and MATLAB routines included. Each set of code are independent whose functionality mirror each other. 
+- Both C++ and MATLAB routines included. Each set of code are independent whose functionality mirror each other.
+- Able to handle very large size ratios, with prior success in generating packings that have particle diameter ratios > 100 in 2D, > 50 in 3D, > 15 in 4D, and > 5 in 5D.  
 
 ## Table of Contents
 1. [Repository Structure](#repository-structure)
@@ -50,11 +135,11 @@ RCPGenerator provides a fast, flexible tool for generating random close packings
 
 /matlab
 
-    ├ initialize\_particlesND.m # Initial position and diameter generator
-    ├ CreatePacking.m          # Generates packings via ADAM optimerizer
-    ├ plot\_particles\_periodic.m
-    ├ plot\_particles\_3D.m
-    └ example.m                # end‑to‑end demo
+    ├ initialize\_particlesND.m    # Initial position and diameter generator
+    ├ CreatePacking.m              # Generates packings via ADAM optimerizer
+    ├ plot\_particles\_periodic.m  # Plot particles in 2D
+    ├ plot\_particles\_3D.m        # Plot particles in 3D
+    └ example.m                    # end‑to‑end demo
 
 README.md
 
@@ -92,13 +177,16 @@ An example use case for InitializeParticles.cpp is:
   --N 500 \
   --Ndim 3 \
   --phi 0.05 \
-  --dist monodisperse \
-  --D 1.0 \
+  --dist mono \
+  --d 1.0 \
   --box 1,1,1 \
+  --walls 0,0,0 \
   > init_500_3D.txt
 ```
 
 This example would generate a intial packing of 500 particles in 3 dimensions at packing fraction 5%. The container size is 1 x 1 x 1, and all the diameters are equal in size. The positions and diameters are saved to init_500_3D.txt.
+
+> **Important Note:** You must supply flags N, Ndim, phi, dist (its parameters), box, and walls, otherwise you will get a Segmentation fault (core dumped) error!
 
 Below is the full set of InitializeParticles.exe flags to adjust the type of packing that is initialized.
 
@@ -221,7 +309,7 @@ When using the `--fix-height` flag, both `InitializeParticles.exe` and `RCPGener
    * During expansion–relaxation, the container height is held at `w × D₁` as particles expand or contract to meet the packing fraction.
 
 ```bash
-./InitializeParticles.exe --N 15000 --Ndim 3 --dist powerlaw --d_min 1.0 --d_max 15.0 --exponent -3 --phi 0.01 --box 1,0.5,4 --fix_height > input.txt
+./InitializeParticles.exe --N 15000 --Ndim 3 --dist powerlaw --d_min 1.0 --d_max 15.0 --exponent -3 --phi 0.01 --box 1,0.5,4 --walls 0,1,0 --fix_height > input.txt
 ./RCPGenerator.exe --file input.txt --output final_packing.txt --NeighborMax 1500 --box 1,0.5,4 --walls 0,1,0 --fix_height
 ```
 
@@ -272,7 +360,7 @@ All MATLAB scripts mirror the C++ functionality. See example.m script for comple
 
 ## Brief Overview of Packing Protocol (ADAM, AMSGrad, Verlet)
 
-RCPGenerator implements an iterative expansion–relaxation scheme described in Desmond & Weeks (2009) [arXiv:0903.0864]. Starting from an initial set of particle positions and diameters, the algorithm alternates between expanding or contracting particle sizes and minimizing the overlap energy, gradually increasing the packing fraction until a jammed state is reached. At each set of steps once energy minimization is reached (determined by the degree to which forces are sufficiently balanced) the particle diameters expaned if particle overlap is mininal, otherwise particle diameters contract. Expansion and contraction rates decrease over time until the diameter adjustment step falls below a tolerance, at which point the algorithm terminates and returns the positions and diameters.
+RCPGenerator implements an iterative expansion–relaxation scheme described in Desmond & Weeks (2009) [arXiv:0903.0864]. Starting from an initial set of particle positions and diameters, the algorithm alternates between expanding or contracting particle sizes and minimizing the overlap energy, gradually increasing the packing fraction until a jammed state is reached. At each set of steps once energy minimization is reached (determined by the degree to which forces are sufficiently balanced) the particle diameters expaned if particle overlap is mininal, otherwise particle diameters contract. Expansion and contraction rates decrease over time until the diameter adjustment step falls below a tolerance, at which point the algorithm terminates and returns the hard particle packing as the particle positions and diameters.
 
 Energy minimization was originally implemented using a conjugate‑gradient solver in Desmond & Weeks (2009). Since then the ADAM optimizer was introduced for neural netork training, and here we find it performs much faster. As such, the ADAM optimize is utilized for rapid initial convergence, followed by AMSGrad for stability when ADAM stalls, and finally overdamped Verlet integrator if overlaps persist. If overlaps still persist it gives up and contracts the particle diameters. In practice, ADAM quickly removes most overlaps, but AMSGrad and Verlet help in reducing overlaps even more.
 
@@ -361,6 +449,9 @@ This project is released under the **MIT License**.
 ## Contact
 
 Kenneth Desmond — [@<KD-physics>](https://github.com/<KD-physics>)
+
+```
+```
 
 ```
 ```
