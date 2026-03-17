@@ -1,4 +1,4 @@
-# Random Close Packing (RCP) in Python
+# Densely Packing Spheres in Python - Random Close Packing (RCP)
 
 ## The Problem of High-Density Packing
 Generating **True Random Close Packing** is fundamentally more complex than simple random placement. At low densities, "place and reject" (Monte Carlo) methods are sufficient. However, as the system approaches the jamming limit (volume fraction $\phi \approx 0.64$ for monodisperse spheres), the probability of placing a sphere without overlap drops toward zero.
@@ -6,7 +6,12 @@ Generating **True Random Close Packing** is fundamentally more complex than simp
 To generate dense packings, the system must **evolve** toward a jammed state using either optimization methods or dynamical simulations.
 
 ## Implementation with `rcpgenerator`
-`rcpgenerator` is an open-source library designed to generate dense packings of non-overlapping spheres using an optimization-based approach.
+
+`rcpgenerator` is an open-source Python library developed to generate dense, jammed packings of non-overlapping spheres. Unlike simple rejection-sampling methods that fail at high volume fractions, this toolkit uses an **optimization-based "inflation" approach** to reach the **Random Close Packing (RCP) limit** ($\phi \approx 0.64$).
+
+* **GitHub Repository:** [rcpgenerator: Fast RCP Sphere Packing](https://github.com/KD-physics/RCPGenerator)
+* **Key Features:** Support for polydisperse distributions, custom container geometries (box, cylinder, sphere), and $O(N \log N)$ scaling.
+* **Background:** This library refactors the core algorithms used in my research on granular materials and soft-matter physics.
 
 ### Quick Start
 ```python
