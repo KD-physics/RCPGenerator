@@ -423,8 +423,17 @@ class Packing:
         path: str | Path | None = None,
         show: bool = False,
         palette_choice: int = 1,
+        figsize=(4, 4),
+        dpi=110,
     ) -> str | None:
-        return _render_packing(self, path=path, show=show, palette_choice=palette_choice)
+        return _render_packing(
+            self,
+            path=path,
+            show=show,
+            palette_choice=palette_choice,
+            figsize=figsize,
+            dpi=dpi,
+        )
 
     def savefig(
         self,
