@@ -11,7 +11,7 @@ To generate dense packings, the system must **evolve** toward a jammed state usi
 
 * **GitHub Repository:** [rcpgenerator: Fast Spehere Packing Generating](https://colab.research.google.com/github/KD-physics/RCPGenerator/blob/main/getting_started.ipynb)
 * **Key Features:** Support for polydisperse distributions, custom container geometries (box, cylinder, sphere), and higher dimensions (tested up to 7).
-
+* [Run in Colab ↗](https://colab.research.google.com/github/KD-physics/RCPGenerator/blob/main/getting_started.ipynb)
 
 ### Quick Start
 ```python
