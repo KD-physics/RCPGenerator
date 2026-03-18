@@ -195,8 +195,8 @@ def _draw_3d_boundary(ax: plt.Axes, box: list[float], walls: list[int]) -> None:
         _draw_box_wireframe(ax, box)
 
 
-def _plot_2d(packing, palette_choice: int) -> plt.Figure:
-    fig, ax = plt.subplots(figsize=(8, 8), dpi=180)
+def _plot_2d(packing, palette_choice: int, figsize=(5, 5), dpi=120) -> plt.Figure:
+    fig, ax = plt.subplots(figsize=figsize, dpi=dpi)
     positions = np.asarray(packing.positions, dtype=float)
     diameters = np.asarray(packing.diameters, dtype=float)
     colors = _particle_colors(len(diameters), palette_choice)
@@ -222,8 +222,8 @@ def _plot_2d(packing, palette_choice: int) -> plt.Figure:
     return fig
 
 
-def _plot_3d(packing, palette_choice: int) -> plt.Figure:
-    fig = plt.figure(figsize=(8, 8), dpi=180)
+def _plot_3d(packing, palette_choice: int, figsize=(5, 5), dpi=120) -> plt.Figure:
+    fig = plt.figure(figsize=figsize, dpi=dpi)    
     ax = fig.add_subplot(111, projection="3d")
     positions = np.asarray(packing.positions, dtype=float)
     diameters = np.asarray(packing.diameters, dtype=float)
