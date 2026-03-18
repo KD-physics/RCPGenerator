@@ -271,15 +271,17 @@ def render_packing(
     path: str | Path | None = None,
     show: bool = False,
     palette_choice: int = 1,
+    figsize: tuple[float, float] = (4, 4),
+    dpi: int = 110,
 ) -> str | None:
     output_path = Path(path) if path is not None else None
     if output_path is not None:
         output_path.parent.mkdir(parents=True, exist_ok=True)
 
     if packing.Ndim == 2:
-        fig = _plot_2d(packing, palette_choice)
+        fig = _plot_2d(packing, palette_choice, figsize=figsize, dpi=dpi)
     elif packing.Ndim == 3:
-        fig = _plot_3d(packing, palette_choice)
+        fig = _plot_3d(packing, palette_choice, figsize=figsize, dpi=dpi)
     else:
         raise ValueError(f"Unsupported rendering dimension: {packing.Ndim}")
 
@@ -289,7 +291,6 @@ def render_packing(
         plt.show()
     plt.close(fig)
     return str(output_path) if output_path is not None else None
-
 
 def animate_packing_2d(
     packing,
