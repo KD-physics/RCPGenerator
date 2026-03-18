@@ -52,12 +52,19 @@ See the `python/` directory and the **`getting_started.ipynb` notebook** for ins
 ### Example: Generating Dense Sphere Packing in Python
 
 ```python
-# Python code snippet to generate dense 3D sphere packing in unit box
 from rcpgenerator import Packing
 
-p = Packing(N=500, Ndim=3, box=[1,1,1]) # Initialize a unit box with 500 spherical particles in 3D
-p.pack() # Generating densing packing of spheres
-p.show_packing() # Display dense packing
+# Initialize 200 spheres in a unit cube
+p = Packing(N=200, Ndim=3, box=[1,1,1]) # See colab getting_started for more examples and settings
+
+# Evolve the system toward a jammed configuration
+final_packing = p.pack()
+
+# Visualize the final packing
+p.show_packing() # should only take a few seconds to run
+
+# Display Packing
+p.show_packing(figsize=(4,4)) # could take 10's of seconds to run
 ```
 
 ## c++ Interface
