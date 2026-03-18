@@ -433,10 +433,21 @@ class Packing:
         palette_choice: int = 1,
     ) -> str:
         return self.render(path=path, show=show, palette_choice=palette_choice)
-
-    def show_packing(self, palette_choice: int = 1) -> None:
-        self.render(path=None, show=True, palette_choice=palette_choice)
-
+    
+    def show_packing(
+        self,
+        palette_choice: int = 1,
+        figsize=(4, 4),
+        dpi=110,
+    ) -> None:
+        self.render(
+            path=None,
+            show=True,
+            palette_choice=palette_choice,
+            figsize=figsize,
+            dpi=dpi,
+        )
+        
     def animate_2d(
         self,
         path: str | Path | None = None,
