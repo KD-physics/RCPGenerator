@@ -93,11 +93,19 @@ class Packing:
         self.N = kwargs.pop("N", 0)
         self.Ndim = kwargs.pop("Ndim", 0)
         self.box = deepcopy(kwargs.pop("box", []))
-        self.walls = deepcopy(kwargs.pop("walls", []))
-        self.fix_height = kwargs.pop("fix_height", False)
-        self.dist = deepcopy(kwargs.pop("dist", {}))
+        default_walls = [0] * len(self.box) if self.box else []
+        self.walls = deepcopy(kwargs.pop("walls", default_walls))    
+        self.fix_height = kwargs.pop("fix_height", False)    
+        self.dist = deepcopy(kwargs.pop("dist", {"type": "mono", "d": 1.0}))
         self.neighbor_max = kwargs.pop("neighbor_max", 0)
         self.seed = kwargs.pop("seed", 0)
+        
+        # self.box = deepcopy(kwargs.pop("box", []))
+        # self.walls = deepcopy(kwargs.pop("walls", []))
+        # self.fix_height = kwargs.pop("fix_height", False)
+        # self.dist = deepcopy(kwargs.pop("dist", {}))
+        # self.neighbor_max = kwargs.pop("neighbor_max", 0)
+        # self.seed = kwargs.pop("seed", 0)
 
         self.positions = []
         self.diameters = []
