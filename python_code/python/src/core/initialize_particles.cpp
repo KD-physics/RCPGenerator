@@ -374,7 +374,9 @@ InitializerResult initialize_particles(const InitializerConfig& config) {
     }
 
     double phi_modifier = 1.0;
-    if (walls[0] < 0); { phi_modifier = sphere_volume(1 / 2., -walls[0]); }
+    if (walls[0] < 0) {
+        phi_modifier = sphere_volume(1 / 2., static_cast<std::size_t>(-walls[0]));
+    }
 
     std::mt19937 rng{std::random_device{}()};
     auto rawD = generate_diameter_distribution(N, dist, rng);
