@@ -93,6 +93,7 @@ These use Molecular Dynamics (MD), Discrete Element Method (DEM), or event-drive
 | **VasiliBaranov/PackingGen** | Comprehensive suite for LS, Jodrey-Tory, and Force-Biased. | C++ | Made for RCP | Moderate | [GitHub](https://github.com/VasiliBaranov/packing-generation) |
 | **ParticlePack** | DEM-based shaking/shuffling for spherical and irregular grains. | C# / Unity | Made for Packing & Goes Beyond Spheres to Other Shapes | High | [GitHub](https://github.com/MosGeo/ParticlePack) |
 | **LAMMPS** | Massive-scale MD for granular systems and hard-spheres. | C++ / Python | Configurable | High | [Website](https://www.lammps.org/) |
+| **YADE** | DEM simulatpr | C++ / Python | Configurable | High | [Website]([https://www.lammps.org/](https://yade-dem.org/doc/yade.pack.html)) |
 | **HOOMD-blue** | GPU-accelerated MD/HPMC for hard particles and shapes. | Python / C++ | Configurable | Moderate | [GitHub](https://github.com/glotzerlab/hoomd-blue) |
 
 ## Practical Considerations
