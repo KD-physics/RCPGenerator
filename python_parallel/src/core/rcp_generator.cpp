@@ -815,9 +815,11 @@ std::pair<PackingResult, PackingTrace> run_packing_observed(
     );
 
     std::vector<std::vector<double>> F(N, std::vector<double>(Ndim, 0.0));
-    std::vector<std::vector<double>> min_dist(
-        N, std::vector<double>(neighborMax, 0.0)
-    );
+    // min_dist is a legacy parameter to get_forces_nd_3 but is never read
+    // downstream (max_min_dist scalar carries the only consumed value). Pass
+    // an empty placeholder instead of allocating N × neighborMax doubles.
+    // Saves ~3.2 GB per worker at N=20K.
+    std::vector<std::vector<double>> min_dist;
     std::vector<std::size_t> z(N, 0);
     double U = 0.0, Lc = 0.0;
 
