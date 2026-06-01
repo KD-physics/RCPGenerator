@@ -1,0 +1,39 @@
+import rcpgenerator
+
+from _common import build_summary
+from _common import print_case_summary
+from _common import render_case
+
+
+CASE_NAME = "2d_bidisperse_box"
+
+
+def run_case(verbose: bool = False) -> dict[str, object]:
+    packing = rcpgenerator.Packing(
+        phi=0.11,
+        N=250,
+        Ndim=2,
+        box=[1.0, 1.0],
+        walls=[0, 0],
+        fix_height=False,
+        dist={"type": "bidisperse", "d1": 0.8, "d2": 1.2, "p": 0.5},
+        neighbor_max=0,
+        seed=124,
+        verbose=verbose,
+    )
+
+    packing.pack()
+    print_case_summary(CASE_NAME, packing)
+    image_path = render_case(CASE_NAME, packing)
+    print(f"image: {image_path}")
+    summary = build_summary(CASE_NAME, packing)
+    summary["image_path"] = image_path
+    return summary
+
+
+def main() -> None:
+    run_case(verbose=True)
+
+
+if __name__ == "__main__":
+    main()
