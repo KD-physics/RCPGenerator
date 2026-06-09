@@ -195,7 +195,18 @@ def _draw_3d_boundary(ax: plt.Axes, box: list[float], walls: list[int]) -> None:
         _draw_box_wireframe(ax, box)
 
 
-def _plot_2d(packing, palette_choice: int, figsize=(5, 5), dpi=120) -> plt.Figure:
+def _resolve_lim(user, box_lo, box_hi):
+    """Pick an (lo, hi) tuple. None / [] / () → fall back to box bounds.
+    Otherwise expects a 2-element sequence."""
+    if user is None:
+        return (box_lo, box_hi)
+    if hasattr(user, "__len__") and len(user) == 0:
+        return (box_lo, box_hi)
+    return (float(user[0]), float(user[1]))
+
+
+def _plot_2d(packing, palette_choice: int, figsize=(5, 5), dpi=120,
+             xlim=None, ylim=None) -> plt.Figure:
     fig, ax = plt.subplots(figsize=figsize, dpi=dpi)
     positions = np.asarray(packing.positions, dtype=float)
     diameters = np.asarray(packing.diameters, dtype=float)
@@ -214,16 +225,17 @@ def _plot_2d(packing, palette_choice: int, figsize=(5, 5), dpi=120) -> plt.Figur
             ax.add_patch(circle)
 
     _draw_2d_boundary(ax, list(packing.box), list(packing.walls))
-    ax.set_xlim(0.0, packing.box[0])
-    ax.set_ylim(0.0, packing.box[1])
+    ax.set_xlim(*_resolve_lim(xlim, 0.0, packing.box[0]))
+    ax.set_ylim(*_resolve_lim(ylim, 0.0, packing.box[1]))
     ax.set_aspect("equal", adjustable="box")
     ax.axis("off")
     fig.tight_layout(pad=0.05)
     return fig
 
 
-def _plot_3d(packing, palette_choice: int, figsize=(5, 5), dpi=120) -> plt.Figure:
-    fig = plt.figure(figsize=figsize, dpi=dpi)    
+def _plot_3d(packing, palette_choice: int, figsize=(5, 5), dpi=120,
+             xlim=None, ylim=None, zlim=None) -> plt.Figure:
+    fig = plt.figure(figsize=figsize, dpi=dpi)
     ax = fig.add_subplot(111, projection="3d")
     positions = np.asarray(packing.positions, dtype=float)
     diameters = np.asarray(packing.diameters, dtype=float)
@@ -255,10 +267,15 @@ def _plot_3d(packing, palette_choice: int, figsize=(5, 5), dpi=120) -> plt.Figur
         )
 
     _draw_3d_boundary(ax, list(packing.box), list(packing.walls))
-    ax.set_xlim(0.0, packing.box[0])
-    ax.set_ylim(0.0, packing.box[1])
-    ax.set_zlim(0.0, packing.box[2])
-    ax.set_box_aspect(tuple(packing.box))
+    xlim_r = _resolve_lim(xlim, 0.0, packing.box[0])
+    ylim_r = _resolve_lim(ylim, 0.0, packing.box[1])
+    zlim_r = _resolve_lim(zlim, 0.0, packing.box[2])
+    ax.set_xlim(*xlim_r)
+    ax.set_ylim(*ylim_r)
+    ax.set_zlim(*zlim_r)
+    ax.set_box_aspect((xlim_r[1] - xlim_r[0],
+                       ylim_r[1] - ylim_r[0],
+                       zlim_r[1] - zlim_r[0]))
     ax.view_init(elev=22, azim=35)
     ax.set_axis_off()
     ax.set_facecolor("white")
@@ -273,15 +290,26 @@ def render_packing(
     palette_choice: int = 1,
     figsize: tuple[float, float] = (4, 4),
     dpi: int = 110,
+    xlim=None,
+    ylim=None,
+    zlim=None,
 ) -> str | None:
+    """Render a packing to PNG (and/or display inline).
+
+    `xlim`, `ylim`, `zlim`: each accepts `None` or `[]` (use the box
+    bounds) or a 2-element sequence like ``[0.0, 0.4]`` to zoom into a
+    sub-region. ``zlim`` is ignored for 2D packings.
+    """
     output_path = Path(path) if path is not None else None
     if output_path is not None:
         output_path.parent.mkdir(parents=True, exist_ok=True)
 
     if packing.Ndim == 2:
-        fig = _plot_2d(packing, palette_choice, figsize=figsize, dpi=dpi)
+        fig = _plot_2d(packing, palette_choice, figsize=figsize, dpi=dpi,
+                       xlim=xlim, ylim=ylim)
     elif packing.Ndim == 3:
-        fig = _plot_3d(packing, palette_choice, figsize=figsize, dpi=dpi)
+        fig = _plot_3d(packing, palette_choice, figsize=figsize, dpi=dpi,
+                       xlim=xlim, ylim=ylim, zlim=zlim)
     else:
         raise ValueError(f"Unsupported rendering dimension: {packing.Ndim}")
 
