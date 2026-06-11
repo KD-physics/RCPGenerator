@@ -1,0 +1,16 @@
+[build-system]
+requires = ["scikit-build-core>=0.10", "pybind11>=2.12"]
+build-backend = "scikit_build_core.build"
+
+[project]
+name = "rcpgenerator"
+version = "0.3.0"
+description = "Fast random close packing generator for polydisperse spheres in N dimensions (OpenMP + SIMD C++ core with a Python API)"
+readme = "README.md"
+license = { file = "LICENSE" }
+requires-python = ">=3.9"
+dependencies = ["matplotlib>=3.10"]
+
+[tool.scikit-build]
+cmake.source-dir = "."
+build.verbose = true
