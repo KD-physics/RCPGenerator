@@ -277,13 +277,14 @@ def _adaptive_packing_worker(payload):
             verbose=False,
         )
         phi = safe_compute_phi(packing)
-        ov = overlap_report(packing, verbose=False)
-        phi_corr = phi_corrected(phi, ov["max_overlap"], Ndim)
+        from .jobs import engine_max_overlap
+        mo = engine_max_overlap(packing)
+        phi_corr = phi_corrected(phi, mo, Ndim)
         return {
             "success": True,
             "phi": float(phi),
             "phi_corr": float(phi_corr),
-            "max_overlap": float(ov["max_overlap"]),
+            "max_overlap": float(mo),
             "stage": payload.get("stage", "unknown"),
             "seed_id": seed_id,
         }

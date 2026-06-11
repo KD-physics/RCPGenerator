@@ -189,11 +189,11 @@ def create_packing(theta, MODEL, *,
         "phi_rcp": float(get_final_phi(packing)),
     }
     if compute_overlap:
-        ov = overlap_report(packing, verbose=False)
-        stats["max_overlap"] = ov["max_overlap"]
-        stats["mean_overlap"] = ov["mean_overlap"]
-        stats["n_overlapping"] = ov["n_overlapping"]
-        stats["phi_corr"] = phi_corrected(phi, ov["max_overlap"], Ndim)
+        mo = engine_max_overlap(packing)
+        stats["max_overlap"] = mo
+        stats["mean_overlap"] = None    # full distribution: overlap_report
+        stats["n_overlapping"] = None
+        stats["phi_corr"] = phi_corrected(phi, mo, Ndim)
     else:
         stats["max_overlap"] = 0.0
         stats["mean_overlap"] = 0.0
@@ -269,6 +269,23 @@ def _save_packing_npz(packing, *, save_dir, generation, candidate, seed, stage):
         box=np.asarray(packing.box, dtype=float),
     )
     return str(path)
+
+
+def engine_max_overlap(packing):
+    """Final max fractional overlap, overlap/(r_i+r_j), read from the
+    engine's convergence-gate statistic (packing.max_min_dist) — the same
+    quantity overlap_report's max_overlap measures, at zero cost.
+
+    The full overlap_report builds a scipy KDTree and queries candidate
+    pairs at r = 2*R_max for EVERY particle; at high size ratio the
+    candidate count scales ~ N*SR^3 (multi-GB per call), and a cohort of
+    packings finishing together ran it simultaneously in every worker —
+    the source of the large transient memory spikes between packing
+    waves. Search paths only ever needed max_overlap for phi_corr, so
+    they now read the engine value; overlap_report remains available for
+    explicit, one-off distribution diagnostics."""
+    v = getattr(packing, "max_min_dist", None)
+    return float(v) if v is not None else 0.0
 
 
 def _estimate_pairs_gb(D, Ndim, base):
@@ -365,8 +382,8 @@ def run_packing_job(job):
         d_final = np.asarray(packing.diameters, dtype=float)
 
         phi = safe_compute_phi(packing)
-        ov = overlap_report(packing, verbose=False)
-        phi_corr = phi_corrected(phi, ov["max_overlap"], Ndim)
+        mo = engine_max_overlap(packing)
+        phi_corr = phi_corrected(phi, mo, Ndim)
 
         packing_path = None
         save_mode = str(job.get("save_packings", "none")).lower()
@@ -389,9 +406,9 @@ def run_packing_job(job):
             "phi": float(phi),
             "phi_rcp": float(get_final_phi(packing)),
             "phi_corr": float(phi_corr),
-            "max_overlap": float(ov["max_overlap"]),
-            "mean_overlap": float(ov["mean_overlap"]),
-            "n_overlapping": int(ov["n_overlapping"]),
+            "max_overlap": float(mo),
+            "mean_overlap": None,   # full distribution: overlap_report
+            "n_overlapping": None,
             "steps": int(packing.steps) if packing.steps is not None else None,
             "force_magnitude": float(packing.force_magnitude) if packing.force_magnitude is not None else None,
             "max_min_dist": float(packing.max_min_dist) if packing.max_min_dist is not None else None,

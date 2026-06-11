@@ -88,11 +88,12 @@ def _v2_packing_eval(payload, MODEL=None, pack_cfg=None):
         size_ratio_hint=MODEL.get("size_ratio"),
         verbose=False)
     phi = float(safe_compute_phi(packing))
-    ov = overlap_report(packing, verbose=False)
-    pc = float(phi_corrected(phi, ov["max_overlap"], Ndim))
+    from .jobs import engine_max_overlap
+    mo = engine_max_overlap(packing)
+    pc = float(phi_corrected(phi, mo, Ndim))
     score = pc if pack_cfg.get("score_by") == "phi_corr" else phi
     return {"success": True, "phi": score, "raw_phi": phi, "phi_corr": pc,
-            "max_overlap": float(ov["max_overlap"]), "rejected": False}
+            "max_overlap": float(mo), "rejected": False}
 
 
 # ============================================================================
