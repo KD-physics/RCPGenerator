@@ -402,7 +402,14 @@ def run_jobs(jobs, config):
         with ProcessPoolExecutor(max_workers=n_workers, mp_context=ctx) as ex:
             futures = [ex.submit(run_packing_job, job) for job in jobs]
             for fut in as_completed(futures):
-                results.append(fut.result())
+                row = fut.result()
+                if not row.get("success") and not row.get("rejected"):
+                    err = row.get("error", "no error message recorded")
+                    print(f"[heads-up] one packing run failed and was "
+                          f"skipped (candidate={row.get('candidate')}, "
+                          f"seed={row.get('seed')}, stage={row.get('stage')}). "
+                          f"The engine said:\n  {err}", flush=True)
+                results.append(row)
         return results
     except Exception as e:
         print("Parallel execution failed; falling back to serial.")

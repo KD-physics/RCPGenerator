@@ -1029,7 +1029,10 @@ class RealRunner(Runner):
             self._cooldown_until[worker_id] = end_wall + self.worker_cooldown_seconds
         try:
             result = f.result()
-        except Exception:
+        except Exception as exc:
+            print(f"[heads-up] one packing process failed and was skipped "
+                  f"(stage={attempt.stage.value}, seed={attempt.seed_id}). "
+                  f"The error was:\n  {exc!r}", flush=True)
             return Event(fake_time=t_now, event_type="failed",
                           attempt_id=attempt.attempt_id)
         if result.get("success"):
@@ -1037,6 +1040,13 @@ class RealRunner(Runner):
                           attempt_id=attempt.attempt_id,
                           phi=float(result["phi"]))
         else:
+            # The worker survived and reported a clean failure (e.g. the
+            # engine raised on neighbor-capacity overflow). Skip this run,
+            # tell the user what the engine said, and keep going.
+            err = result.get("error", "no error message recorded")
+            print(f"[heads-up] one packing run failed and was skipped "
+                  f"(stage={attempt.stage.value}, seed={attempt.seed_id}). "
+                  f"The engine said:\n  {err}", flush=True)
             return Event(fake_time=t_now, event_type="failed",
                           attempt_id=attempt.attempt_id)
 
