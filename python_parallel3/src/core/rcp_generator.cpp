@@ -610,6 +610,23 @@ static std::uint64_t g_rcp_perm_epoch = 0;
 // the dispatch call that follows on the same thread.
 static double g_rcp_shell_scale_dyn = 1.0;
 
+// Neighbor-capacity overflow: build the error message thrown to Python.
+// Sites inside OpenMP regions record it under a critical section and the
+// enclosing function throws AFTER the region (throwing across an OpenMP
+// boundary would call std::terminate and kill the process — which is the
+// failure mode this replaces).
+static std::string rcp_nb_overflow_msg(const char* site, std::size_t particle,
+                                       std::uint32_t cap) {
+    std::string m = "rcpgenerator: particle ";
+    m += std::to_string(particle);
+    m += " exceeded its neighbor capacity (";
+    m += std::to_string(cap);
+    m += " slots) during pair-list construction (";
+    m += site;
+    m += ").";
+    m += " This usually means the per-particle neighbor allocation is too small for the size ratio in this packing. Recommendation: pass a larger neighbor_max (the per-particle base; e.g. neighbor_max=1500 -- capacity scales as 50*(D_i/D_min)^omega + neighbor_max), or reduce the size ratio.";
+    return m;
+}
 // Per-run/periodic timing diagnostics to stderr. Default OFF for release
 // builds; RCP_PROFILE=1 enables (research instrumentation).
 static bool rcp_profile_prints() {
@@ -1221,6 +1238,7 @@ void get_pairs_nd_3(
     }
 
     bool warningIssued = false;
+    std::string overflow_msg;   // set under the overflow criticals below
 
     // Cycle 13: flat pairs storage. pairs[i] is now at pairs_data + pair_offsets[i].
     // pairs_data[pair_offsets[i]] is the count; following entries are neighbors.
@@ -1336,11 +1354,9 @@ void get_pairs_nd_3(
                         } else {
                             #pragma omp critical(warn_neighbor_overflow_A)
                             if (!warningIssued) {
-                                std::cerr << "Error: particle " << i
-                                          << " exceeded MaxNb_i = " << cap_i
-                                          << " (size-based per-particle cap). "
-                                          << "Raise MaxNbBig in the run options.\n";
-                                std::exit(EXIT_FAILURE);
+                                warningIssued = true;
+                                overflow_msg = rcp_nb_overflow_msg(
+                                    "sort+walk own-write", i, cap_i);
                             }
                         }
                     } else if (refresh[j] == 0) {
@@ -1362,11 +1378,9 @@ void get_pairs_nd_3(
                                 omp_unset_lock(&j_locks[j]);
                                 #pragma omp critical(warn_neighbor_overflow_B)
                                 if (!warningIssued) {
-                                    std::cerr << "Error: particle " << j
-                                              << " exceeded MaxNb_j = " << cap_j
-                                              << " (size-based per-particle cap). "
-                                              << "Raise MaxNbBig in the run options.\n";
-                                    std::exit(EXIT_FAILURE);
+                                    warningIssued = true;
+                                    overflow_msg = rcp_nb_overflow_msg(
+                                        "sort+walk cross-write", j, cap_j);
                                 }
                             }
                         } else {
@@ -1391,6 +1405,11 @@ void get_pairs_nd_3(
             }
         }
     }  // close omp parallel block
+
+    // Cycle 21N: an overflow inside the parallel region was recorded
+    // instead of exiting; surface it now as an exception (caught in
+    // Python; the worker process survives).
+    if (warningIssued) throw std::runtime_error(overflow_msg);
 
     // Canonicalize: sort each particle's neighbor list.
     #pragma omp parallel for schedule(static)
@@ -1809,8 +1828,17 @@ struct KdTree {
         if (N > KD_LEAF_SIZE) {
             const std::size_t split_dim_root = 0;
             const std::uint32_t mid = static_cast<std::uint32_t>(N) / 2;
+            // Cycle 21N FIX: bound the partition to the LIVE N entries.
+            // perm is a grow-only buffer; using perm.end() partitioned
+            // across stale tail entries from a previous (larger-N) run in
+            // the same process, shuffling dead particle indices into the
+            // live range — out-of-bounds position reads (occasional
+            // worker segfault) and silently wrong neighbor lists. Latent
+            // since Cycle 8 H19; only fires when one process packs a
+            // smaller system after a larger one.
             __gnu_parallel::nth_element(
-                perm.begin(), perm.begin() + mid, perm.end(),
+                perm.begin(), perm.begin() + mid,
+                perm.begin() + static_cast<std::ptrdiff_t>(N),
                 [x, Ndim, split_dim_root](std::uint32_t a, std::uint32_t b) {
                     return x[a * Ndim + split_dim_root]
                          < x[b * Ndim + split_dim_root];
@@ -3099,6 +3127,7 @@ void get_pairs_kdtree(
     }
 
     bool warningIssued = false;
+    std::string overflow_msg;   // set under the overflow criticals below
 
     // Cycle 7 H11: per-thread deferred cross-write buffer. Each thread
     // appends (j, i) pairs locally instead of locking slot_j. After the
@@ -3254,10 +3283,23 @@ void get_pairs_kdtree(
                         } else {
                             #pragma omp critical(warn_neighbor_overflow_kd_A)
                             if (!warningIssued) {
-                                std::cerr << "Error: particle " << i
-                                          << " exceeded MaxNb_i = " << cap_i
-                                          << " (kdtree own-write).\n";
-                                std::exit(EXIT_FAILURE);
+                                warningIssued = true;
+                                overflow_msg = rcp_nb_overflow_msg(
+                                    "kdtree own-write", i, cap_i);
+                                if (std::getenv("RCP_DEBUG_LAYOUT")) {
+                                    std::cerr << "[ovf] i=" << i
+                                              << " cap=" << cap_i
+                                              << " Di=" << Di
+                                              << " Dmax=" << Dmax
+                                              << " t_shell=" << t_shell
+                                              << " infl=" << kd_radius_inflation
+                                              << " full_rebuild=" << need_full_rebuild
+                                              << " kd_R=" << kd_R << "\n  slots:";
+                                    const std::uint32_t* sl = pairs_data + pair_offsets[i];
+                                    for (std::uint32_t kk = 1; kk <= std::min<std::uint32_t>(sl[0], 24); ++kk)
+                                        std::cerr << " " << sl[kk];
+                                    std::cerr << " ...\n";
+                                }
                             }
                         }
                     } else if (refresh[j] == 0) {
@@ -3319,16 +3361,18 @@ void get_pairs_kdtree(
                     kd_dirty_list.push_back(j);
                     dirty_kd[j] = 1;
                 }
-            } else {
-                if (!warningIssued) {
-                    std::cerr << "Error: particle " << j
-                              << " exceeded MaxNb_j = " << cap_j
-                              << " (kdtree cross-write).\n";
-                    std::exit(EXIT_FAILURE);
-                }
+            } else if (!warningIssued) {
+                warningIssued = true;
+                overflow_msg = rcp_nb_overflow_msg(
+                    "kdtree cross-write", j, cap_j);
             }
         }
     }
+
+    // Cycle 21N: surface any recorded overflow (parallel own-write or the
+    // serial cross-write merge above) as an exception now that all OpenMP
+    // regions and locks are released.
+    if (warningIssued) throw std::runtime_error(overflow_msg);
 
     // Cycle 7 measurement: record query-region wall per regime.
     if (kd_probe_on) {
@@ -4418,6 +4462,16 @@ std::pair<PackingResult, PackingTrace> run_packing_observed(
             off += static_cast<std::uint64_t>(cap) + 1;
         }
         offsets_out[N] = off;
+        if (std::getenv("RCP_DEBUG_LAYOUT")) {
+            std::uint32_t cmin = max_nb_out[0], cmax = max_nb_out[0];
+            for (std::size_t i = 1; i < N; ++i) {
+                if (max_nb_out[i] < cmin) cmin = max_nb_out[i];
+                if (max_nb_out[i] > cmax) cmax = max_nb_out[i];
+            }
+            std::cerr << "[layout] N=" << N << " base=" << base
+                      << " dmin=" << dmin << " caps=[" << cmin << ","
+                      << cmax << "] total_slots=" << off << "\n";
+        }
         return off;
     };
 
