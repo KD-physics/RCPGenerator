@@ -953,12 +953,20 @@ class RealRunner(Runner):
                  worker_cooldown_seconds: float = 0.0):
         from concurrent.futures import ProcessPoolExecutor
         import multiprocessing as mp
+        import os as _os
         self.n_workers = n_workers
         self.packing_callable = packing_callable
         self.throttle_local = throttle_local
         self.worker_cooldown_seconds = worker_cooldown_seconds
-        ctx = mp.get_context("fork")
-        self.executor = ProcessPoolExecutor(max_workers=n_workers, mp_context=ctx)
+        # forkserver (default): children come from a clean helper process.
+        # Plain fork inherits the parent's initialized OpenMP runtime —
+        # if the notebook packed anything in-process before the search,
+        # forked children die abruptly at their first parallel region
+        # (BrokenProcessPool with no message). RCP_MP_CONTEXT overrides.
+        self._mp_ctx = mp.get_context(
+            _os.environ.get("RCP_MP_CONTEXT", "forkserver"))
+        self.executor = ProcessPoolExecutor(max_workers=n_workers,
+                                            mp_context=self._mp_ctx)
         self._future_to_data = {}   # future -> (attempt, start_wall, worker_id)
         self._wall_start = time.monotonic()
         self._busy_total = 0.0
@@ -968,6 +976,24 @@ class RealRunner(Runner):
 
     def now(self):
         return time.monotonic() - self._wall_start
+
+    def _heal_pool(self):
+        """A worker died abruptly (OOM kill, segfault). Rebuild the pool so
+        the search continues; in-flight attempts surface as failed events
+        through the normal poll path (their dead futures raise)."""
+        from concurrent.futures import ProcessPoolExecutor
+        print("[heads-up] a worker process died abruptly (no Python "
+              "error — typically the OS out-of-memory killer or a native "
+              "crash). Rebuilding the worker pool and continuing; the "
+              "affected runs are recorded as failures and skipped. If this "
+              "repeats often, lower n_workers or RCP_WORKER_MEM_GB.",
+              flush=True)
+        try:
+            self.executor.shutdown(wait=False, cancel_futures=True)
+        except Exception:
+            pass
+        self.executor = ProcessPoolExecutor(max_workers=self.n_workers,
+                                            mp_context=self._mp_ctx)
 
     def n_idle(self):
         # Available = not in-flight AND past cooldown
@@ -1004,8 +1030,14 @@ class RealRunner(Runner):
         attempt.worker_id = w
         attempt.started_at = self.now()
         start_wall = time.monotonic()
-        f = self.executor.submit(self.packing_callable, attempt.theta,
-                                  attempt.seed_id, attempt.stage.value)
+        from concurrent.futures.process import BrokenProcessPool
+        try:
+            f = self.executor.submit(self.packing_callable, attempt.theta,
+                                      attempt.seed_id, attempt.stage.value)
+        except BrokenProcessPool:
+            self._heal_pool()
+            f = self.executor.submit(self.packing_callable, attempt.theta,
+                                      attempt.seed_id, attempt.stage.value)
         self._future_to_data[f] = (attempt, start_wall, w)
 
     def next_event(self) -> Optional[Event]:
@@ -1030,6 +1062,9 @@ class RealRunner(Runner):
         try:
             result = f.result()
         except Exception as exc:
+            from concurrent.futures.process import BrokenProcessPool
+            if isinstance(exc, BrokenProcessPool):
+                self._heal_pool()
             print(f"[heads-up] one packing process failed and was skipped "
                   f"(stage={attempt.stage.value}, seed={attempt.seed_id}). "
                   f"The error was:\n  {exc!r}", flush=True)

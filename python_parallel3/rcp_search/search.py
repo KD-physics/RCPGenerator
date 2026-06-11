@@ -254,6 +254,15 @@ def _save_best_per_gen(best_candidate, MODEL, config, generation):
 def _adaptive_packing_worker(payload):
     """Top-level (picklable) packing worker for the AdaptiveScheduler path."""
     try:
+        from .jobs import _pin_worker_threads, _check_worker_mem
+        _pin_worker_threads()
+        _mem_msg = _check_worker_mem(
+            payload["diameters"], int(payload["Ndim"]),
+            int(payload.get("neighbor_max", 0)))
+        if _mem_msg:
+            return {"success": False, "error": _mem_msg,
+                    "stage": payload.get("stage", "unknown"),
+                    "seed_id": int(payload.get("seed_id", -1))}
         D = np.asarray(payload["diameters"], dtype=float)
         seed_id = int(payload["seed_id"])
         Ndim = int(payload["Ndim"])

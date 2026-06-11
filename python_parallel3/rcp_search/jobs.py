@@ -271,9 +271,51 @@ def _save_packing_npz(packing, *, save_dir, generation, candidate, seed, stage):
     return str(path)
 
 
+def _estimate_pairs_gb(D, Ndim, base):
+    """Predicted neighbor-matrix allocation (GB) for this packing —
+    mirrors the engine's per-particle cap formula so pathological
+    candidates can be refused BEFORE the OS out-of-memory killer
+    silently destroys the worker process."""
+    D = np.asarray(D, dtype=float)
+    dmin = max(float(D.min()), 1e-300)
+    scaling = Ndim / 3.0
+    omega = 1.0 + Ndim / 6.0
+    b = base if base > 0 else (300 if Ndim == 2 else 750)
+    caps = np.ceil(scaling * (50.0 * (D / dmin) ** omega + b))
+    caps = np.minimum(caps, len(D))
+    return float((caps + 1).sum() * 4) / 1e9
+
+
+def _check_worker_mem(D, Ndim, base):
+    """Returns None if within budget, else an explanatory message."""
+    cap_gb = float(os.environ.get("RCP_WORKER_MEM_GB", "8"))
+    est = _estimate_pairs_gb(D, Ndim, base)
+    if est <= cap_gb:
+        return None
+    return (f"rcp_search: refusing to pack — estimated neighbor-matrix "
+            f"allocation {est:.1f} GB exceeds the per-worker budget "
+            f"{cap_gb:.0f} GB (RCP_WORKER_MEM_GB). This candidate's size "
+            f"distribution implies very large per-particle neighbor "
+            f"capacities. Raise RCP_WORKER_MEM_GB if the host has room, "
+            f"lower n_workers, or tighten the prescreen.")
+
+
+def _pin_worker_threads():
+    """Engine threads per worker process (default 1: the pool supplies the
+    parallelism — 40+ workers each spawning machine-wide OpenMP teams
+    oversubscribes the host ~40x). RCP_WORKER_THREADS overrides."""
+    try:
+        import rcpgenerator
+        rcpgenerator.set_num_threads(
+            max(1, int(os.environ.get("RCP_WORKER_THREADS", "1"))))
+    except Exception:
+        pass
+
+
 def run_packing_job(job):
     """Worker-safe one-packing entry point."""
     try:
+        _pin_worker_threads()
         D = np.asarray(job["diameters"], dtype=float)
         seed = int(job["seed"])
         rng = np.random.default_rng(seed)
@@ -301,6 +343,14 @@ def run_packing_job(job):
                     "packing_path": None,
                 }
 
+        mem_msg = _check_worker_mem(D, Ndim, int(job.get("neighbor_max", 0)))
+        if mem_msg:
+            return {
+                "success": False, "error": mem_msg,
+                "candidate": job["candidate"], "seed": seed,
+                "generation": job["generation"], "stage": job["stage"],
+                "theta": job.get("theta"),
+            }
         packing = run_one_custom_packing(
             D, seed=seed, Ndim=Ndim,
             phi_init=float(job["phi_init"]),
@@ -397,7 +447,8 @@ def run_jobs(jobs, config):
     if n_workers <= 1 or len(jobs) <= 1:
         return [run_packing_job(job) for job in jobs]
     try:
-        ctx = mp.get_context("fork")
+        # forkserver: immune to parent OpenMP state (see scheduler.py).
+        ctx = mp.get_context(os.environ.get("RCP_MP_CONTEXT", "forkserver"))
         results = []
         with ProcessPoolExecutor(max_workers=n_workers, mp_context=ctx) as ex:
             futures = [ex.submit(run_packing_job, job) for job in jobs]
