@@ -54,20 +54,24 @@ def run_one_custom_packing(
          realized phi matches `phi_init`.
       3. Call `.pack()` and return the packed instance.
 
-    `neighbor_max=0` resolves to a dimension- and size-ratio-scaled default
-    via :func:`auto_neighbor_max`. Pass a positive int to override.
+    `neighbor_max=0` (default) delegates to the engine's per-particle,
+    diameter-ratio-scaled allocation. Pass a positive int to override the
+    per-particle base.
     """
     diameters = np.asarray(diameters, dtype=float)
     diameters = diameters[np.isfinite(diameters)]
     diameters = np.maximum(diameters, 1e-12)
     N = len(diameters)
 
-    if int(neighbor_max) <= 0:
-        sr = float(size_ratio_hint) if size_ratio_hint else float(
-            diameters.max() / max(diameters.min(), 1e-12)
-        )
-        neighbor_max = auto_neighbor_max(N, Ndim, sr)
-    neighbor_max = int(min(neighbor_max, 7500))
+    # neighbor_max <= 0 delegates to the C++ per-particle layout (base 200
+    # scaled by each particle's diameter ratio), which sizes rows by actual
+    # need. The previous behavior resolved a GLOBAL value via
+    # auto_neighbor_max — sized for the largest particle — which the C++
+    # layer then used as the per-particle BASE, giving every small particle
+    # the big particle's allocation (~15 GB at N=500K, SR>=28 in 3D vs
+    # ~0.8 GB delegated). Explicit positive overrides pass through as the
+    # C++ base, unchanged.
+    neighbor_max = max(0, int(neighbor_max))
 
     if box is None:
         box = [1.0] * Ndim

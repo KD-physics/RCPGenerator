@@ -73,10 +73,13 @@ def safe_compute_phi(packing):
 
 
 def auto_neighbor_max(N, Ndim, size_ratio=1.0):
-    """Default per-particle neighbor allocation when CONFIG['neighbor_max']==0.
+    """LEGACY — no longer used by run_one_custom_packing/create_packing.
 
-    Scales as the C++ default does: with Ndim and the diameter ratio.
-    Capped at 7500 to keep memory bounded on large N.
+    Returns a single global allocation sized for the largest particle.
+    The engine now sizes neighbor rows per particle from each diameter
+    ratio, so passing this global value as `neighbor_max` would give
+    every small particle the largest particle's allocation. Kept only
+    for import compatibility.
     """
     base = 200.0
     scaling = Ndim / 3.0
