@@ -202,6 +202,7 @@ class _Cand:
     theta: Any
     state: CandState = CandState.PENDING
     results: list = field(default_factory=list)
+    raw: list = field(default_factory=list)      # full result dicts
     inflight: set = field(default_factory=set)   # attempt ids
 
     @property
@@ -470,6 +471,7 @@ class QueueScheduler:
             "respawns": self.pool.respawn_count,
             "utilization": util,
             "states": {c.cid: c.state.value for c in self.cands},
+            "candidates": self.cands,
             "events": list(self.events),
         }
         if self._own_pool:
@@ -498,6 +500,7 @@ class QueueScheduler:
                       f"stage={stage}): {out.get('error', '?')}")
             return
         c.results.append(float(out["phi"]))
+        c.raw.append(out)
         if stage == "cheap" and c.n >= self.cfg.cheap_seeds and \
                 c.state == CandState.SCREENING:
             self._on_screened(c)

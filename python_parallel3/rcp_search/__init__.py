@@ -55,6 +55,7 @@ from .model import (
     universal_pdf_R,
 )
 from .overlap import overlap_report, phi_corrected
+from .search_v2 import run_or_resume_search_v2
 from .persistence import (
     SearchState,
     load_config_sidecar,
@@ -111,6 +112,7 @@ __all__ = [
     "plot_population_at_generation", "regenerate_packing", "compare_runs",
     # quality
     "overlap_report", "phi_corrected",
+    "run_or_resume_search_v2",
     # voronoi
     "voronoi_phi_local", "plot_local_phi_histogram",
     "plot_local_phi_vs_diameter",
