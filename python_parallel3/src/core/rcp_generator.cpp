@@ -610,6 +610,19 @@ static std::uint64_t g_rcp_perm_epoch = 0;
 // the dispatch call that follows on the same thread.
 static double g_rcp_shell_scale_dyn = 1.0;
 
+// Cycle 21L diagnostics: current RSS of this process (Linux), GB.
+static double rcp_rss_gb() {
+    FILE* f = std::fopen("/proc/self/statm", "r");
+    if (!f) return 0.0;
+    long tot = 0, res = 0;
+    if (std::fscanf(f, "%ld %ld", &tot, &res) != 2) res = 0;
+    std::fclose(f);
+    return res * 4096.0 / 1e9;
+}
+static void rcp_rss_probe(const char* tag) {
+    if (!std::getenv("RCP_DEBUG_LAYOUT")) return;
+    std::cerr << "[rss] " << tag << ": " << rcp_rss_gb() << " GB\n";
+}
 // Neighbor-capacity overflow: build the error message thrown to Python.
 // Sites inside OpenMP regions record it under a critical section and the
 // enclosing function throws AFTER the region (throwing across an OpenMP
@@ -4477,9 +4490,41 @@ std::pair<PackingResult, PackingTrace> run_packing_observed(
 
     std::vector<std::uint32_t> max_neighbors_per_particle;
     std::vector<std::uint64_t> pair_offsets;
+    rcp_rss_probe("pre-pair-layout");
     std::uint64_t pairs_total = compute_pair_layout(
         max_neighbors_per_particle, pair_offsets);
-    std::vector<std::uint32_t> pairs_data(pairs_total, 0);
+    // Cycle 21L lazy pairs buffer. The N x M layout is CAPACITY — for
+    // mid-heavy size distributions occupancy is a few percent (e.g.
+    // gaussian bulk ~20x above a tail dmin: ~5000 slots/particle
+    // allocated, ~60 used). A zero-filled vector touches every page and
+    // makes the full 2+ GB capacity RESIDENT for the whole run; with
+    // many search workers running fat candidates simultaneously that
+    // was a ~100 GB host-memory wave. Untouched anonymous pages are
+    // zero-backed by the kernel, and row content beyond slot[0]=count
+    // is never read — so allocate WITHOUT value-init and reset only the
+    // per-row count slots. RSS then tracks actual usage, not capacity.
+    struct LazyPairs {
+        std::unique_ptr<std::uint32_t[]> buf;
+        std::uint64_t n = 0;
+        std::uint32_t* data() { return buf.get(); }
+        std::uint64_t size() const { return n; }
+        std::uint32_t* begin() { return buf.get(); }
+        std::uint32_t* end() { return buf.get() + n; }
+        std::uint32_t& operator[](std::uint64_t i) { return buf[i]; }
+        const std::uint32_t& operator[](std::uint64_t i) const { return buf[i]; }
+        void reset(std::uint64_t total, const std::uint64_t* offsets,
+                   std::size_t N) {
+            if (total != n) {
+                buf.reset(new std::uint32_t[total]);   // no value-init
+                n = total;
+            }
+            for (std::size_t i = 0; i < N; ++i)
+                buf[offsets[i]] = 0;                   // counts only
+        }
+    };
+    LazyPairs pairs_data;
+    pairs_data.reset(pairs_total, pair_offsets.data(), N);
+    rcp_rss_probe("post-pairs-alloc");
     // Cycle 21k packed-D0 mirror: per-slot D0[j] copies, maintained by the
     // pair backends' canonicalize passes, consumed by the force loop's
     // SIMD reject paths (contiguous load + kappa multiply instead of a
@@ -4718,8 +4763,7 @@ std::pair<PackingResult, PackingTrace> run_packing_observed(
         // offsets shift too. Recompute the layout and resize pairs_data.
         std::uint64_t new_total = compute_pair_layout(
             max_neighbors_per_particle, pair_offsets);
-        if (pairs_data.size() != new_total) pairs_data.assign(new_total, 0);
-        else std::fill(pairs_data.begin(), pairs_data.end(), 0u);
+        pairs_data.reset(new_total, pair_offsets.data(), N);
 
         // Rebuild pair list fresh under the new numbering.
         std::fill(refresh.begin(), refresh.end(), 1u);
@@ -4780,10 +4824,12 @@ std::pair<PackingResult, PackingTrace> run_packing_observed(
     g_rcp_shell_scale_dyn = 1.0;
     auto profile_wall_start = std::chrono::steady_clock::now();
 
+    rcp_rss_probe("pre-init-reorder");
     // Cycle 10: initial spatial reorder so the very first force loop sees
     // a cache-friendly layout. Skipped if REORDER_INTERVAL=0 (baseline).
     if (options.reorder_interval > 0) {
         reorder_particles_now();
+        rcp_rss_probe("post-init-reorder");
     } else {
         g_t_pairs.begin();
         {
@@ -5217,11 +5263,7 @@ std::pair<PackingResult, PackingTrace> run_packing_observed(
             {
                 std::uint64_t new_total = compute_pair_layout(
                     max_neighbors_per_particle, pair_offsets);
-                if (pairs_data.size() != new_total) {
-                    pairs_data.assign(new_total, 0);
-                } else {
-                    std::fill(pairs_data.begin(), pairs_data.end(), 0u);
-                }
+                pairs_data.reset(new_total, pair_offsets.data(), N);
             }
             // m_hat/v_hat are recomputed from m,v each step → no need to load.
             // Overwrite schedule scalars.
@@ -5299,6 +5341,11 @@ std::pair<PackingResult, PackingTrace> run_packing_observed(
         }
     }
     for (std::size_t step = start_step + 1; step <= max_steps; ++step) {
+        if ((step == 1 || step == 50 || step == 500) &&
+                std::getenv("RCP_DEBUG_LAYOUT")) {
+            std::cerr << "[rss] step" << step << ": " << rcp_rss_gb()
+                      << " GB\n";
+        }
         rcp_shadow_set_step(static_cast<std::uint64_t>(step));
         g_t_bookkeep.begin();
         steps = step;
@@ -5576,8 +5623,7 @@ std::pair<PackingResult, PackingTrace> run_packing_observed(
                 {
                     std::uint64_t new_total = compute_pair_layout(
                         max_neighbors_per_particle, pair_offsets);
-                    if (pairs_data.size() != new_total) pairs_data.assign(new_total, 0);
-                    else std::fill(pairs_data.begin(), pairs_data.end(), 0u);
+                    pairs_data.reset(new_total, pair_offsets.data(), N);
                 }
                 std::fill(refresh.begin(), refresh.end(), 1u);
                 {
