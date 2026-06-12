@@ -100,13 +100,22 @@ class PreemptivePool:
         self._procs[w] = p
 
     def submit(self, w: int, attempt_id: int, payload: dict):
-        try:
-            self._conns[w].send((attempt_id, payload))
-        except (BrokenPipeError, OSError):
-            # worker died since the last poll (e.g., OOM kill): respawn
-            # with a fresh pipe and resubmit — the task is not lost.
-            self.ensure_alive(w)
-            self._conns[w].send((attempt_id, payload))
+        """Send a task to worker w; on a dead pipe (worker OOM-killed or
+        crashed since the last poll), force a full respawn (fresh process
+        AND fresh pipe) and retry, twice, with a short breather — under
+        active OOM pressure the first respawn can be reaped too. Raises
+        only after three failures; the scheduler turns that into a failed
+        attempt rather than a dead search."""
+        for retry in range(3):
+            try:
+                self._conns[w].send((attempt_id, payload))
+                return
+            except (BrokenPipeError, OSError):
+                self.kill(w)        # full respawn: new process + new pipe
+                if retry:
+                    time.sleep(1.0)  # let memory pressure subside
+        raise BrokenPipeError(
+            f"worker {w}: pipe still broken after 3 respawns")
 
     def kill(self, w: int):
         """Terminate worker w mid-task and respawn with a fresh pipe."""
@@ -191,6 +200,8 @@ class QSConfig:
     z: float = 2.0                # one-sided confidence for the gate
     epsilon: float = 5e-4         # indifference zone in phi
     sigma_prior: float = 2e-3     # pooled-sigma fallback until data exists
+    progress_every: int = 25      # progress line every K completed seeds
+    progress_seconds: float = 120.0   # ... or at least every T seconds
     stop_cheap_when_filled: bool = True
     kill_cheap_when_filled: bool = True
     result_timeout_s: float = 30.0  # watchdog for lost workers
@@ -237,6 +248,8 @@ class QueueScheduler:
         self._t0: Optional[float] = None   # set at first dispatch
         self._idle_while_eligible = 0.0
         self.kills = 0
+        self._completed_seeds = 0
+        self._last_progress = (0, time.monotonic())
 
     # ---- statistics ------------------------------------------------------
 
@@ -400,7 +413,15 @@ class QueueScheduler:
         if c.state == CandState.PENDING:
             c.state = CandState.SCREENING
         self._worker_busy[w] = aid
-        self.pool.submit(w, aid, payload)
+        try:
+            self.pool.submit(w, aid, payload)
+        except (BrokenPipeError, OSError) as exc:
+            print(f"[heads-up] could not dispatch to worker {w} even "
+                  f"after respawns ({exc!r}) — recording the attempt as "
+                  f"failed and continuing. If this repeats, the host is "
+                  f"likely under memory pressure: lower n_workers or "
+                  f"RCP_WORKER_MEM_GB.", flush=True)
+            self._fail_attempt(aid, w)
 
     def _account_busy(self, aid: int, w: int):
         t0 = self._attempt_start.pop(aid, None)
@@ -486,6 +507,32 @@ class QueueScheduler:
         self._account_busy(aid, w)
         self._worker_busy[w] = None
 
+    def _progress(self, force=False):
+        n, t = self._last_progress
+        now = time.monotonic()
+        if not force and \
+                self._completed_seeds - n < self.cfg.progress_every and \
+                now - t < self.cfg.progress_seconds:
+            return
+        self._last_progress = (self._completed_seeds, now)
+        screened = self._screened_count()
+        bucket = self._bucket()
+        confirmed = sum(1 for c in bucket if c.state == CandState.CONFIRMED)
+        states = [c.state for c in self.cands]
+        dropped = states.count(CandState.DROPPED)
+        out_ct = (states.count(CandState.DEMOTED)
+                  + states.count(CandState.EVICTED))
+        lead = self._leader_mean()
+        inflight = sum(1 for b in self._worker_busy if b is not None)
+        print(f"[progress] seeds={self._completed_seeds} "
+              f"screened={screened}/{len(self.cands)} "
+              f"bucket={len(bucket)}/{self.cfg.max_elite} "
+              f"(confirmed={confirmed}) | in-flight={inflight} | "
+              f"dropped={dropped} demoted/evicted={out_ct} "
+              f"kills={self.kills} | "
+              f"best_so_far={lead if lead > -1e30 else float('nan'):.4f}",
+              flush=True)
+
     def _on_result(self, aid: int, out: dict):
         if aid in self._killed_attempts:
             return                       # late result from a killed attempt
@@ -495,9 +542,11 @@ class QueueScheduler:
         self._account_busy(aid, w)
         if self._worker_busy[w] == aid:
             self._worker_busy[w] = None
+        self._completed_seeds += 1
         if not out.get("success", True):
             self._log(f"[heads-up] run failed and skipped (c{cid} "
                       f"stage={stage}): {out.get('error', '?')}")
+            self._progress()
             return
         c.results.append(float(out["phi"]))
         c.raw.append(out)
@@ -509,6 +558,7 @@ class QueueScheduler:
             if c.state == CandState.ELITE and c.n >= self.cfg.elite_seeds:
                 c.state = CandState.CONFIRMED
                 self._log(f"confirm c{c.cid} mean={c.mean:.5f} n={c.n}")
+        self._progress()
 
     # ---- diagnostics -----------------------------------------------------
 

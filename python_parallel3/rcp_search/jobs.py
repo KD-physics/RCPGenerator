@@ -271,6 +271,53 @@ def _save_packing_npz(packing, *, save_dir, generation, candidate, seed, stage):
     return str(path)
 
 
+def _rss_gb():
+    """Current resident set of THIS process in GB (Linux)."""
+    try:
+        with open("/proc/self/statm") as f:
+            pages = int(f.read().split()[1])
+        return pages * 4096 / 1e9
+    except Exception:
+        return 0.0
+
+
+def _peak_gb():
+    """Lifetime peak RSS of this process in GB (ru_maxrss, Linux=KB)."""
+    try:
+        import resource
+        return resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1e6
+    except Exception:
+        return 0.0
+
+
+class _MemTrace:
+    """Per-stage RSS deltas inside a worker; prints only when a stage
+    grows the process by more than RCP_MEMTRACE_GB (default 1.0) — i.e.,
+    it is silent in normal operation and fires exactly during memory
+    spikes, identifying which stage produced them."""
+
+    def __init__(self, tag):
+        self.tag = tag
+        self.last = _rss_gb()
+        self.last_peak = _peak_gb()
+        self.thresh = float(os.environ.get("RCP_MEMTRACE_GB", "1.0"))
+        self.rows = []
+
+    def mark(self, stage):
+        now, pk = _rss_gb(), _peak_gb()
+        # peak delta exposes transients that are freed before stage end
+        self.rows.append((stage, now - self.last, pk - self.last_peak, now))
+        self.last, self.last_peak = now, pk
+
+    def flush(self):
+        if any(d > self.thresh or pd > self.thresh
+               for _, d, pd, _ in self.rows):
+            detail = " | ".join(
+                f"{st}:{d:+.2f}GB(peak{pd:+.2f},rss={r:.2f})"
+                for st, d, pd, r in self.rows)
+            print(f"[memtrace] {self.tag}: {detail}", flush=True)
+
+
 def engine_max_overlap(packing):
     """Final max fractional overlap, overlap/(r_i+r_j), read from the
     engine's convergence-gate statistic (packing.max_min_dist) — the same

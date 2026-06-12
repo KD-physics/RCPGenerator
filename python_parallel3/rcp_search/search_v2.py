@@ -60,13 +60,16 @@ def _v2_packing_eval(payload, MODEL=None, pack_cfg=None):
     ...record fields}. "phi" carries the SCORING value (mean_phi or
     phi_corr per config) so the scheduler's statistics drive on it."""
     _pin_worker_threads()
+    from .jobs import _MemTrace
     theta = np.asarray(payload["theta"], dtype=float)
     cid, seed = int(payload["candidate"]), int(payload["seed"])
     N, Ndim = int(pack_cfg["N"]), int(pack_cfg["Ndim"])
+    mt = _MemTrace(f"c{cid}s{seed}")
 
     D = sample_diameters(theta, MODEL, N=N)
     rng = np.random.default_rng(cid * 100003 + seed)
     rng.shuffle(D)
+    mt.mark("sample_D")
 
     ps = pack_cfg.get("prescreen") or {}
     if ps.get("enabled", False):
@@ -87,13 +90,20 @@ def _v2_packing_eval(payload, MODEL=None, pack_cfg=None):
         neighbor_max=int(pack_cfg.get("neighbor_max", 0)),
         size_ratio_hint=MODEL.get("size_ratio"),
         verbose=False)
+    mt.mark("pack")
     phi = float(safe_compute_phi(packing))
+    mt.mark("compute_phi")
     from .jobs import engine_max_overlap
     mo = engine_max_overlap(packing)
     pc = float(phi_corrected(phi, mo, Ndim))
+    mt.mark("overlap+corr")
     score = pc if pack_cfg.get("score_by") == "phi_corr" else phi
-    return {"success": True, "phi": score, "raw_phi": phi, "phi_corr": pc,
-            "max_overlap": float(mo), "rejected": False}
+    out = {"success": True, "phi": score, "raw_phi": phi, "phi_corr": pc,
+           "max_overlap": float(mo), "rejected": False}
+    del packing
+    mt.mark("teardown")
+    mt.flush()
+    return out
 
 
 # ============================================================================
@@ -115,6 +125,8 @@ def _qs_config_from(config) -> QSConfig:
         epsilon=float(config.get("gate_epsilon", 5e-4)),
         stop_cheap_when_filled=bool(config.get("stop_cheap_when_filled", True)),
         kill_cheap_when_filled=bool(config.get("kill_cheap_when_filled", True)),
+        progress_every=int(config.get("progress_every", 25)),
+        progress_seconds=float(config.get("progress_seconds", 120.0)),
     )
 
 
