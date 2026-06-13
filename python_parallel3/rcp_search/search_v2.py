@@ -193,6 +193,21 @@ def _run_queue_generation(state, MODEL, pool, eval_fn):
     print(f"[gen {gen + 1}] seeds={res['total_seeds']} kills={res['kills']} "
           f"utilization={res['utilization']:.2f} "
           f"sigma_pooled={res['pooled_sigma']:.2e}")
+    # Top-candidate distribution table (default on; set
+    # config['print_top_distribution']=False to silence). Shows how the
+    # winning distribution shape evolves generation to generation.
+    if config.get("print_top_distribution", True) and rows:
+        try:
+            from .model import theta_to_dataframe
+            top = rows[0]
+            tdf = theta_to_dataframe(top["theta"], MODEL)
+            print(f"Top candidate c{top['candidate']:02d} "
+                  f"(mean_phi={top['mean_phi']:.6f}) distribution:")
+            print(tdf.to_string(index=False,
+                                float_format=lambda x: f"{x:.6g}"))
+        except Exception as _disp_exc:
+            print(f"[top-dist] skipped (non-fatal): {_disp_exc!r}", flush=True)
+
     print("Elites:")
     for r in confirmed:
         print(f"  cand {r['candidate']:02d}: mean_phi={r['mean_phi']:.6f} "

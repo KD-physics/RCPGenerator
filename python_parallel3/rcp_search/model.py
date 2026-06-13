@@ -488,3 +488,57 @@ def make_universal_model(components, *, size_ratio=5.0, Ndim=2,
             "random": init_theta_random,
         },
     }
+
+
+def theta_to_dataframe(theta, MODEL):
+    """Decode a universal-mixture theta into a physical-parameter table.
+
+    Returns a long-format DataFrame, one row per (component, parameter),
+    with the raw theta value, its physical value, and units. The physical
+    transforms mirror the model's own PDF code exactly:
+      - amp slots -> softmax mixture weights across components
+      - R_low_u / R_high_u / R_center_u -> R = R_min + raw * (R_max-R_min)
+      - sigma_u -> raw * (R_max - R_min)
+      - exp -> raw (1-to-1, no transform)
+    """
+    import pandas as pd
+    theta = np.asarray(theta, dtype=float)
+    R_min, R_max = MODEL["R_min"], MODEL["R_max"]
+    span = R_max - R_min
+
+    amps = np.array([theta[c["slice_start"]] for c in MODEL["components"]])
+    w = np.exp(amps - amps.max())
+    w = w / w.sum()
+
+    rows = []
+    for k, c in enumerate(MODEL["components"]):
+        params = theta[c["slice_start"]:c["slice_end"]]
+        label, ctype = c["label"], c["type"]
+        rows.append({"component": label, "type": ctype, "param": "mixture_weight",
+                     "raw_theta": float(amps[k]), "physical": float(w[k]),
+                     "units": "fraction of mass"})
+        for j, pname in enumerate(c["param_names"]):
+            raw = float(params[j])
+            if pname == "amp":
+                continue
+            elif pname in ("R_low_u", "R_high_u", "R_center_u"):
+                R = R_min + raw * span
+                rows.append({"component": label, "type": ctype, "param": pname,
+                             "raw_theta": raw, "physical": R,
+                             "units": f"R (D = {2 * R:.4f})"})
+            elif pname == "sigma_u":
+                rows.append({"component": label, "type": ctype, "param": pname,
+                             "raw_theta": raw, "physical": raw * span,
+                             "units": "R (width)"})
+            elif pname == "exp":
+                rows.append({"component": label, "type": ctype, "param": pname,
+                             "raw_theta": raw, "physical": raw,
+                             "units": "P(R) ∝ R^exp"})
+            else:
+                rows.append({"component": label, "type": ctype, "param": pname,
+                             "raw_theta": raw, "physical": raw, "units": ""})
+        if ctype == "delta":
+            rows.append({"component": label, "type": ctype, "param": "sigma_fixed",
+                         "raw_theta": 0.005, "physical": 0.005 * span,
+                         "units": "R (width, internal)"})
+    return pd.DataFrame(rows)
