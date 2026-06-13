@@ -51,11 +51,13 @@ from .model import (
     perturb_theta,
     sample_diameters,
     set_perturb_weights,
+    theta_to_dataframe,
     tukey_window_on_interval,
     universal_pdf_R,
 )
 from .overlap import overlap_report, phi_corrected
 from .search_v2 import run_or_resume_search_v2
+from .census import load_census, moments_to_delta_S, census_path
 from .persistence import (
     SearchState,
     load_config_sidecar,
@@ -93,7 +95,7 @@ except ImportError:
 __all__ = [
     # model
     "COMPONENT_REGISTRY", "make_universal_model", "balance_amplitudes",
-    "set_perturb_weights", "initialize_theta", "evaluate_model_pdf",
+    "set_perturb_weights", "theta_to_dataframe", "initialize_theta", "evaluate_model_pdf",
     "sample_diameters", "clip_theta", "perturb_theta", "universal_pdf_R",
     "tukey_window_on_interval",
     # jobs
@@ -113,6 +115,7 @@ __all__ = [
     # quality
     "overlap_report", "phi_corrected",
     "run_or_resume_search_v2",
+    "load_census", "moments_to_delta_S", "census_path",
     # voronoi
     "voronoi_phi_local", "plot_local_phi_histogram",
     "plot_local_phi_vs_diameter",
