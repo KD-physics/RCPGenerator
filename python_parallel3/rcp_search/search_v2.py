@@ -77,12 +77,15 @@ def _v2_packing_eval(payload, MODEL=None, pack_cfg=None):
             D, Ndim, ps.get("phi_target", 0.85), ps.get("threshold", 2.5))
         if reject:
             return {"success": True, "phi": 0.0, "raw_phi": 0.0,
-                    "phi_corr": 0.0, "max_overlap": 0.0, "rejected": True}
+                    "phi_corr": 0.0, "max_overlap": 0.0, "rejected": True,
+                    "seed": seed, "steps": 0, "wall_s": 0.0}
 
     mem_msg = _check_worker_mem(D, Ndim, int(pack_cfg.get("neighbor_max", 0)))
     if mem_msg:
-        return {"success": False, "error": mem_msg}
+        return {"success": False, "error": mem_msg, "seed": seed}
 
+    import time as _time
+    _t0 = _time.perf_counter()
     packing = run_one_custom_packing(
         D, seed=seed, Ndim=Ndim,
         phi_init=float(pack_cfg["phi_init"]),
@@ -90,6 +93,8 @@ def _v2_packing_eval(payload, MODEL=None, pack_cfg=None):
         neighbor_max=int(pack_cfg.get("neighbor_max", 0)),
         size_ratio_hint=MODEL.get("size_ratio"),
         verbose=False)
+    _wall_s = _time.perf_counter() - _t0
+    _steps = int(packing.steps) if getattr(packing, "steps", None) is not None else None
     mt.mark("pack")
     phi = float(safe_compute_phi(packing))
     mt.mark("compute_phi")
@@ -99,7 +104,8 @@ def _v2_packing_eval(payload, MODEL=None, pack_cfg=None):
     mt.mark("overlap+corr")
     score = pc if pack_cfg.get("score_by") == "phi_corr" else phi
     out = {"success": True, "phi": score, "raw_phi": phi, "phi_corr": pc,
-           "max_overlap": float(mo), "rejected": False}
+           "max_overlap": float(mo), "rejected": False,
+           "seed": seed, "steps": _steps, "wall_s": float(_wall_s)}
     del packing
     mt.mark("teardown")
     mt.flush()
@@ -171,6 +177,14 @@ def _run_queue_generation(state, MODEL, pool, eval_fn):
                            pool=pool, log=bool(config.get("verbose_scheduler",
                                                           False)))
     res = sched.run()
+
+    # Cycle 22 packing census: append one row per packing (parent-side,
+    # single writer; reads results already collected — touches no worker).
+    try:
+        from .census import append_generation as _census_append
+        _census_append(state, MODEL, res, config)
+    except Exception as _census_exc:   # logging must never break a search
+        print(f"[census] skipped (non-fatal): {_census_exc!r}", flush=True)
 
     rows = [_cand_row(c, gen) for c in res["candidates"] if c.n > 0]
     rows.sort(key=lambda r: r["score"], reverse=True)
