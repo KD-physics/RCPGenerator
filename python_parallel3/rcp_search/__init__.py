@@ -57,6 +57,7 @@ from .model import (
 )
 from .overlap import overlap_report, phi_corrected
 from .search_v2 import run_or_resume_search_v2
+from .snapshot import restore_from_snapshot, load_snapshot
 from .census import load_census, moments_to_delta_S, census_path
 from .persistence import (
     SearchState,
@@ -115,6 +116,7 @@ __all__ = [
     # quality
     "overlap_report", "phi_corrected",
     "run_or_resume_search_v2",
+    "restore_from_snapshot", "load_snapshot",
     "load_census", "moments_to_delta_S", "census_path",
     # voronoi
     "voronoi_phi_local", "plot_local_phi_histogram",

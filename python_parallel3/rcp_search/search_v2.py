@@ -160,7 +160,7 @@ def _cand_row(c, gen):
     }
 
 
-def _run_queue_generation(state, MODEL, pool, eval_fn):
+def _run_queue_generation(state, MODEL, pool, eval_fn, restore_snap=None):
     config = state["config"]
     gen = int(state["next_generation"])
     rng = np.random.default_rng()
@@ -169,14 +169,56 @@ def _run_queue_generation(state, MODEL, pool, eval_fn):
     sigma = float(state["sigma"])
     pop = int(config["population_size"])
 
-    print(f"\n=== Generation {gen + 1}/{config['generations']} "
-          f"| sigma={sigma:.4f} | mode=queue-v2 ===")
+    restore_state = None
+    if restore_snap is not None and int(restore_snap.get("generation", -1)) == gen:
+        # Warm-start this generation from the realtime snapshot: reuse the
+        # exact population thetas and re-seed completed results/states.
+        sigma = float(restore_snap.get("sigma", sigma))
+        thetas = [np.asarray(t, dtype=float) for t in restore_snap["thetas"]]
+        restore_state = restore_snap.get("candidates")
+        print(f"\n=== Generation {gen + 1}/{config['generations']} "
+              f"| sigma={sigma:.4f} | mode=queue-v2 | RESTORED ===")
+        done = sum(len(v.get("results", [])) for v in restore_state.values())
+        bucket = sum(1 for v in restore_state.values()
+                     if v.get("state") in ("elite", "confirmed"))
+        leadvals = [sum(v["results"]) / len(v["results"])
+                    for v in restore_state.values() if v.get("results")]
+        best = max(leadvals) if leadvals else float("nan")
+        print(f"[progress] RESTORED: completed_packings={done} "
+              f"bucket={bucket} kills={int(restore_snap.get('kills', 0))} "
+              f"best_so_far={best:.4f} | resuming unfinished + in-flight thetas",
+              flush=True)
+    else:
+        print(f"\n=== Generation {gen + 1}/{config['generations']} "
+              f"| sigma={sigma:.4f} | mode=queue-v2 ===")
+        thetas = [perturb_theta(center, sigma, MODEL, rng) for _ in range(pop)]
 
-    thetas = [perturb_theta(center, sigma, MODEL, rng) for _ in range(pop)]
+    # Realtime snapshot: written after each result+dispatch (worker-finish
+    # cadence), atomic temp+rename. Only loss on a bump is in-flight compute.
+    def _snap(sched_self):
+        try:
+            from .snapshot import write_snapshot
+            write_snapshot(config["save_dir"], generation=gen, sigma=sigma,
+                           thetas=thetas, candidates=sched_self.cands,
+                           kills=sched_self.kills, config=config, model=MODEL)
+        except Exception as _se:
+            print(f"[snapshot] skipped (non-fatal): {_se!r}", flush=True)
+
     sched = QueueScheduler(_qs_config_from(config), thetas, eval_fn,
-                           pool=pool, log=bool(config.get("verbose_scheduler",
-                                                          False)))
+                           pool=pool,
+                           log=bool(config.get("verbose_scheduler", False)),
+                           on_tick=(_snap if config.get("snapshot", True)
+                                    else None),
+                           restore_state=restore_state)
     res = sched.run()
+
+    # Generation finished cleanly -> the checkpoint below supersedes the
+    # snapshot; clear it so a later restore=True never grabs a done gen.
+    try:
+        from .snapshot import clear_snapshot
+        clear_snapshot(config["save_dir"])
+    except Exception:
+        pass
 
     # Cycle 22 packing census: append one row per packing (parent-side,
     # single writer; reads results already collected — touches no worker).
@@ -253,10 +295,46 @@ def _run_queue_generation(state, MODEL, pool, eval_fn):
 # Entry point
 # ============================================================================
 
-def run_or_resume_search_v2(theta_start, config, MODEL, force_restart=False):
+def run_or_resume_search_v2(theta_start, config, MODEL, force_restart=False,
+                            restore=False, eval_fn=None, return_restored=False):
     """v2 search entry point — same contract and checkpoint as
-    run_or_resume_search; evaluation runs on the no-phases queue."""
+    run_or_resume_search; evaluation runs on the no-phases queue.
+
+    restore=False (default): unchanged behavior — resume from the last
+      COMPLETED generation in checkpoint.pkl, honoring the passed CONFIG/
+      MODEL (so you can change generations/N/etc and continue).
+    restore=True: true mid-generation restore from the realtime snapshot —
+      reverts CONFIG/MODEL to the snapshot's, warm-starts the in-progress
+      generation (only in-flight packings are lost), then continues.
+    eval_fn: optional override of the per-packing evaluator (module-level,
+      picklable). Default None -> the real rcpgenerator path. Used by tests.
+    return_restored=True: return (theta_best, state, config, model) instead
+      of (theta_best, state). The restored CONFIG/MODEL are also always on
+      state['config'] / state['model'].
+    """
     config = deepcopy(config)
+
+    # restore=True: authoritatively revert CONFIG and MODEL to the snapshot
+    # of the in-progress generation (the completed packings were computed
+    # under them; a changed N etc. would be inconsistent).
+    restore_snap = None
+    if restore:
+        from .snapshot import load_snapshot
+        restore_snap = load_snapshot(config.get("save_dir"))
+        if restore_snap is None:
+            print("[restore] no snapshot found; falling back to normal "
+                  "resume from the last completed generation.", flush=True)
+        else:
+            snap_cfg = deepcopy(restore_snap["config"])
+            snap_cfg["save_dir"] = config.get("save_dir", snap_cfg.get("save_dir"))
+            diffs = [k for k in snap_cfg
+                     if k in config and config[k] != snap_cfg[k]]
+            if diffs:
+                print(f"[restore] using snapshot CONFIG/MODEL; ignoring "
+                      f"passed-in differences in: {sorted(diffs)}", flush=True)
+            config = snap_cfg
+            MODEL = restore_snap["model"]
+
     search_dir(config)
     speed = config.get("speed")
     if speed is not None:
@@ -293,7 +371,8 @@ def run_or_resume_search_v2(theta_start, config, MODEL, force_restart=False):
         "prescreen": config.get("prescreen"),
         "score_by": str(config.get("score_by", "mean_phi")),
     }
-    eval_fn = partial(_v2_packing_eval, MODEL=MODEL, pack_cfg=pack_cfg)
+    if eval_fn is None:
+        eval_fn = partial(_v2_packing_eval, MODEL=MODEL, pack_cfg=pack_cfg)
     pool = PreemptivePool(resolve_n_workers(config), eval_fn)
 
     stop_eps = float(config.get("stop_eps", 1e-3))
@@ -305,8 +384,12 @@ def run_or_resume_search_v2(theta_start, config, MODEL, force_restart=False):
     prev_best = (state["best_result"][best_key]
                  if state.get("best_result") else -np.inf)
     try:
+        first = True
         while int(state["next_generation"]) < int(config["generations"]):
-            state = _run_queue_generation(state, MODEL, pool, eval_fn)
+            snap_for_gen = restore_snap if first else None
+            first = False
+            state = _run_queue_generation(state, MODEL, pool, eval_fn,
+                                          restore_snap=snap_for_gen)
             new_best = (state["best_result"][best_key]
                         if state.get("best_result") else -np.inf)
             if stop_G > 0:
@@ -326,4 +409,8 @@ def run_or_resume_search_v2(theta_start, config, MODEL, force_restart=False):
     theta_best = None
     if state.get("best_result") is not None:
         theta_best = np.asarray(state["best_result"]["theta"], dtype=float)
+    state["config"] = config
+    state["model"] = MODEL
+    if return_restored:
+        return theta_best, state, config, MODEL
     return theta_best, state

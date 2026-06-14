@@ -230,12 +230,31 @@ class QueueScheduler:
     no-phases workflow. Returns the decision + diagnostics."""
 
     def __init__(self, cfg: QSConfig, thetas: list, eval_fn: Callable,
-                 pool: Optional[PreemptivePool] = None, log: bool = False):
+                 pool: Optional[PreemptivePool] = None, log: bool = False,
+                 on_tick=None, restore_state=None):
         self.cfg = cfg
         self.cands = [_Cand(cid=i, theta=t) for i, t in enumerate(thetas)]
+        # Cycle 22 restore: re-seed completed results + states from a
+        # snapshot. In-flight / unfinished candidates keep their theta and
+        # simply get their remaining seeds re-dispatched (only the
+        # interrupted C++ packing is lost; the theta is preserved).
+        if restore_state is not None:
+            for cd in self.cands:
+                saved = restore_state.get(cd.cid)
+                if not saved:
+                    continue
+                cd.results = list(saved.get("results", []))
+                cd.raw = list(saved.get("raw", []))
+                st = saved.get("state")
+                if st is not None:
+                    cd.state = CandState(st) if not isinstance(st, CandState) else st
         self.pool = pool or PreemptivePool(cfg.n_workers, eval_fn)
         self._own_pool = pool is None
         self.log = log
+        # Cycle 22: called once per scheduler tick (after a result is
+        # processed and idle workers re-dispatched) with `self`, so the
+        # caller can persist a realtime snapshot. Never touches worker code.
+        self._on_tick = on_tick
         # attempt bookkeeping
         self._next_attempt = 0
         self._attempt_info: dict[int, tuple[int, str, int]] = {}  # aid -> (cid, stage, worker)
@@ -471,6 +490,12 @@ class QueueScheduler:
                     self._fail_attempt(dead_aid, w)
                 continue
             self._on_result(aid, out)
+            if self._on_tick is not None:
+                try:
+                    self._on_tick(self)
+                except Exception as _tick_exc:   # snapshot must never break a run
+                    print(f"[snapshot] skipped (non-fatal): {_tick_exc!r}",
+                          flush=True)
         util = self.utilization()
         bucket = sorted(self._bucket(), key=lambda c: c.mean, reverse=True)
         confirmed = [c for c in bucket if c.n >= cfg.elite_seeds]
