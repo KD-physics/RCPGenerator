@@ -234,17 +234,23 @@ def _run_queue_generation(state, MODEL, pool, eval_fn, restore_snap=None):
                  if r["state"] in ("confirmed", "elite")]
     print(f"[gen {gen + 1}] seeds={res['total_seeds']} kills={res['kills']} "
           f"utilization={res['utilization']:.2f} "
-          f"sigma_pooled={res['pooled_sigma']:.2e}")
+          f"sigma_pooled={res['pooled_sigma']:.2e} "
+          f"tail_idle={res.get('tail_idle_cpu_s', 0.0)/60.0:.1f} cpu-min")
     # Top-candidate distribution table (default on; set
     # config['print_top_distribution']=False to silence). Shows how the
     # winning distribution shape evolves generation to generation.
     if config.get("print_top_distribution", True) and rows:
         try:
             from .model import theta_to_dataframe
-            top = rows[0]
+            # Show the top CONFIRMED candidate (the one that actually feeds
+            # the decision), not the global max-mean — a 1-2 seed noise draw
+            # can top the raw list without being trustworthy or selected.
+            top = confirmed[0] if confirmed else rows[0]
+            tag = "confirmed elite" if confirmed else "UNCONFIRMED (no elite this gen)"
             tdf = theta_to_dataframe(top["theta"], MODEL)
             print(f"Top candidate c{top['candidate']:02d} "
-                  f"(mean_phi={top['mean_phi']:.6f}) distribution:")
+                  f"(mean_phi={top['mean_phi']:.6f}, n={top['n']}, "
+                  f"state={top['state']}, {tag}) distribution:")
             print(tdf.to_string(index=False,
                                 float_format=lambda x: f"{x:.6g}"))
         except Exception as _disp_exc:

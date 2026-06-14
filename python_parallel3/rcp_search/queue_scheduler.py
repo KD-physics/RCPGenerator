@@ -269,6 +269,11 @@ class QueueScheduler:
         self.kills = 0
         self._completed_seeds = 0
         self._last_progress = (0, time.monotonic())
+        # Cycle 22 idle-tail measurement: once all cheaps are screened
+        # (rule 1 satisfied), measure CPU-time left idle while the elite
+        # tail drains — the recoverable prize for speculative gen X+1.
+        self._tail_start = None
+        self._busy_at_tail_start = 0.0
 
     # ---- statistics ------------------------------------------------------
 
@@ -516,6 +521,7 @@ class QueueScheduler:
             "kills": self.kills,
             "respawns": self.pool.respawn_count,
             "utilization": util,
+            "tail_idle_cpu_s": self.tail_idle_cpu_s(),
             "states": {c.cid: c.state.value for c in self.cands},
             "candidates": self.cands,
             "events": list(self.events),
@@ -578,6 +584,14 @@ class QueueScheduler:
         if stage == "cheap" and c.n >= self.cfg.cheap_seeds and \
                 c.state == CandState.SCREENING:
             self._on_screened(c)
+        # idle-tail clock starts the instant the cheap phase is exhausted
+        # (no candidate still PENDING or mid-cheap-screen) — covers both
+        # full-screen and fill-and-stop endings of the cheap phase.
+        if self._tail_start is None and not any(
+                cd.state in (CandState.PENDING, CandState.SCREENING)
+                for cd in self.cands):
+            self._tail_start = time.monotonic()
+            self._busy_at_tail_start = sum(self._busy_time)
         elif stage == "elite":
             self._racing_check()
             if c.state == CandState.ELITE and c.n >= self.cfg.elite_seeds:
@@ -586,6 +600,17 @@ class QueueScheduler:
         self._progress()
 
     # ---- diagnostics -----------------------------------------------------
+
+    def tail_idle_cpu_s(self) -> float:
+        """CPU-seconds left idle after all cheaps were screened (rule 1
+        done) until generation end — the elite-tail prize a speculative
+        gen X+1 could reclaim."""
+        if self._tail_start is None:
+            return 0.0
+        span = time.monotonic() - self._tail_start
+        tail_busy = sum(self._busy_time) - self._busy_at_tail_start
+        idle = self.cfg.n_workers * span - tail_busy
+        return max(0.0, idle)
 
     def utilization(self) -> float:
         if self._t0 is None:
