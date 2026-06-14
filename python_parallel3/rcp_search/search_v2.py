@@ -269,9 +269,12 @@ def _run_queue_generation(state, MODEL, pool, eval_fn, restore_snap=None):
         cur = state["best_result"]
         if cur is None or best_this_gen[best_key] > cur.get(best_key, -np.inf):
             state["best_result"] = deepcopy(best_this_gen)
-        # center update: TOP-K BY MEAN (recombination set, decoupled from
-        # confirmation depth) with v1's exp-rank weights
-        recomb = rows[:int(config.get("elite_count", 2))]
+        # center update: recombination set = top-K CONFIRMED candidates by
+        # mean (NOT all rows — including dropped/demoted candidates would
+        # let a single-seed noise outlier with a lucky high mean dominate
+        # the center via the rank-0 weight, steering the search on noise).
+        # Matches v1's batch path, which recombines from confirmed only.
+        recomb = confirmed[:int(config.get("elite_count", 2))]
         elite_thetas = np.array([np.asarray(r["theta"], dtype=float)
                                  for r in recomb])
         ranks = np.arange(len(elite_thetas))
