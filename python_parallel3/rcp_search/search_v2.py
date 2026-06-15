@@ -160,6 +160,201 @@ def _cand_row(c, gen):
     }
 
 
+def _center_from_confirmed(confirmed_rows, config, MODEL):
+    """Rank-weighted recombination center from the top-K confirmed rows
+    (each a dict carrying 'theta', already ordered best-first). Returns None
+    if empty.
+
+    The exp-rank weights depend ONLY on rank, not on the mean values, so the
+    center is bit-identical whenever the ordered top-K theta list is unchanged
+    — even if more elite seeds refine the means. That is exactly the
+    carry-over validity condition the speculator relies on.
+    """
+    recomb = confirmed_rows[:int(config.get("elite_count", 2))]
+    if not recomb:
+        return None
+    elite_thetas = np.array([np.asarray(r["theta"], dtype=float)
+                             for r in recomb])
+    weights = np.exp(-np.arange(len(elite_thetas)))
+    weights = weights / np.sum(weights)
+    return clip_theta(np.sum(elite_thetas * weights[:, None], axis=0), MODEL)
+
+
+class _Branch:
+    """One hypothesised gen-(X+1) population: a candidate final recombination
+    ordering, the center it implies, the gen+1 thetas drawn from it, and the
+    cheap packings computed for it so far. `prob` is the Thompson-estimated
+    probability this ordering is the one gen X actually lands on."""
+    __slots__ = ("key", "prob", "center", "thetas", "pending",
+                 "inflight", "results", "dispatched")
+
+    def __init__(self, key, prob, center, thetas, cheap):
+        self.key = key                 # tuple of recomb cids, ranked
+        self.prob = float(prob)
+        self.center = np.asarray(center, dtype=float)
+        self.thetas = thetas
+        pop = len(thetas)
+        self.pending = [(cid, s) for cid in range(pop) for s in range(cheap)]
+        self.inflight = set()
+        self.results = {}              # (cid, seed) -> out
+        self.dispatched = 0            # handed out (for proportional alloc)
+
+
+class _Speculator:
+    """Multi-branch compute-ahead: packs gen-(X+1) cheap seeds on gen-X's
+    idle TAIL workers, HEDGED across the most likely final recombination
+    orderings so the work survives the center moving.
+
+    Why multiple branches: gen X's center is a rank-weighted sum of the
+    top-K confirmed thetas, so it isn't pinned down until the elite means
+    stop reordering. A single provisional center (phase 1) is discarded
+    whenever that ordering shifts. Here we Thompson-sample the contenders'
+    noisy means to estimate P(each ordering is final), build one gen+1
+    population per high-probability ordering, and spend idle CPUs across
+    them PROPORTIONAL to P(win). Whatever ordering gen X lands on, a branch
+    almost surely already computed its cheaps.
+
+    Correctness is identical to phase 1 per branch: each branch draws its
+    thetas from a CLONE of the post-proposal RNG state, so the branch whose
+    center equals gen X's FINAL center yields thetas bit-identical to what
+    gen X+1 will draw, and its cheap packings are reusable. Non-matching
+    branches are discarded. Strictly leftover capacity: real work always
+    preempts (requeue() returns a killed seed to its branch).
+    """
+
+    def __init__(self, config, MODEL, rng_state_next, sigma_next, cheap_seeds,
+                 branch_seed, n_branches=4, n_samples=400):
+        self.config = config
+        self.MODEL = MODEL
+        self._rng_state_next = rng_state_next
+        self._sigma_next = float(sigma_next)
+        self._cheap = int(cheap_seeds)
+        self._branch_seed = int(branch_seed)
+        self._n_branches = int(config.get("compute_ahead_branches", n_branches))
+        self._n_samples = int(config.get("compute_ahead_samples", n_samples))
+        self.scheduler = None          # set by QueueScheduler.__init__
+        self._branches = None          # list[_Branch] or None until init
+        self.n_completed = 0
+
+    # ---- branch construction ---------------------------------------------
+
+    def _enumerate_branches(self, contenders, sigma):
+        """Thompson-sample final recombination orderings from the contenders'
+        means (each ~ N(mean, (sigma/sqrt(n))^2)); return the top-N most
+        probable ordered top-K cid tuples with their probabilities."""
+        K = int(self.config.get("elite_count", 2))
+        rng = np.random.default_rng(self._branch_seed)
+        cids = [c[0] for c in contenders]
+        means = np.array([c[2] for c in contenders], dtype=float)
+        ns = np.array([max(1, c[3]) for c in contenders], dtype=float)
+        se = (sigma if sigma > 0 else 1e-9) / np.sqrt(ns)
+        counts = {}
+        for _ in range(self._n_samples):
+            draw = means + se * rng.standard_normal(len(means))
+            order = np.argsort(-draw)[:K]
+            key = tuple(cids[i] for i in order)
+            counts[key] = counts.get(key, 0) + 1
+        ranked = sorted(counts.items(), key=lambda kv: kv[1], reverse=True)
+        ranked = ranked[:self._n_branches]
+        tot = sum(c for _, c in ranked)
+        return [(key, c / tot) for key, c in ranked]
+
+    def _ensure_init(self) -> bool:
+        if self._branches is not None:
+            return len(self._branches) > 0
+        # Lock branches only once gen X's screening floor is met (recomb set
+        # settled enough to estimate). Before that _next_work() can idle in
+        # the screening-drain gap with a partial, misleading bucket.
+        sch = self.scheduler
+        if sch._screened_count() < sch.cfg.min_cheap:
+            return False
+        contenders, sigma = sch.contenders_for_speculation()
+        if not contenders:
+            return False
+        theta_by_cid = {c[0]: c[1] for c in contenders}
+        branch_specs = self._enumerate_branches(contenders, sigma)
+        pop = int(self.config["population_size"])
+        branches = []
+        for key, prob in branch_specs:
+            rows = [{"theta": theta_by_cid[cid]} for cid in key]
+            center = _center_from_confirmed(rows, self.config, self.MODEL)
+            if center is None:
+                continue
+            rng = np.random.default_rng()
+            rng.bit_generator.state = self._rng_state_next   # same start state
+            thetas = [perturb_theta(center, self._sigma_next, self.MODEL, rng)
+                      for _ in range(pop)]
+            branches.append(_Branch(key, prob, center, thetas, self._cheap))
+        self._branches = branches
+        return len(branches) > 0
+
+    # ---- work dispatch (proportional to branch probability) --------------
+
+    def next_payload(self):
+        if not self._ensure_init():
+            return None
+        # pick the branch with pending work that is most UNDER its proportional
+        # share: minimise dispatched/prob (a branch with prob 0.5 should get
+        # ~2x the seeds of a prob 0.25 branch).
+        best, best_key = None, None
+        for bi, b in enumerate(self._branches):
+            if not b.pending:
+                continue
+            score = b.dispatched / b.prob if b.prob > 0 else float("inf")
+            if best is None or score < best_key:
+                best, best_key, best_i = b, score, bi
+        if best is None:
+            return None
+        cid, seed = best.pending.pop(0)
+        best.inflight.add((cid, seed))
+        best.dispatched += 1
+        return {"theta": best.thetas[cid], "candidate": cid, "seed": seed,
+                "stage": "cheap", "branch": best_i}
+
+    def on_result(self, payload, out):
+        bi = int(payload.get("branch", 0))
+        if bi >= len(self._branches):
+            return
+        b = self._branches[bi]
+        key = (int(payload["candidate"]), int(payload["seed"]))
+        b.inflight.discard(key)
+        if out.get("success", True):
+            b.results[key] = out
+            self.n_completed += 1
+
+    def requeue(self, payload):
+        bi = int(payload.get("branch", 0))
+        if bi >= len(self._branches):
+            return
+        b = self._branches[bi]
+        key = (int(payload["candidate"]), int(payload["seed"]))
+        if key in b.inflight:
+            b.inflight.discard(key)
+            b.pending.append(key)
+            b.dispatched -= 1
+
+    # ---- harvest ---------------------------------------------------------
+
+    def harvest(self, real_center):
+        """Return {'center','thetas','results'} for whichever branch's center
+        matches gen X's FINAL center (at most one — the center is a
+        deterministic function of the ordering); else None."""
+        if not self._branches:
+            return None
+        rc = np.asarray(real_center, dtype=float)
+        for b in self._branches:
+            if b.results and np.allclose(b.center, rc, rtol=0.0, atol=1e-12):
+                return {"center": b.center, "thetas": b.thetas,
+                        "results": dict(b.results)}
+        return None
+
+    def branch_summary(self):
+        if not self._branches:
+            return "0 branches"
+        return " ".join(f"b{i}(p={b.prob:.2f},n={len(b.results)})"
+                        for i, b in enumerate(self._branches))
+
+
 def _run_queue_generation(state, MODEL, pool, eval_fn, restore_snap=None):
     config = state["config"]
     gen = int(state["next_generation"])
@@ -193,6 +388,43 @@ def _run_queue_generation(state, MODEL, pool, eval_fn, restore_snap=None):
               f"| sigma={sigma:.4f} | mode=queue-v2 ===")
         thetas = [perturb_theta(center, sigma, MODEL, rng) for _ in range(pop)]
 
+    # ---- compute-ahead (opt-in: config['compute_ahead']) ----------------
+    # Two halves: (a) CONSUME a cache the previous gen computed on its idle
+    # tail (validated by re-deriving this gen's thetas and matching them);
+    # (b) CREATE a speculator that draws gen+1's population from the
+    # post-proposal RNG state and packs its cheaps on THIS gen's idle tail.
+    precomputed = None
+    speculator = None
+    if config.get("compute_ahead", False) and restore_state is None:
+        carry = state.pop("_carry", None)
+        if carry is not None:
+            cthetas = carry.get("thetas", [])
+            pre = {}
+            for (cid, seed), out in carry.get("results", {}).items():
+                if cid < len(thetas) and cid < len(cthetas) and np.allclose(
+                        np.asarray(thetas[cid], dtype=float),
+                        np.asarray(cthetas[cid], dtype=float),
+                        rtol=0.0, atol=1e-12):
+                    pre[(cid, seed)] = out
+            if pre:
+                precomputed = pre
+                print(f"[compute-ahead] carried {len(pre)} pre-screened "
+                      f"packings into gen {gen + 1} (recompute skipped).",
+                      flush=True)
+            elif carry.get("results"):
+                print("[compute-ahead] carry discarded (center moved); "
+                      "gen recomputed from scratch.", flush=True)
+        if gen + 1 < int(config["generations"]):
+            speculator = _Speculator(
+                config, MODEL,
+                deepcopy(rng.bit_generator.state),
+                sigma * float(config.get("sigma_decay", 0.80)),
+                int(config.get("cheap_seeds_per_candidate", 2)),
+                branch_seed=int(config.get("master_seed", 1234)) * 100003
+                + gen * 7 + 99)
+    else:
+        state.pop("_carry", None)      # never let a stale carry linger
+
     # Realtime snapshot: written after each result+dispatch (worker-finish
     # cadence), atomic temp+rename. Only loss on a bump is in-flight compute.
     def _snap(sched_self):
@@ -209,7 +441,8 @@ def _run_queue_generation(state, MODEL, pool, eval_fn, restore_snap=None):
                            log=bool(config.get("verbose_scheduler", False)),
                            on_tick=(_snap if config.get("snapshot", True)
                                     else None),
-                           restore_state=restore_state)
+                           restore_state=restore_state,
+                           speculator=speculator, precomputed=precomputed)
     res = sched.run()
 
     # Generation finished cleanly -> the checkpoint below supersedes the
@@ -274,14 +507,25 @@ def _run_queue_generation(state, MODEL, pool, eval_fn, restore_snap=None):
         # let a single-seed noise outlier with a lucky high mean dominate
         # the center via the rank-0 weight, steering the search on noise).
         # Matches v1's batch path, which recombines from confirmed only.
-        recomb = confirmed[:int(config.get("elite_count", 2))]
-        elite_thetas = np.array([np.asarray(r["theta"], dtype=float)
-                                 for r in recomb])
-        ranks = np.arange(len(elite_thetas))
-        weights = np.exp(-ranks)
-        weights = weights / np.sum(weights)
-        state["center"] = clip_theta(
-            np.sum(elite_thetas * weights[:, None], axis=0), MODEL)
+        new_center = _center_from_confirmed(confirmed, config, MODEL)
+        if new_center is not None:
+            state["center"] = new_center
+
+    # compute-ahead harvest: if the center held, carry the speculator's
+    # idle-tail packings into gen+1; otherwise discard. Done AFTER the center
+    # update so the validity check sees this gen's FINAL center.
+    if speculator is not None:
+        carry = speculator.harvest(state["center"])
+        msg = (f"[compute-ahead] gen {gen + 1} idle tail: "
+               f"computed={res.get('spec_completed', 0)} "
+               f"preempted={res.get('spec_preempted', 0)} "
+               f"| branches: {speculator.branch_summary()}")
+        if carry is not None:
+            state["_carry"] = carry
+            msg += f" -> carrying {len(carry['results'])} into gen {gen + 2}"
+        elif res.get("spec_completed", 0):
+            msg += " -> discarded (no branch matched final center)"
+        print(msg, flush=True)
 
     state["log_rows"].extend(
         {k: (v.tolist() if isinstance(v, np.ndarray) else v)

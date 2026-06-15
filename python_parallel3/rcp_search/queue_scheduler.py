@@ -231,7 +231,8 @@ class QueueScheduler:
 
     def __init__(self, cfg: QSConfig, thetas: list, eval_fn: Callable,
                  pool: Optional[PreemptivePool] = None, log: bool = False,
-                 on_tick=None, restore_state=None):
+                 on_tick=None, restore_state=None,
+                 speculator=None, precomputed=None):
         self.cfg = cfg
         self.cands = [_Cand(cid=i, theta=t) for i, t in enumerate(thetas)]
         # Cycle 22 restore: re-seed completed results + states from a
@@ -260,6 +261,23 @@ class QueueScheduler:
         self._attempt_info: dict[int, tuple[int, str, int]] = {}  # aid -> (cid, stage, worker)
         self._killed_attempts: set[int] = set()
         self._worker_busy: list[Optional[int]] = [None] * cfg.n_workers
+        # Cycle 22 compute-ahead (idle-tail speculation). Strictly leftover
+        # capacity: real work is always dispatched first and preempts
+        # speculation (a busy speculative worker is killed to free a CPU the
+        # instant real work needs it). `precomputed` is a {(cid, seed): out}
+        # cache of gen-X+1 cheap packings computed on gen-X's idle tail and
+        # carried in IFF the center held (driver-validated); it is drained at
+        # run start through the normal result path, so gating is identical to
+        # a worker having returned those packings instantly at t=0.
+        self._speculator = speculator
+        if speculator is not None:
+            speculator.scheduler = self
+        self._precomputed = dict(precomputed) if precomputed else {}
+        self._spec_info: dict[int, tuple[dict, int]] = {}   # aid -> (payload, w)
+        self._worker_spec: list[bool] = [False] * cfg.n_workers
+        self.spec_completed = 0
+        self.spec_preempted = 0
+        self.precomputed_used = 0
         # diagnostics
         self.events: list[str] = []
         self._busy_time = [0.0] * cfg.n_workers
@@ -452,13 +470,123 @@ class QueueScheduler:
         if t0 is not None:
             self._busy_time[w] += time.monotonic() - t0
 
+    # ---- compute-ahead (idle-tail speculation) ---------------------------
+
+    def _drain_precomputed(self):
+        """Inject carried gen-X-tail packings as instant t=0 completions,
+        in (cid, seed) order, through the SAME recording/gating path a live
+        worker result takes. No worker is consumed."""
+        if not self._precomputed:
+            return
+        for (cid, seed), out in sorted(self._precomputed.items()):
+            c = self.cands[cid]
+            if c.state == CandState.PENDING:
+                c.state = CandState.SCREENING
+            self._completed_seeds += 1
+            self.precomputed_used += 1
+            if not out.get("success", True):
+                continue
+            # stage is "cheap" — carried packings are gen+1 cheap screening
+            self._record_success(c, "cheap", out)
+
+    def current_confirmed_thetas(self):
+        """Provisional recombination set for the speculator: current bucket
+        (elite/confirmed) ordered by mean, highest first. Returns
+        [(cid, theta, mean), ...]."""
+        bucket = sorted(self._bucket(), key=lambda c: c.mean, reverse=True)
+        return [(c.cid, c.theta, c.mean) for c in bucket]
+
+    def contenders_for_speculation(self):
+        """Contender set for multi-branch speculation: everyone who could
+        still end up in gen X's recombination set — the bucket plus the
+        waitlist (waitlist can be pulled in when a demotion/eviction opens a
+        slot). Returns ([(cid, theta, mean, n), ...], pooled_sigma) so the
+        speculator can Thompson-sample the final ordering."""
+        cont = [c for c in self.cands if c.state in
+                (CandState.ELITE, CandState.CONFIRMED, CandState.WAITLIST)
+                and c.n > 0]
+        rows = [(c.cid, c.theta, c.mean, c.n) for c in cont]
+        return rows, self.pooled_sigma()
+
+    def _dispatch_spec(self, w: int, payload: dict):
+        aid = self._next_attempt
+        self._next_attempt += 1
+        self._spec_info[aid] = (payload, w)
+        now = time.monotonic()
+        if self._t0 is None:
+            self._t0 = now
+        self._attempt_start[aid] = now
+        self._worker_busy[w] = aid
+        self._worker_spec[w] = True
+        try:
+            self.pool.submit(w, aid, payload)
+        except (BrokenPipeError, OSError):
+            self._fail_spec(aid, w)
+
+    def _on_spec_result(self, aid: int, w: int, out: dict):
+        payload, _ = self._spec_info.pop(aid, (None, None))
+        self._account_busy(aid, w)
+        if self._worker_busy[w] == aid:
+            self._worker_busy[w] = None
+        self._worker_spec[w] = False
+        self.spec_completed += 1
+        if payload is not None and self._speculator is not None:
+            try:
+                self._speculator.on_result(payload, out)
+            except Exception as exc:   # speculation must never break a run
+                self._log(f"spec on_result failed (ignored): {exc!r}")
+
+    def _free_one_speculative(self) -> bool:
+        """Kill one in-flight speculative seed to free a CPU for real work.
+        The lost seed is requeued in the speculator so it can be retried if
+        idle capacity returns. Returns False if none are in flight."""
+        for w in range(self.cfg.n_workers):
+            if self._worker_spec[w]:
+                aid = self._worker_busy[w]
+                self.pool.kill(w)
+                self._account_busy(aid, w)
+                payload, _ = self._spec_info.pop(aid, (None, None))
+                self._worker_busy[w] = None
+                self._worker_spec[w] = False
+                self.spec_preempted += 1
+                if payload is not None and self._speculator is not None:
+                    try:
+                        self._speculator.requeue(payload)
+                    except Exception:
+                        pass
+                return True
+        return False
+
+    def _fail_spec(self, aid: int, w: int):
+        payload, _ = self._spec_info.pop(aid, (None, None))
+        self._account_busy(aid, w)
+        self._worker_busy[w] = None
+        self._worker_spec[w] = False
+        if payload is not None and self._speculator is not None:
+            try:
+                self._speculator.requeue(payload)
+            except Exception:
+                pass
+
+    def _kill_all_speculative(self):
+        for w in range(self.cfg.n_workers):
+            if self._worker_spec[w]:
+                aid = self._worker_busy[w]
+                self.pool.kill(w)
+                self._account_busy(aid, w)
+                self._spec_info.pop(aid, None)
+                self._worker_busy[w] = None
+                self._worker_spec[w] = False
+
     # ---- main loop -------------------------------------------------------
 
     def run(self) -> dict:
         cfg = self.cfg
+        # Carried gen-X-tail packings: inject through the normal result path
+        # before any dispatch, so gating sees them as instant t=0 completions.
+        self._drain_precomputed()
         while True:
-            # fill idle workers
-            dispatched = False
+            # 1. fill idle workers with REAL work (highest priority)
             for w in range(cfg.n_workers):
                 if self._worker_busy[w] is not None:
                     continue
@@ -466,14 +594,39 @@ class QueueScheduler:
                 if work is None:
                     break
                 self._dispatch(w, *work)
-                dispatched = True
-            inflight = sum(1 for b in self._worker_busy if b is not None)
-            if inflight == 0:
-                if self._next_work() is None:
-                    break       # generation complete
-                if not dispatched:
-                    break       # safety: nothing dispatchable
-                continue
+            # 2. real work remains but no idle worker -> preempt speculation.
+            #    Kill speculative seeds (leftover/best-effort) to free CPUs for
+            #    real work, then refill. Guarantees rule 2 (enough elites): an
+            #    elite seed never waits behind speculation.
+            while self._next_work() is not None and self._free_one_speculative():
+                for w in range(cfg.n_workers):
+                    if self._worker_busy[w] is not None:
+                        continue
+                    work = self._next_work()
+                    if work is None:
+                        break
+                    self._dispatch(w, *work)
+            # 3. speculative fill: ONLY workers with no real work to do, and
+            #    only once a provisional center exists (the speculator gates
+            #    that internally and returns None otherwise).
+            if self._speculator is not None and self._next_work() is None:
+                for w in range(cfg.n_workers):
+                    if self._worker_busy[w] is not None:
+                        continue
+                    payload = self._speculator.next_payload()
+                    if payload is None:
+                        break
+                    self._dispatch_spec(w, payload)
+            real_inflight = sum(1 for w in range(cfg.n_workers)
+                                if self._worker_busy[w] is not None
+                                and not self._worker_spec[w])
+            spec_inflight = sum(1 for s in self._worker_spec if s)
+            # generation complete once no real work remains anywhere
+            if real_inflight == 0 and self._next_work() is None:
+                self._kill_all_speculative()   # harvest happens in the driver
+                break
+            if real_inflight == 0 and spec_inflight == 0:
+                break       # safety: nothing dispatchable
             # wait for a result on any worker pipe
             got = self.pool.next_result(timeout=cfg.result_timeout_s)
             if got is None:
@@ -482,8 +635,11 @@ class QueueScheduler:
                     if self._worker_busy[w] is not None and \
                             not self.pool.ensure_alive(w):
                         dead_aid = self._worker_busy[w]
-                        self._log(f"worker {w} died; attempt {dead_aid} lost")
-                        self._fail_attempt(dead_aid, w)
+                        if self._worker_spec[w]:
+                            self._fail_spec(dead_aid, w)
+                        else:
+                            self._log(f"worker {w} died; attempt {dead_aid} lost")
+                            self._fail_attempt(dead_aid, w)
                 continue
             w, aid, out = got
             if aid is None:
@@ -491,10 +647,16 @@ class QueueScheduler:
                 self.pool.ensure_alive(w)
                 dead_aid = self._worker_busy[w]
                 if dead_aid is not None:
-                    self._log(f"worker {w} pipe died; attempt {dead_aid} lost")
-                    self._fail_attempt(dead_aid, w)
+                    if self._worker_spec[w]:
+                        self._fail_spec(dead_aid, w)
+                    else:
+                        self._log(f"worker {w} pipe died; attempt {dead_aid} lost")
+                        self._fail_attempt(dead_aid, w)
                 continue
-            self._on_result(aid, out)
+            if aid in self._spec_info:
+                self._on_spec_result(aid, w, out)
+            else:
+                self._on_result(aid, out)
             if self._on_tick is not None:
                 try:
                     self._on_tick(self)
@@ -522,6 +684,9 @@ class QueueScheduler:
             "respawns": self.pool.respawn_count,
             "utilization": util,
             "tail_idle_cpu_s": self.tail_idle_cpu_s(),
+            "spec_completed": self.spec_completed,
+            "spec_preempted": self.spec_preempted,
+            "precomputed_used": self.precomputed_used,
             "states": {c.cid: c.state.value for c in self.cands},
             "candidates": self.cands,
             "events": list(self.events),
@@ -579,6 +744,15 @@ class QueueScheduler:
                       f"stage={stage}): {out.get('error', '?')}")
             self._progress()
             return
+        self._record_success(c, stage, out)
+        self._progress()
+
+    def _record_success(self, c: _Cand, stage: str, out: dict):
+        """Post-success bookkeeping shared by live worker results and
+        precomputed (carried-over) results: append the phi, run gating on
+        screening completion, advance the idle-tail clock, and confirm/race
+        elites. Identical effect whether the packing came from a worker just
+        now or from a gen-X-tail speculative cache injected at t=0."""
         c.results.append(float(out["phi"]))
         c.raw.append(out)
         if stage == "cheap" and c.n >= self.cfg.cheap_seeds and \
@@ -597,7 +771,6 @@ class QueueScheduler:
             if c.state == CandState.ELITE and c.n >= self.cfg.elite_seeds:
                 c.state = CandState.CONFIRMED
                 self._log(f"confirm c{c.cid} mean={c.mean:.5f} n={c.n}")
-        self._progress()
 
     # ---- diagnostics -----------------------------------------------------
 
