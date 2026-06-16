@@ -61,6 +61,16 @@ from .overlap import overlap_report, phi_corrected
 from .search_v2 import run_or_resume_search_v2
 from .snapshot import restore_from_snapshot, load_snapshot
 from .census import load_census, moments_to_delta_S, census_path
+from .sweep import (
+    build_sweep_model,
+    autosize_N,
+    make_grid,
+    plan_sweep,
+    run_one_case,
+    run_sweep_parallel,
+    run_sweep_sequential,
+    load_sweep_census,
+)
 from .persistence import (
     SearchState,
     load_config_sidecar,
@@ -120,6 +130,10 @@ __all__ = [
     "run_or_resume_search_v2",
     "restore_from_snapshot", "load_snapshot",
     "load_census", "moments_to_delta_S", "census_path",
+    # continuous-baseline sweeps
+    "build_sweep_model", "autosize_N", "make_grid", "plan_sweep",
+    "run_one_case", "run_sweep_parallel", "run_sweep_sequential",
+    "load_sweep_census",
     # voronoi
     "voronoi_phi_local", "plot_local_phi_histogram",
     "plot_local_phi_vs_diameter",
