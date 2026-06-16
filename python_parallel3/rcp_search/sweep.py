@@ -48,24 +48,36 @@ _PHI_JAMMED = {2: 0.86, 3: 0.80}
 # Model construction per family (returns MODEL, theta, and a recoverable spec)
 # ============================================================================
 
-def build_sweep_model(family, shape_param, size_ratio, Ndim,
+def size_axis_name(family):
+    """The user-controlled size axis for each family: lognormal is swept by
+    the truncation `a` (in sigma); power/gaussian by the actual size ratio."""
+    return "a" if str(family).lower() == "lognormal" else "size_ratio"
+
+
+def build_sweep_model(family, shape_param, size, Ndim,
                       grid_n=5000, alpha_tukey=0.0025):
     """Return (MODEL, theta, spec) for one continuous baseline.
 
     family: 'power' | 'lognormal' | 'gaussian'
-    shape_param: exponent q (power), alpha (lognormal), CV (gaussian)
-    size_ratio: D_max/D_min crop (power, lognormal). For gaussian it is
-                DERIVED from CV (pass None) so the distribution is contained.
-    `spec` is the exact make_universal_model kwargs (JSON-able) for recovery.
+    shape_param (the per-curve shape): exponent q (power), alpha (lognormal),
+        CV (gaussian).
+    size (the user-controlled SIZE AXIS, family-specific):
+        power / gaussian -> size_ratio (D_max/D_min crop, user-controlled)
+        lognormal        -> truncation `a` (in sigma); SR = exp(2*a*alpha) is
+                            DERIVED (fix a, solve for size ratio).
+    `spec` is the exact make_universal_model kwargs (JSON-able); the model dict
+    construction itself is unchanged — only this user-facing mapping differs.
     """
     bal = "equal_volume" if int(Ndim) == 3 else "equal_area"
     family = str(family).lower()
 
     if family == "lognormal":
-        SR = float(size_ratio)
+        alpha = float(shape_param)
+        a = float(size)                         # truncation in sigma units
+        SR = float(np.exp(2.0 * a * alpha))     # fix a, solve for size ratio
         comps = [{"type": "lognormal",
-                  "init": {"alpha": float(shape_param), "cutoff": 1.0}}]
-        name = f"ln_a{shape_param:g}_S{SR:g}_d{Ndim}"
+                  "init": {"alpha": alpha, "cutoff": 1.0}}]
+        name = f"ln_a{a:g}_al{alpha:g}_d{Ndim}"
         spec = dict(components=comps, size_ratio=SR, Ndim=int(Ndim),
                     alpha_tukey=float(alpha_tukey), grid_n=int(grid_n),
                     balance_rule=bal, name=name)
@@ -76,7 +88,7 @@ def build_sweep_model(family, shape_param, size_ratio, Ndim,
             center_for_geometric_mean(MODEL, 1.0)
 
     elif family == "power":
-        SR = float(size_ratio)
+        SR = float(size)                        # user-controlled size ratio
         comps = [{"type": "power",
                   "init": {"R_low_u": 0.0, "R_high_u": 1.0,
                            "exp": float(shape_param)}}]
@@ -88,18 +100,13 @@ def build_sweep_model(family, shape_param, size_ratio, Ndim,
         theta = initialize_theta(MODEL, rule="from_spec")
 
     elif family == "gaussian":
-        # Gaussian in DIAMETER, mean D=1, sigma_D = CV. Sweep axis is CV;
-        # SR is derived so the geometric span [1/sqrt(SR), sqrt(SR)] contains
-        # the gaussian's ~±4σ (the low end is the binding constraint).
+        # Gaussian in DIAMETER, mean D=1, sigma_D = CV (the per-curve shape).
+        # SIZE AXIS = user-controlled size ratio: the gaussian is placed at the
+        # span's geometric center and CROPPED by the [S^-1/2, S^1/2] span (so
+        # small SR truncates the tails; large SR fully contains it).
         CV = float(shape_param)
-        if CV >= 0.24:
-            # symmetric ±4σ would cross D=0; clean handling of broad gaussians
-            # (asymmetric crop at a positive floor) is deferred — flag loudly.
-            raise NotImplementedError(
-                f"gaussian CV={CV} >= 0.24 needs asymmetric-crop handling "
-                f"(not yet built); use CV < 0.24 for now.")
-        SR = float(max((1.0 + 4.0 * CV) ** 2, 1.0 / (1.0 - 4.0 * CV) ** 2) * 1.05)
-        comps = [{"type": "gaussian", "init": {}}]   # filled after we know span
+        SR = float(size)
+        comps = [{"type": "gaussian", "init": {}}]   # filled after span is known
         name = f"gs_cv{CV:g}_S{SR:g}_d{Ndim}"
         spec = dict(components=comps, size_ratio=SR, Ndim=int(Ndim),
                     alpha_tukey=float(alpha_tukey), grid_n=int(grid_n),
@@ -108,8 +115,8 @@ def build_sweep_model(family, shape_param, size_ratio, Ndim,
         R_min, R_max = MODEL["R_min"], MODEL["R_max"]
         span_R = R_max - R_min
         R_c = 0.5                              # D_c = 1
-        R_center_u = (R_c - R_min) / span_R
-        sigma_u = (CV / 2.0) / span_R          # sigma_R = sigma_D/2 = CV/2
+        R_center_u = min(max((R_c - R_min) / span_R, 0.0), 1.0)
+        sigma_u = min(max((CV / 2.0) / span_R, 1e-3), 0.5)  # sigma_R = CV/2
         spec["components"] = [{"type": "gaussian",
                                "init": {"R_center_u": float(R_center_u),
                                         "sigma_u": float(sigma_u)}}]
@@ -166,12 +173,12 @@ def autosize_N(MODEL, theta, Ndim, dmaxL_tol, N_cap,
 # Case identity + resume
 # ============================================================================
 
-def case_key(family, shape_param, size_ratio, seed, Ndim, dmaxL_tol):
-    """Canonical key for resume/skip. N is excluded (derived); size_ratio is
-    rounded so a derived gaussian SR matches stably."""
-    sz = "auto" if size_ratio is None else f"{float(size_ratio):.6g}"
-    return (f"{family}|p={float(shape_param):.6g}|s={sz}|seed={int(seed)}"
-            f"|d={int(Ndim)}|tol={float(dmaxL_tol):.4g}")
+def case_key(family, shape_param, size, seed, Ndim, dmaxL_tol):
+    """Canonical key for resume/skip. `size` is the family's user-controlled
+    size-axis value (SR for power/gaussian, truncation `a` for lognormal); N
+    is excluded (derived)."""
+    return (f"{family}|p={float(shape_param):.6g}|s={float(size):.6g}"
+            f"|seed={int(seed)}|d={int(Ndim)}|tol={float(dmaxL_tol):.4g}")
 
 
 def census_path(save_dir):
@@ -202,20 +209,23 @@ def load_completed_keys(save_dir):
 # One case -> one census row (picklable; the parallel harness reuses this)
 # ============================================================================
 
-def run_one_case(family, shape_param, size_ratio, seed, Ndim, *,
+def run_one_case(family, shape_param, size, seed, Ndim, *,
                  dmaxL_tol=0.20, N_cap=250_000, grid_n=5000,
                  alpha_tukey=0.0025, phi_init=0.30, initializer_phi=0.11,
                  neighbor_max=0, speed="quick", N_override=None,
                  phi_jammed=None):
     """Build the model, size N (or use N_override), pack, return a
-    self-describing census row dict. Returns a row with status 'invalid' if
-    the autosizer can't meet the tolerance within N_cap (no packing run)."""
+    self-describing census row dict. `size` is the family's user-controlled
+    size axis (SR for power/gaussian, truncation `a` for lognormal). Returns a
+    row with status 'invalid' if the autosizer can't meet the tolerance within
+    N_cap (no packing run)."""
     from .jobs import create_packing
     t_build = time.perf_counter()
     MODEL, theta, spec = build_sweep_model(
-        family, shape_param, size_ratio, Ndim,
+        family, shape_param, size, Ndim,
         grid_n=grid_n, alpha_tukey=alpha_tukey)
-    SR = float(spec["size_ratio"])
+    SR = float(spec["size_ratio"])              # actual size ratio (derived for lognormal)
+    ax_name = size_axis_name(family)
 
     if N_override is not None:
         N, pred_dmaxL = int(N_override), None
@@ -223,7 +233,7 @@ def run_one_case(family, shape_param, size_ratio, seed, Ndim, *,
         N, pred_dmaxL = autosize_N(MODEL, theta, Ndim, dmaxL_tol, N_cap,
                                    phi_jammed=phi_jammed)
 
-    key = case_key(family, shape_param, size_ratio, seed, Ndim, dmaxL_tol)
+    key = case_key(family, shape_param, size, seed, Ndim, dmaxL_tol)
     base = {
         "case_key": key,
         "source": "continuous_baseline",        # provenance for the merged set
@@ -232,6 +242,9 @@ def run_one_case(family, shape_param, size_ratio, seed, Ndim, *,
         "param_name": {"power": "exp", "lognormal": "alpha",
                        "gaussian": "CV"}[family],
         "param_value": float(shape_param),
+        "size_axis": float(size),               # user-controlled axis value
+        "size_axis_name": ax_name,              # 'a' (lognormal) or 'size_ratio'
+        "a_trunc": (float(size) if family == "lognormal" else None),
         "size_ratio": SR, "Ndim": int(Ndim), "seed": int(seed),
         "dmaxL_tol": float(dmaxL_tol), "N_cap": int(N_cap),
         "model_spec": spec,
@@ -290,8 +303,9 @@ def run_sweep_sequential(cases, save_dir, *, dmaxL_tol=0.20, N_cap=250_000,
     """Run a list of cases one at a time, appending self-describing rows.
     Idempotent: cases already in the census are skipped.
 
-    cases: list of dicts {family, shape_param, size_ratio, seed}. (size_ratio
-    is ignored/derived for gaussian -> pass None.)
+    cases: list of dicts {family, shape_param, size, seed}, where `size` is the
+    family's user-controlled size axis (SR for power/gaussian, truncation `a`
+    for lognormal).
     local_N_hardcap: if set, any autosized N above it is clamped down and the
     row flagged — a SAFETY rail for the local pilot so we never launch a
     heavy packing on the dev machine.
@@ -304,9 +318,9 @@ def run_sweep_sequential(cases, save_dir, *, dmaxL_tol=0.20, N_cap=250_000,
     for c in cases:
         fam = c["family"]
         p = c["shape_param"]
-        sr = c.get("size_ratio")
+        sz = c["size"]
         seed = int(c.get("seed", 0))
-        key = case_key(fam, p, sr, seed, Ndim, dmaxL_tol)
+        key = case_key(fam, p, sz, seed, Ndim, dmaxL_tol)
         if key in done:
             if verbose:
                 print(f"[skip] {key} (already in census)", flush=True)
@@ -314,7 +328,7 @@ def run_sweep_sequential(cases, save_dir, *, dmaxL_tol=0.20, N_cap=250_000,
 
         N_override, clamped = None, False
         if local_N_hardcap is not None:
-            MODEL, theta, _ = build_sweep_model(fam, p, sr, Ndim,
+            MODEL, theta, _ = build_sweep_model(fam, p, sz, Ndim,
                                                 grid_n=grid_n,
                                                 alpha_tukey=alpha_tukey)
             N_auto, _ = autosize_N(MODEL, theta, Ndim, dmaxL_tol, N_cap)
@@ -325,7 +339,7 @@ def run_sweep_sequential(cases, save_dir, *, dmaxL_tol=0.20, N_cap=250_000,
                 clamped = N_auto > local_N_hardcap   # only flag a true clamp
 
         t0 = time.perf_counter()
-        row = run_one_case(fam, p, sr, seed, Ndim, dmaxL_tol=dmaxL_tol,
+        row = run_one_case(fam, p, sz, seed, Ndim, dmaxL_tol=dmaxL_tol,
                            N_cap=N_cap, grid_n=grid_n, alpha_tukey=alpha_tukey,
                            speed=speed, N_override=N_override)
         if clamped:
@@ -340,25 +354,21 @@ def run_sweep_sequential(cases, save_dir, *, dmaxL_tol=0.20, N_cap=250_000,
                      f"Dmax/L={row['realized_dmaxL']:.3f} "
                      f"CV={row['sample_CV']:.3f}" if st == "ok" else
                      row.get("reason", ""))
-            print(f"[done] {fam} p={p} sr={sr} -> {st} {extra} "
-                  f"({time.perf_counter()-t0:.1f}s)", flush=True)
+            print(f"[done] {fam} p={p} {size_axis_name(fam)}={sz} -> {st} "
+                  f"{extra} ({time.perf_counter()-t0:.1f}s)", flush=True)
     return rows
 
 
-def make_grid(family, params, sizes=None, seeds=(0,)):
-    """Build a `cases` list (cross product). For gaussian, `size_ratio` is
-    derived from CV, so `sizes` is ignored."""
+def make_grid(family, params, sizes, seeds=(0,)):
+    """Build a `cases` list (cross product params × sizes × seeds). `sizes` is
+    the family's user-controlled size axis: size ratios for power/gaussian,
+    truncation `a` values for lognormal."""
     cases = []
     for p in params:
-        if str(family).lower() == "gaussian":
+        for sz in sizes:
             for s in seeds:
                 cases.append({"family": family, "shape_param": p,
-                              "size_ratio": None, "seed": int(s)})
-        else:
-            for sr in (sizes or []):
-                for s in seeds:
-                    cases.append({"family": family, "shape_param": p,
-                                  "size_ratio": sr, "seed": int(s)})
+                              "size": sz, "seed": int(s)})
     return cases
 
 
@@ -377,8 +387,8 @@ def _sweep_worker(payload):
     a = dict(payload)
     key = a.pop("key", None); a.pop("T", None)
     fam = a.pop("family"); p = a.pop("shape_param")
-    sr = a.pop("size_ratio"); seed = a.pop("seed"); Ndim = a.pop("Ndim")
-    row = run_one_case(fam, p, sr, seed, Ndim, **a)
+    sz = a.pop("size"); seed = a.pop("seed"); Ndim = a.pop("Ndim")
+    row = run_one_case(fam, p, sz, seed, Ndim, **a)
     if key is not None:
         row["case_key"] = key
     return row
@@ -392,24 +402,24 @@ def _build_pending(cases, Ndim, dmaxL_tol, N_cap, grid_n, alpha_tukey, done):
     autocache = {}
     for c in cases:
         fam = c["family"]; p = c["shape_param"]
-        sr = c.get("size_ratio"); seed = int(c.get("seed", 0))
-        key = case_key(fam, p, sr, seed, Ndim, dmaxL_tol)
+        sz = c["size"]; seed = int(c.get("seed", 0))
+        key = case_key(fam, p, sz, seed, Ndim, dmaxL_tol)
         if key in done:
             skipped += 1
             continue
-        akey = (fam, float(p), "auto" if sr is None else float(sr))
+        akey = (fam, float(p), float(sz))
         if akey not in autocache:
-            M, th, _ = build_sweep_model(fam, p, sr, Ndim, grid_n=grid_n,
+            M, th, _ = build_sweep_model(fam, p, sz, Ndim, grid_n=grid_n,
                                          alpha_tukey=alpha_tukey)
             autocache[akey] = autosize_N(M, th, Ndim, dmaxL_tol, N_cap)
         N, pred = autocache[akey]
         if N is None:
-            row = run_one_case(fam, p, sr, seed, Ndim, dmaxL_tol=dmaxL_tol,
+            row = run_one_case(fam, p, sz, seed, Ndim, dmaxL_tol=dmaxL_tol,
                                N_cap=N_cap, grid_n=grid_n,
                                alpha_tukey=alpha_tukey)
             invalid_rows.append(row)
             continue
-        pending.append({"family": fam, "shape_param": p, "size_ratio": sr,
+        pending.append({"family": fam, "shape_param": p, "size": sz,
                         "seed": seed, "Ndim": Ndim, "N_override": int(N),
                         "dmaxL_tol": dmaxL_tol, "N_cap": N_cap,
                         "grid_n": grid_n, "alpha_tukey": alpha_tukey,
@@ -436,8 +446,8 @@ def plan_sweep(cases, save_dir, *, dmaxL_tol=0.20, N_cap=250_000, Ndim=3,
     print(f"  invalid (N>cap)    : {len(invalid_rows)}")
     for r in invalid_rows:
         print(f"      drop {r['family']} {r['param_name']}={r['param_value']} "
-              f"SR={r['size_ratio']:g} (pred D_max/L@cap="
-              f"{r.get('predicted_dmaxL_at_cap', float('nan')):.2f})")
+              f"{r['size_axis_name']}={r['size_axis']:g} (SR={r['size_ratio']:g}, "
+              f"pred D_max/L@cap={r.get('predicted_dmaxL_at_cap', float('nan')):.2f})")
     if Ns:
         tot = sum(Ns)
         core_h = tot * s_per_particle * T / 3600.0
@@ -555,7 +565,8 @@ def run_sweep_parallel(cases, save_dir, *, T=4, total_cpus=None,
                         counts["killed"] += 1
                         print(f"[mem-monitor] RAM {used:.0f}>{mem_budget_gb:.0f} "
                               f"GB: killed {case['family']} "
-                              f"p={case['shape_param']} SR~{case['size_ratio']} "
+                              f"p={case['shape_param']} "
+                              f"{size_axis_name(case['family'])}={case['size']} "
                               f"N={case['N_override']} (RSS {best_rss/1e9:.0f} "
                               f"GB). Raise T (fewer concurrent) or lower N_cap.",
                               flush=True)
@@ -566,7 +577,8 @@ def run_sweep_parallel(cases, save_dir, *, T=4, total_cpus=None,
                                    "source": "continuous_baseline",
                                    "family": case["family"],
                                    "param_value": float(case["shape_param"]),
-                                   "size_ratio": case["size_ratio"],
+                                   "size_axis": float(case["size"]),
+                                   "size_axis_name": size_axis_name(case["family"]),
                                    "Ndim": Ndim, "seed": case["seed"],
                                    "N": case["N_override"],
                                    "status": "killed_oom",
@@ -592,7 +604,8 @@ def run_sweep_parallel(cases, save_dir, *, T=4, total_cpus=None,
                 counts[st] = counts.get(st, 0) + 1
                 if verbose and st == "ok":
                     print(f"[ok] {case['family']} p={case['shape_param']} "
-                          f"SR~{case['size_ratio']} N={outrow.get('N')} "
+                          f"{size_axis_name(case['family'])}={case['size']} "
+                          f"N={outrow.get('N')} "
                           f"phi={outrow.get('phi', float('nan')):.4f} "
                           f"Dmax/L={outrow.get('realized_dmaxL', float('nan')):.3f}",
                           flush=True)
