@@ -44,9 +44,11 @@ from .jobs import (
 from .model import (
     COMPONENT_REGISTRY,
     balance_amplitudes,
+    center_for_geometric_mean,
     clip_theta,
     evaluate_model_pdf,
     initialize_theta,
+    lognormal_diagnostics,
     make_universal_model,
     perturb_theta,
     sample_diameters,
@@ -98,7 +100,7 @@ __all__ = [
     "COMPONENT_REGISTRY", "make_universal_model", "balance_amplitudes",
     "set_perturb_weights", "theta_to_dataframe", "initialize_theta", "evaluate_model_pdf",
     "sample_diameters", "clip_theta", "perturb_theta", "universal_pdf_R",
-    "tukey_window_on_interval",
+    "tukey_window_on_interval", "lognormal_diagnostics", "center_for_geometric_mean",
     # jobs
     "create_packing", "run_one_custom_packing", "run_packing_job",
     "make_packing_job", "run_jobs", "resolve_n_workers",

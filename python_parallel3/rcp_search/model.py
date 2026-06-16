@@ -87,6 +87,44 @@ def _delta_pdf_R(R, params, MODEL):
     return np.exp(-0.5 * ((R - R_c) / sigma) ** 2)
 
 
+def _lognormal_pdf_R(R, params, MODEL):
+    """Truncated lognormal in DIAMETER, expressed on R (D = 2R).
+
+    A lognormal of log-width ``alpha`` (std of ln D) whose GEOMETRIC MEAN
+    (mu = exp(mu_log) = median) sits at a center placed LINEARLY across the
+    span — identical convention to the gaussian's ``R_center_u``:
+
+        R_c = R_min + center * (R_max - R_min)        # D_c = 2 R_c = mu
+
+    Truncated symmetrically in log about D_c to an effective size ratio
+    ``S_eff = cutoff * S`` (S = MODEL['size_ratio']), i.e. the local support
+    is [D_c * S_eff^-1/2, D_c * S_eff^+1/2]. Anything past the global span
+    [R_min, R_max] is clipped by the framework grid (same as the gaussian
+    when its center/width overrun the span). The returned density is
+    un-normalized (the framework normalizes over the grid); the 1/D factor
+    becomes 1/R up to a constant, which normalization absorbs.
+
+    params = [amp, alpha, cutoff, center]  (amp handled by the mixer).
+    """
+    R_min, R_max = MODEL["R_min"], MODEL["R_max"]
+    span = R_max - R_min
+    alpha = max(float(params[1]), 1e-6)
+    cutoff = min(max(float(params[2]), 1e-6), 1.0)
+    center = min(max(float(params[3]), 0.0), 1.0)
+    S = float(MODEL.get("size_ratio", 1.0))
+    R_c = R_min + center * span                     # geometric mean (in R)
+    S_eff = max(cutoff * S, 1.0 + 1e-12)            # local size ratio >= 1
+    h = 0.5 * np.log(S_eff)                          # half-width in log
+    R_lo, R_hi = R_c * np.exp(-h), R_c * np.exp(h)
+    R = np.asarray(R, dtype=float)
+    out = np.zeros_like(R)
+    inside = (R >= R_lo) & (R <= R_hi) & (R > 0)
+    if np.any(inside):
+        x = np.log(R[inside] / R_c)                  # = ln(D/D_c)
+        out[inside] = np.exp(-0.5 * (x / alpha) ** 2) / R[inside]
+    return out
+
+
 COMPONENT_REGISTRY = {
     "power": {
         "n_params": 4,
@@ -114,6 +152,22 @@ COMPONENT_REGISTRY = {
         "perturb_scale": [1.0, 0.05],
         "defaults": {"amp": 0.0, "R_center_u": 0.5},
         "pdf_fn": _delta_pdf_R,
+    },
+    "lognormal": {
+        # Truncated lognormal in diameter. shape params:
+        #   alpha  — log-width (std of ln D)
+        #   cutoff — effective size ratio as a LINEAR fraction of the global
+        #            S: S_eff = cutoff * size_ratio  (cutoff=1 -> full span)
+        #   center — geometric mean (mu) position, LINEAR across the span
+        #            (same convention as gaussian R_center_u; default 0.5 is
+        #            the linear midpoint, NOT D_g=1 — see lognormal_diagnostics)
+        "n_params": 4,
+        "param_names": ["amp", "alpha", "cutoff", "center"],
+        "bounds_lower": [-30.0, 0.01, 0.05, 0.0],
+        "bounds_upper": [30.0, 3.0, 1.0, 1.0],
+        "perturb_scale": [1.0, 0.05, 0.05, 0.05],
+        "defaults": {"amp": 0.0, "alpha": 0.9, "cutoff": 1.0, "center": 0.5},
+        "pdf_fn": _lognormal_pdf_R,
     },
 }
 
@@ -534,6 +588,20 @@ def theta_to_dataframe(theta, MODEL):
                 rows.append({"component": label, "type": ctype, "param": pname,
                              "raw_theta": raw, "physical": raw,
                              "units": "P(R) ∝ R^exp"})
+            elif pname == "alpha":
+                rows.append({"component": label, "type": ctype, "param": pname,
+                             "raw_theta": raw, "physical": raw,
+                             "units": "log-width (std of ln D)"})
+            elif pname == "cutoff":
+                S = float(MODEL.get("size_ratio", 1.0))
+                rows.append({"component": label, "type": ctype, "param": pname,
+                             "raw_theta": raw, "physical": raw * S,
+                             "units": f"S_eff = cutoff*S (S={S:g})"})
+            elif pname == "center":   # geometric mean (mu), linear across span
+                R_c = R_min + raw * span
+                rows.append({"component": label, "type": ctype, "param": pname,
+                             "raw_theta": raw, "physical": 2.0 * R_c,
+                             "units": "D_c = mu (geometric mean)"})
             else:
                 rows.append({"component": label, "type": ctype, "param": pname,
                              "raw_theta": raw, "physical": raw, "units": ""})
@@ -542,3 +610,57 @@ def theta_to_dataframe(theta, MODEL):
                          "raw_theta": 0.005, "physical": 0.005 * span,
                          "units": "R (width, internal)"})
     return pd.DataFrame(rows)
+
+
+def center_for_geometric_mean(MODEL, D_target=1.0):
+    """The linear `center` value that places the lognormal geometric mean
+    (mu) at diameter `D_target`. center=0.5 is the linear midpoint of the
+    span, which is NOT D_g=1; this returns the center giving D_c=D_target.
+    """
+    R_min, R_max = MODEL["R_min"], MODEL["R_max"]
+    span = R_max - R_min
+    return float((0.5 * float(D_target) - R_min) / span)
+
+
+def lognormal_diagnostics(theta, MODEL, component=None):
+    """Analytic diagnostics for a 'lognormal' component (exact, independent
+    of the grid/Tukey sampling path). `component` is an index into
+    MODEL['components']; default picks the first lognormal.
+
+    Returns a dict: alpha, cutoff, center, S, S_eff, D_c (=mu, geometric
+    mean), D_min, D_max, a (=ln(S_eff)/(2 alpha)), parent_sD (untruncated
+    coefficient of variation sqrt(exp(alpha^2)-1)). For the realized sample
+    CV, std/mean of `sample_diameters(theta, MODEL, N)` (scale-invariant).
+    """
+    theta = np.asarray(theta, dtype=float)
+    comps = MODEL["components"]
+    idx = None
+    if isinstance(component, int) and 0 <= component < len(comps) \
+            and comps[component]["type"] == "lognormal":
+        idx = component
+    else:
+        for i, c in enumerate(comps):
+            if c["type"] == "lognormal":
+                idx = i
+                break
+    if idx is None:
+        raise ValueError("no 'lognormal' component found in MODEL")
+    c = comps[idx]
+    p = theta[c["slice_start"]:c["slice_end"]]
+    alpha = float(p[1])
+    cutoff = float(p[2])
+    center = float(p[3])
+    S = float(MODEL.get("size_ratio", 1.0))
+    R_min, R_max = MODEL["R_min"], MODEL["R_max"]
+    span = R_max - R_min
+    D_c = 2.0 * (R_min + center * span)          # geometric mean (mu)
+    S_eff = max(cutoff * S, 1.0)
+    h = 0.5 * np.log(S_eff)
+    D_min = float(D_c * np.exp(-h))
+    D_max = float(D_c * np.exp(h))
+    a = float(h / max(alpha, 1e-12))             # = ln(S_eff)/(2 alpha)
+    parent_sD = float(np.sqrt(np.exp(alpha ** 2) - 1.0))
+    return {"component": c["label"], "alpha": alpha, "cutoff": cutoff,
+            "center": center, "S": S, "S_eff": float(S_eff),
+            "D_c": float(D_c), "D_min": D_min, "D_max": D_max,
+            "a": a, "parent_sD": parent_sD}
