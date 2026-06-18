@@ -37,6 +37,7 @@ struct InitializerConfig {
     std::vector<std::int8_t> walls;
     bool fix_height = false;
     Distribution dist;
+    std::uint64_t seed = 0;   // deterministic RNG seed for placement + diameters
 };
 
 struct InitializerResult {
