@@ -67,6 +67,7 @@ rcpgenerator::InitializerConfig initializer_config_from_dict(const py::dict& sou
     assign_if_present(source, "Ndim", config.Ndim);
     assign_if_present(source, "box", config.box);
     assign_if_present(source, "fix_height", config.fix_height);
+    assign_if_present(source, "seed", config.seed);
     if (source.contains(py::str("walls"))) {
         config.walls = cast_walls(source[py::str("walls")]);
     }
