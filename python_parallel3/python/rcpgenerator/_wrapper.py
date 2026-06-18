@@ -192,6 +192,7 @@ class Packing:
             "walls": deepcopy(self.walls),
             "fix_height": self.fix_height,
             "dist": deepcopy(self.dist),
+            "seed": self.seed,   # deterministic, seed-varying initial configuration
         }
 
     def _collect_pack_input(self) -> dict[str, Any]:
