@@ -99,6 +99,20 @@ def build_sweep_model(family, shape_param, size, Ndim,
         MODEL = make_universal_model(**spec)
         theta = initialize_theta(MODEL, rule="from_spec")
 
+    elif family == "weibull":
+        # Weibull / Rosin-Rammler in DIAMETER (crushed/comminuted material).
+        # SIZE AXIS = user-controlled size ratio (full span); shape = modulus k.
+        SR = float(size)
+        k = float(shape_param)
+        comps = [{"type": "weibull",
+                  "init": {"R_low_u": 0.0, "R_high_u": 1.0, "k": k}}]
+        name = f"wb_k{shape_param:g}_S{SR:g}_d{Ndim}"
+        spec = dict(components=comps, size_ratio=SR, Ndim=int(Ndim),
+                    alpha_tukey=float(alpha_tukey), grid_n=int(grid_n),
+                    balance_rule=bal, name=name)
+        MODEL = make_universal_model(**spec)
+        theta = initialize_theta(MODEL, rule="from_spec")
+
     elif family == "gaussian":
         # Gaussian in DIAMETER, mean D=1, sigma_D = CV (the per-curve shape).
         # SIZE AXIS = user-controlled size ratio: the gaussian is placed at the
@@ -213,7 +227,7 @@ def run_one_case(family, shape_param, size, seed, Ndim, *,
                  dmaxL_tol=0.20, N_cap=250_000, grid_n=5000,
                  alpha_tukey=0.0025, phi_init=0.30, initializer_phi=0.11,
                  neighbor_max=0, speed="quick", N_override=None,
-                 phi_jammed=None):
+                 phi_jammed=None, reorder_interval=None):
     """Build the model, size N (or use N_override), pack, return a
     self-describing census row dict. `size` is the family's user-controlled
     size axis (SR for power/gaussian, truncation `a` for lognormal). Returns a
@@ -240,13 +254,15 @@ def run_one_case(family, shape_param, size, seed, Ndim, *,
         "family": family,
         "model_name": spec["name"],             # mirrors packing_census schema
         "param_name": {"power": "exp", "lognormal": "alpha",
-                       "gaussian": "CV"}[family],
+                       "gaussian": "CV", "weibull": "k"}[family],
         "param_value": float(shape_param),
         "size_axis": float(size),               # user-controlled axis value
         "size_axis_name": ax_name,              # 'a' (lognormal) or 'size_ratio'
         "a_trunc": (float(size) if family == "lognormal" else None),
         "size_ratio": SR, "Ndim": int(Ndim), "seed": int(seed),
         "dmaxL_tol": float(dmaxL_tol), "N_cap": int(N_cap),
+        "reorder_interval": (None if reorder_interval is None
+                             else int(reorder_interval)),
         "model_spec": spec,
     }
 
@@ -265,7 +281,8 @@ def run_one_case(family, shape_param, size, seed, Ndim, *,
     packing, pstats = create_packing(
         theta, MODEL, N=N, Ndim=int(Ndim), seed=int(seed),
         phi_init=phi_init, initializer_phi=initializer_phi,
-        neighbor_max=neighbor_max, speed=speed, verbose=False)
+        neighbor_max=neighbor_max, speed=speed,
+        reorder_interval=reorder_interval, verbose=False)
     wall = time.perf_counter() - t0
 
     if not isinstance(pstats, dict) or pstats.get("phi") is None:
@@ -299,7 +316,8 @@ def run_one_case(family, shape_param, size, seed, Ndim, *,
 
 def run_sweep_sequential(cases, save_dir, *, dmaxL_tol=0.20, N_cap=250_000,
                          Ndim=3, grid_n=5000, alpha_tukey=0.0025,
-                         speed="quick", local_N_hardcap=None, verbose=True):
+                         speed="quick", reorder_interval=None,
+                         local_N_hardcap=None, verbose=True):
     """Run a list of cases one at a time, appending self-describing rows.
     Idempotent: cases already in the census are skipped.
 
@@ -341,7 +359,8 @@ def run_sweep_sequential(cases, save_dir, *, dmaxL_tol=0.20, N_cap=250_000,
         t0 = time.perf_counter()
         row = run_one_case(fam, p, sz, seed, Ndim, dmaxL_tol=dmaxL_tol,
                            N_cap=N_cap, grid_n=grid_n, alpha_tukey=alpha_tukey,
-                           speed=speed, N_override=N_override)
+                           speed=speed, N_override=N_override,
+                           reorder_interval=reorder_interval)
         if clamped:
             row["local_N_hardcapped"] = True
         with open(out, "a") as f:
@@ -464,6 +483,7 @@ def plan_sweep(cases, save_dir, *, dmaxL_tol=0.20, N_cap=250_000, Ndim=3,
 def run_sweep_parallel(cases, save_dir, *, T=4, total_cpus=None,
                        mem_budget_gb=100.0, dmaxL_tol=0.20, N_cap=250_000,
                        Ndim=3, grid_n=5000, alpha_tukey=0.0025, speed="quick",
+                       reorder_interval=None,
                        max_kills_per_case=2, mp_context="fork", verbose=True):
     """Run the grid in parallel: `total_cpus // T` cases concurrent, each at
     T engine threads. Idempotent (skips done), appends self-describing rows.
@@ -500,6 +520,7 @@ def run_sweep_parallel(cases, save_dir, *, T=4, total_cpus=None,
               "invalid": len(invalid_rows), "skipped": skipped}
     for c in pending:
         c["speed"] = speed; c["T"] = T
+        c["reorder_interval"] = reorder_interval
     if verbose:
         print(f"[sweep] pending={len(pending)} skipped={skipped} "
               f"invalid={len(invalid_rows)}", flush=True)

@@ -125,6 +125,37 @@ def _lognormal_pdf_R(R, params, MODEL):
     return out
 
 
+def _weibull_pdf_R(R, params, MODEL):
+    """Weibull / Rosin--Rammler density on a normalized [R_low_u, R_high_u]
+    sub-interval. The characteristic (Rosin--Rammler) scale ``lambda`` is the
+    TOP of the window (R_high), and ``k`` (params[3]) is the Weibull modulus:
+
+        f(R) propto (R/lambda)^(k-1) * exp(-(R/lambda)^k),  lambda = R_high.
+
+    k < 1 -> broad, heavy small-size tail (much fine material); k = 1 ->
+    exponential; k > 1 -> concentrated near the top size. Un-normalized (the
+    framework normalizes over the grid). This is the standard distribution for
+    crushed / comminuted / ground material (Rosin--Rammler 1933).
+
+    params = [amp, R_low_u, R_high_u, k]  (amp handled by the mixer).
+    """
+    R_min, R_max = MODEL["R_min"], MODEL["R_max"]
+    span = R_max - R_min
+    R_low = R_min + float(params[1]) * span
+    R_high = R_min + float(params[2]) * span
+    if R_high < R_low:
+        R_low, R_high = R_high, R_low
+    k = max(float(params[3]), 1e-6)
+    lam = R_high if R_high > 0 else 1e-12            # RR characteristic size
+    R = np.asarray(R, dtype=float)
+    out = np.zeros_like(R)
+    inside = (R >= R_low) & (R <= R_high) & (R > 0)
+    if np.any(inside):
+        x = R[inside] / lam
+        out[inside] = x ** (k - 1.0) * np.exp(-(x ** k))
+    return out
+
+
 COMPONENT_REGISTRY = {
     "power": {
         "n_params": 4,
@@ -168,6 +199,17 @@ COMPONENT_REGISTRY = {
         "perturb_scale": [1.0, 0.05, 0.05, 0.05],
         "defaults": {"amp": 0.0, "alpha": 0.9, "cutoff": 1.0, "center": 0.5},
         "pdf_fn": _lognormal_pdf_R,
+    },
+    "weibull": {
+        # Weibull / Rosin-Rammler in DIAMETER (crushed/comminuted material).
+        # shape param: k (Weibull modulus); characteristic scale at R_high.
+        "n_params": 4,
+        "param_names": ["amp", "R_low_u", "R_high_u", "k"],
+        "bounds_lower": [-30.0, 0.0, 0.0, 0.05],
+        "bounds_upper": [30.0, 1.0, 1.0, 10.0],
+        "perturb_scale": [1.0, 0.10, 0.10, 0.10],
+        "defaults": {"amp": 0.0, "R_low_u": 0.0, "R_high_u": 1.0, "k": 1.0},
+        "pdf_fn": _weibull_pdf_R,
     },
 }
 
