@@ -43,6 +43,7 @@ def run_one_custom_packing(
     neighbor_max=0,
     fix_height=False,
     size_ratio_hint=None,
+    reorder_interval=None,
     verbose=False,
 ):
     """Run one packing with a user-supplied diameter list.
@@ -57,6 +58,15 @@ def run_one_custom_packing(
     `neighbor_max=0` (default) delegates to the engine's per-particle,
     diameter-ratio-scaled allocation. Pass a positive int to override the
     per-particle base.
+
+    `reorder_interval` (default None) controls the engine's periodic spatial
+    reorder. None leaves the engine default (reorder ON; lean execution path).
+    Set to 0 to DISABLE the reorder: this caps transient RSS (the reorder's
+    full pair-list rebuild ratchets memory ~linearly with reorder count at
+    high size ratio / large N), at the cost of ~20% wall time and a ~1e-3 phi
+    shift from the changed op-ordering. Use only for runs that would otherwise
+    OOM; keep None for protocol-consistent science. A positive int sets the
+    reorder step interval explicitly.
     """
     diameters = np.asarray(diameters, dtype=float)
     diameters = diameters[np.isfinite(diameters)]
@@ -107,7 +117,20 @@ def run_one_custom_packing(
     object.__setattr__(packing, "_packed", False)
     object.__setattr__(packing, "_needs_pack", True)
 
-    packing.pack()
+    if reorder_interval is None:
+        packing.pack()                       # lean path, engine-default reorder
+    else:
+        # Passing options forces the observed execution path; with verbose off
+        # and no trajectory capture it is numerically the same core run, just
+        # carrying our reorder_interval override. _apply_packing_result writes
+        # back positions/phi exactly as pack() does.
+        packing._execute_packing(
+            verbose=verbose,
+            progress_interval=1000,
+            capture_trajectory=False,
+            trajectory_interval=0,
+            options={"reorder_interval": int(reorder_interval)},
+        )
     return packing
 
 
@@ -124,6 +147,7 @@ def create_packing(theta, MODEL, *,
                    N=500, Ndim=None, seed=0,
                    phi_init=0.30, initializer_phi=0.11,
                    neighbor_max=0,
+                   reorder_interval=None,
                    compute_voronoi=False,
                    compute_overlap=True,
                    prescreen=None,
@@ -180,6 +204,7 @@ def create_packing(theta, MODEL, *,
         initializer_phi=float(initializer_phi),
         neighbor_max=int(neighbor_max),
         size_ratio_hint=MODEL.get("size_ratio"),
+        reorder_interval=reorder_interval,
         verbose=verbose,
     )
 
