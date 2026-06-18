@@ -18,6 +18,10 @@
 #include <utility>
 #include <vector>
 
+#if defined(__linux__)
+#include <sys/mman.h>   // madvise(MADV_DONTNEED): release pairs_data pages on reorder
+#endif
+
 #include <omp.h>
 
 // libstdc++ parallel-mode <parallel/algorithm> provides __gnu_parallel::sort,
@@ -3382,6 +3386,30 @@ void get_pairs_kdtree(
         }
     }
 
+    // Cycle 23 probe (gated by RCP_DEBUG_LAYOUT): confirms the cross-write
+    // buffers stay tiny (~1 MB) and reports pairs_data reserved size. Verified
+    // xwrite is NOT the memory hog; the resident growth was pairs_data faulted
+    // across shifting reorder layouts, fixed via LazyPairs::release_resident().
+    static const bool kd_xwrite_probe = []() {
+        const char* s = std::getenv("RCP_DEBUG_LAYOUT");
+        return s && s[0] && s[0] != '0';
+    }();
+    if (kd_xwrite_probe) {
+        static std::uint64_t s_peak_live = 0;
+        std::uint64_t live = 0, cap = 0;
+        for (int t = 0; t < kd_max_threads; ++t) {
+            live += g_kd_xwrite_buffers[t].size();
+            cap  += g_kd_xwrite_buffers[t].capacity();
+        }
+        if (live > s_peak_live) {
+            s_peak_live = live;
+            std::fprintf(stderr,
+                "[xwrite] kd_R=%zu live=%.3fGB cap=%.3fGB pairs_data_cap=%.3fGB\n",
+                kd_R, live * 8.0 / 1e9, cap * 8.0 / 1e9,
+                static_cast<double>(pair_offsets[N]) * 4.0 / 1e9);
+        }
+    }
+
     // Cycle 21N: surface any recorded overflow (parallel own-write or the
     // serial cross-write merge above) as an exception now that all OpenMP
     // regions and locks are released.
@@ -4521,6 +4549,40 @@ std::pair<PackingResult, PackingTrace> run_packing_observed(
             for (std::size_t i = 0; i < N; ++i)
                 buf[offsets[i]] = 0;                   // counts only
         }
+        // Cycle 23: return faulted pages to the OS. SAFE ONLY when the whole
+        // buffer is about to be fully rewritten (the reorder-triggered full
+        // rebuild): old contents are discarded anyway, and any page touched
+        // again zero-fills then gets overwritten. Without this, each reorder
+        // recomputes pair_offsets (per-particle caps shift even though the
+        // total is invariant), so the rebuild writes a SHIFTED layout into the
+        // same buffer and faults fresh pages while the prior layout's pages
+        // stay resident — RSS ratchets to the full-matrix footprint over the
+        // run. Only acts on the large mmap-backed (page-aligned) allocation.
+        void release_resident() {
+#if defined(__linux__)
+            const std::size_t bytes = n * sizeof(std::uint32_t);
+            if (!buf || bytes < (std::size_t{64} << 20)) return;  // large mmap-backed only
+            constexpr std::uintptr_t PAGE = 4096;
+            // malloc returns the user ptr offset into a page-aligned mmap region
+            // (chunk header), so it is 16-aligned, NOT page-aligned. Round the
+            // start UP to the next page and madvise whole pages of the interior.
+            const std::uintptr_t addr = reinterpret_cast<std::uintptr_t>(buf.get());
+            const std::uintptr_t aligned = (addr + PAGE - 1) & ~(PAGE - 1);
+            const std::size_t off = static_cast<std::size_t>(aligned - addr);
+            if (bytes <= off) return;
+            const std::size_t len = ((bytes - off) / PAGE) * PAGE;
+            if (!len) return;
+            const int rc = ::madvise(reinterpret_cast<void*>(aligned), len,
+                                     MADV_DONTNEED);
+            static const bool dbg = []() {
+                const char* s = std::getenv("RCP_DEBUG_LAYOUT");
+                return s && s[0] && s[0] != '0';
+            }();
+            if (dbg)
+                std::fprintf(stderr, "[release_resident] dropped %.2f GB rc=%d\n",
+                             len / 1e9, rc);
+#endif
+        }
     };
     LazyPairs pairs_data;
     pairs_data.reset(pairs_total, pair_offsets.data(), N);
@@ -4761,6 +4823,10 @@ std::pair<PackingResult, PackingTrace> run_packing_observed(
 
         // Cycle 13: D has been permuted, so per-particle MaxNb caps and
         // offsets shift too. Recompute the layout and resize pairs_data.
+        // Cycle 23: drop the prior layout's resident pages first — the full
+        // rebuild below (refresh=[1,...]) overwrites the whole buffer, so this
+        // is result-neutral and stops RSS ratcheting across shifting layouts.
+        pairs_data.release_resident();
         std::uint64_t new_total = compute_pair_layout(
             max_neighbors_per_particle, pair_offsets);
         pairs_data.reset(new_total, pair_offsets.data(), N);
