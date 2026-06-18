@@ -168,126 +168,143 @@ std::string trim(const std::string& s) {
 
 }  // namespace
 
-void initialize_positions_binned(
+// O(N) random non-overlapping placement via a cell-list random sequential
+// addition (RSA). Replaces the former O(N^2) octant-binned and naive variants
+// (which scanned ~N/8 or N partners per insertion). Produces a disordered
+// arrangement (NO lattice) with a guaranteed hard-core minimum separation, so
+// no two particles are near-coincident -> the soft-pair force cannot blow up at
+// the first packing step -- at the configured packing fraction (set by the
+// prior diameter scaling). Cells are sized >= the largest diameter, so any
+// overlapping partner of a trial particle lies in the immediate 3^Ndim cell
+// block; at the dilute init fraction each insertion checks O(1) partners.
+// Deterministic given `seed`. Distances use the minimum image on periodic
+// (walls[d]==0) axes; non-periodic axes keep particles inside the domain.
+void initialize_positions_celllist(
     std::vector<std::vector<double>>& x,
     const std::vector<double>& D,
     const std::vector<double>& box,
     std::vector<std::int8_t>& walls,
-    bool fix_height)
+    bool fix_height,
+    std::uint64_t seed)
 {
-    std::size_t N = x.size();
-    std::size_t Ndim = box.size();
-    std::size_t NB = 1u << Ndim;
-    std::vector<std::vector<std::size_t>> bins(NB);
+    const std::size_t N = x.size();
+    const std::size_t Ndim = box.size();
+    if (N == 0) { (void)fix_height; return; }
 
-    std::vector<double> bin_size(Ndim);
-    for (std::size_t d = 0; d < Ndim; ++d)
-        bin_size[d] = box[d] * 0.5;
+    double Dmax = 0.0;                 // D is caller-sorted descending; scan anyway
+    for (double v : D) if (v > Dmax) Dmax = v;
+    if (Dmax <= 0.0) Dmax = 1e-12;
 
-    auto getBin = [&](const std::vector<double>& pt) {
+    // Cell grid: edge >= Dmax so an overlapping pair (centre distance
+    // (Di+Dj)/2 <= Dmax) always falls within the 3^Ndim neighbour block.
+    std::vector<std::size_t> ncell(Ndim);
+    std::vector<double> cell_size(Ndim);
+    std::vector<std::size_t> stride(Ndim, 1);
+    std::size_t total_cells = 1;
+    for (std::size_t d = 0; d < Ndim; ++d) {
+        std::size_t nc = static_cast<std::size_t>(std::floor(box[d] / Dmax));
+        if (nc < 1) nc = 1;
+        ncell[d] = nc;
+        cell_size[d] = box[d] / static_cast<double>(nc);
+        total_cells *= nc;
+    }
+    for (std::size_t d = 1; d < Ndim; ++d) stride[d] = stride[d - 1] * ncell[d - 1];
+
+    std::vector<std::vector<std::uint32_t>> cells(total_cells);
+
+    const bool spherical = (walls[0] < 0);
+    const std::size_t Ksph = spherical ? static_cast<std::size_t>(-walls[0]) : 0;
+    const double Rsph = box[0] * 0.5;
+
+    std::mt19937_64 rng{seed ? seed : 0x9E3779B97F4A7C15ULL};
+    std::uniform_real_distribution<double> ud(0.0, 1.0);
+
+    auto cell_of = [&](const std::vector<double>& p) {
         std::size_t id = 0;
-        for (std::size_t d = 0; d < Ndim; ++d)
-            if (pt[d] > box[d] * 0.5) id |= (1u << d);
+        for (std::size_t d = 0; d < Ndim; ++d) {
+            long c = static_cast<long>(p[d] / cell_size[d]);
+            if (c < 0) c = 0;
+            if (c >= static_cast<long>(ncell[d])) c = static_cast<long>(ncell[d]) - 1;
+            id += static_cast<std::size_t>(c) * stride[d];
+        }
         return id;
     };
 
-    std::mt19937 rng{std::random_device{}()};
-    std::uniform_real_distribution<> ud(0.0, 1.0);
+    std::size_t nneigh = 1;
+    for (std::size_t d = 0; d < Ndim; ++d) nneigh *= 3;
 
-    std::vector<double> xt0(Ndim);
-    std::size_t bin_id0 = rng() % NB;
-    for (std::size_t d = 0; d < Ndim; ++d) {
-        std::size_t in_bin = (bin_id0 >> d) & 1;
-        double origin = in_bin * bin_size[d];
-        xt0[d] = origin + D[0] / 2 + ud(rng) * (bin_size[d] - D[0]);
-        x[0][d] = xt0[d];
-    }
-    bins[bin_id0].push_back(0);
+    std::vector<double> xt(Ndim);
+    std::vector<long> ci(Ndim);
+    const std::size_t MAX_ATTEMPTS = std::size_t{1} << 22;  // ~4e6; dilute RSA accepts in O(1)
 
-    std::size_t count = 1;
-    while (count < N) {
-        std::vector<double> xt(Ndim);
-        std::size_t bin_id = rng() % NB;
-        for (std::size_t d = 0; d < Ndim; ++d) {
-            std::size_t in_bin = (bin_id >> d) & 1;
-            double origin = in_bin * bin_size[d];
-            xt[d] = origin + D[count] / 2 + ud(rng) * (bin_size[d] - D[count]);
-        }
+    for (std::size_t count = 0; count < N; ++count) {
+        const double Dc = D[count];
+        std::size_t attempts = 0;
+        bool placed = false;
+        while (!placed) {
+            if (++attempts > MAX_ATTEMPTS)
+                throw std::runtime_error(
+                    "initializer: could not place a non-overlapping particle "
+                    "(phi_init too high for random sequential addition; "
+                    "lower the initial packing fraction)");
 
-        std::size_t b = getBin(xt);
-        bool ok = true;
-
-        if (walls[0] < 0) {
-            std::size_t K = static_cast<std::size_t>(-walls[0]);
-            double R = box[0] * 0.5;
-            double sumsq = 0.0;
-            for (std::size_t d = 0; d < K; ++d) {
-                double diff = xt[d] - R;
-                sumsq += diff * diff;
+            for (std::size_t d = 0; d < Ndim; ++d) {
+                if (walls[d] == 0)             // periodic: anywhere in [0, box)
+                    xt[d] = ud(rng) * box[d];
+                else                           // hard wall: keep particle inside
+                    xt[d] = Dc * 0.5 + ud(rng) * (box[d] - Dc);
             }
-            if (sumsq > R * R) {
-                ok = false;
-            }
-        }
 
-        if (ok)
-        {
-            for (std::size_t idx : bins[b]) {
-                double r_ij = 0.5 * (D[idx] + D[count]);
-                if (sqDist(x[idx], xt) <= r_ij * r_ij) {
-                    ok = false;
-                    break;
+            if (spherical) {                   // spherical confinement (first Ksph dims)
+                double sumsq = 0.0;
+                for (std::size_t d = 0; d < Ksph; ++d) {
+                    double diff = xt[d] - Rsph;
+                    sumsq += diff * diff;
+                }
+                if (sumsq > (Rsph - Dc * 0.5) * (Rsph - Dc * 0.5)) continue;
+            }
+
+            for (std::size_t d = 0; d < Ndim; ++d) {
+                long c = static_cast<long>(xt[d] / cell_size[d]);
+                if (c < 0) c = 0;
+                if (c >= static_cast<long>(ncell[d])) c = static_cast<long>(ncell[d]) - 1;
+                ci[d] = c;
+            }
+
+            bool ok = true;
+            for (std::size_t m = 0; m < nneigh && ok; ++m) {
+                std::size_t t = m, ncidx = 0;
+                bool valid = true;
+                for (std::size_t d = 0; d < Ndim; ++d) {
+                    long o = static_cast<long>(t % 3) - 1; t /= 3;
+                    long nc = ci[d] + o;
+                    if (walls[d] == 0) {       // periodic wrap
+                        if (ncell[d] == 1) nc = 0;
+                        else { nc %= static_cast<long>(ncell[d]);
+                               if (nc < 0) nc += static_cast<long>(ncell[d]); }
+                    } else {                   // clamp, no wrap
+                        if (nc < 0 || nc >= static_cast<long>(ncell[d])) { valid = false; break; }
+                    }
+                    ncidx += static_cast<std::size_t>(nc) * stride[d];
+                }
+                if (!valid) continue;
+                for (std::uint32_t idx : cells[ncidx]) {
+                    double s = 0.0;
+                    for (std::size_t d = 0; d < Ndim; ++d) {
+                        double dx = xt[d] - x[idx][d];
+                        if (walls[d] == 0) dx -= box[d] * std::nearbyint(dx / box[d]);
+                        s += dx * dx;
+                    }
+                    double r_ij = 0.5 * (D[idx] + Dc);
+                    if (s <= r_ij * r_ij) { ok = false; break; }
                 }
             }
 
             if (ok) {
-                x[count] = std::move(xt);
-                bins[b].push_back(count);
-                ++count;
+                x[count] = xt;
+                cells[cell_of(xt)].push_back(static_cast<std::uint32_t>(count));
+                placed = true;
             }
-        }
-    }
-
-    (void)fix_height;
-}
-
-void initialize_positions_naive(
-    std::vector<std::vector<double>>& x,
-    const std::vector<double>& D,
-    const std::vector<double>& box,
-    std::vector<std::int8_t>& walls,
-    bool fix_height)
-{
-    std::size_t N = x.size(), Ndim = box.size();
-    std::mt19937 rng{std::random_device{}()};
-    std::uniform_real_distribution<> ud(0.0, 1.0);
-    for (std::size_t d = 0; d < Ndim; ++d) x[0][d] = ud(rng) * (box[d] - D[0]) + D[0] / 2;
-    std::size_t count = 1;
-    while (count < N) {
-        std::vector<double> xt(Ndim);
-        for (std::size_t d = 0; d < Ndim; ++d) xt[d] = ud(rng) * (box[d] - D[count]) + D[count] / 2;
-        bool ok = true;
-
-        if (walls[0] < 0) {
-            std::size_t K = static_cast<std::size_t>(-walls[0]);
-            double R = box[0] * 0.5;
-            double sumsq = 0.0;
-            for (std::size_t d = 0; d < K; ++d) {
-                double diff = xt[d] - R;
-                sumsq += diff * diff;
-            }
-            if (sumsq > (R - D[count] / 2) * (R - D[count] / 2)) {
-                ok = false;
-            }
-        }
-
-        if (ok)
-        {
-            for (std::size_t i = 0; i < count; ++i) {
-                double r_ij = 0.5 * (D[i] + D[count]);
-                if (sqDist(x[i], xt) <= r_ij * r_ij) { ok = false; break; }
-            }
-            if (ok) { x[count] = std::move(xt); ++count; }
         }
     }
 
@@ -378,7 +395,7 @@ InitializerResult initialize_particles(const InitializerConfig& config) {
         phi_modifier = sphere_volume(1 / 2., static_cast<std::size_t>(-walls[0]));
     }
 
-    std::mt19937 rng{std::random_device{}()};
+    std::mt19937 rng{static_cast<std::mt19937::result_type>(config.seed)};
     auto rawD = generate_diameter_distribution(N, dist, rng);
     auto scaled_pair = scale_diameters_nd(rawD, phi * phi_modifier, box, Ndim);
     auto D_scaled = std::move(scaled_pair.first);
@@ -407,7 +424,7 @@ InitializerResult initialize_particles(const InitializerConfig& config) {
     }
 
     std::vector<std::vector<double>> x(N, std::vector<double>(Ndim));
-    initialize_positions_binned(x, D_scaled, box, walls, fix_height);
+    initialize_positions_celllist(x, D_scaled, box, walls, fix_height, config.seed);
 
     InitializerResult result;
     result.positions = std::move(x);
