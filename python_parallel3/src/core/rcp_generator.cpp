@@ -4643,9 +4643,47 @@ std::pair<PackingResult, PackingTrace> run_packing_observed(
     // 150K convergence runs). Prior code sized to N_STEPS unconditionally
     // and wrote past end starting at step 60001 — surfaced as glibc
     // 'corrupted size vs. prev_size' ~62K bad writes later.
-    const std::size_t hist_size = std::max<std::size_t>(
-        static_cast<std::size_t>(N_steps),
-        (options.max_steps > 0 ? options.max_steps : 0) + 1);
+    //
+    // Cycle 22+: termination is governed by convergence, not by a fixed step
+    // ceiling — annealing mu -> 0 drives the maximum overlap below the criterion,
+    // which is guaranteed regardless of step count (a low-mu state simply cannot
+    // retain overlaps). The old flat 60000 default cap was cutting off the
+    // floor-mu relaxation for the largest-N cases, leaving them under-converged.
+    // We replace it with a schedule-derived ceiling that gives provable headroom
+    // over a full run: (rung-1 deadline) x (oscillation cycles + 3), floored at
+    // N_STEPS for backward compatibility. It stays finite so the step-indexed
+    // history buffers below remain bounded (an unbounded cap would re-trigger the
+    // OOB corruption noted above), and options.max_steps > 0 is still honored.
+    //
+    // NOTE: the preset table below MIRRORS the in-loop schedule (RCP_SPEED ->
+    // (Y, X, cycles) and the rung-1 deadline, ~lines 5180+ and ~5755). Keep the
+    // two in sync if the schedule constants change.
+    const std::size_t step_cap = [&]() -> std::size_t {
+        if (options.max_steps > 0) return options.max_steps;        // passable override
+        int Y = 2, X = 9; std::size_t cycles = 2;                   // RCP_SPEED=quick default
+        if (const char* sp = std::getenv("RCP_SPEED")) {
+            std::string v(sp);
+            if      (v == "immediate") { Y = 1; X = 5;  cycles = 1; }
+            else if (v == "patient")   { Y = 3; X = 24; cycles = 3; }
+            else if (v == "forever")   { Y = 4; X = 49; cycles = 4; }
+        }
+        if (const char* oc = std::getenv("RCP_OSC_CYCLES")) {
+            long v = std::atol(oc); if (v >= 1 && v < 100) cycles = std::size_t(v);
+        }
+        double rung1 = static_cast<double>(Y) * 4000.0
+            + static_cast<double>(X) * std::sqrt(static_cast<double>(N)
+                                                 * static_cast<double>(Ndim))
+            - 2000.0;                                               // Cycle 21M -2000 cut
+        if (const char* rd = std::getenv("RCP_RUNG1_DEADLINE")) {
+            long v = std::atol(rd);
+            if (v > 100 && v < 10000000) rung1 = static_cast<double>(v);
+        }
+        if (rung1 < 1500.0) rung1 = 1500.0;
+        const std::size_t formula =
+            static_cast<std::size_t>(rung1 * static_cast<double>(cycles + 3));
+        return std::max<std::size_t>(static_cast<std::size_t>(N_steps), formula);
+    }();
+    const std::size_t hist_size = step_cap + 1;
     std::vector<double> U_history(hist_size, 0.0);
 
     std::vector<double> phi_history(hist_size, 0.0);
@@ -4956,7 +4994,7 @@ std::pair<PackingResult, PackingTrace> run_packing_observed(
     }
 
     std::size_t steps = 0;
-    const std::size_t max_steps = options.max_steps > 0 ? options.max_steps : static_cast<std::size_t>(N_steps);
+    const std::size_t max_steps = step_cap;   // resolved above: N-scaled default (cap no longer binds real runs), options.max_steps honored if passed
     // Cycle 10: how often to re-reorder. 0 disables (baseline / debugging).
     const std::size_t REORDER_INTERVAL = options.reorder_interval;
     // Cycle 13 b6.A Step 1 (instrumentation) — served its purpose:
