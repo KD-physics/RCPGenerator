@@ -169,16 +169,18 @@ std::string trim(const std::string& s) {
 }  // namespace
 
 // O(N) random non-overlapping placement via a cell-list random sequential
-// addition (RSA). Replaces the former O(N^2) octant-binned and naive variants
-// (which scanned ~N/8 or N partners per insertion). Produces a disordered
-// arrangement (NO lattice) with a guaranteed hard-core minimum separation, so
-// no two particles are near-coincident -> the soft-pair force cannot blow up at
-// the first packing step -- at the configured packing fraction (set by the
-// prior diameter scaling). Cells are sized >= the largest diameter, so any
-// overlapping partner of a trial particle lies in the immediate 3^Ndim cell
-// block; at the dilute init fraction each insertion checks O(1) partners.
-// Deterministic given `seed`. Distances use the minimum image on periodic
-// (walls[d]==0) axes; non-periodic axes keep particles inside the domain.
+// addition (RSA). Produces a disordered arrangement (NO lattice) with a
+// guaranteed hard-core minimum separation, so no two particles are
+// near-coincident -> the soft-pair force cannot blow up at the first packing
+// step -- at the configured packing fraction (set by the prior diameter
+// scaling). Uses a FINE grid (~O(1) particles per cell) with asymmetric "halo"
+// registration rather than Dmax-sized cells: a Dmax cell degenerates to ~O(N^2)
+// for broad (e.g. power-law) size distributions, where the box spans only a few
+// coarse cells. Largest-first insertion lets each placed particle register
+// itself in every cell within its own radius reach, so a trial particle tests
+// only the single cell holding its centre. Deterministic given `seed`. Distances
+// use the minimum image on periodic (walls[d]==0) axes; non-periodic axes keep
+// particles inside the domain.
 void initialize_positions_celllist(
     std::vector<std::vector<double>>& x,
     const std::vector<double>& D,
@@ -195,20 +197,37 @@ void initialize_positions_celllist(
     for (double v : D) if (v > Dmax) Dmax = v;
     if (Dmax <= 0.0) Dmax = 1e-12;
 
-    // Cell grid: edge >= Dmax so an overlapping pair (centre distance
-    // (Di+Dj)/2 <= Dmax) always falls within the 3^Ndim neighbour block.
-    std::vector<std::size_t> ncell(Ndim);
+    // Fine grid sized to hold ~TARGET_PER_CELL particles per cell -- NOT to Dmax.
+    // A Dmax-sized cell collapses to ~O(N^2) for broad size distributions (most
+    // particles are far smaller than the largest, so the box spans only a handful
+    // of coarse cells). With a fine grid we use asymmetric "halo" registration
+    // instead: particles are inserted largest-first (D is caller-sorted desc), so
+    // every already-placed partner is >= the trial's diameter, and a placed
+    // particle can only overlap a future trial whose centre lies within its own
+    // radius reach Dc. Each placed particle therefore registers itself in every
+    // cell its reach can touch; a trial particle then only needs to test the one
+    // cell containing its centre. Same uniform draws + exact overlap test as a
+    // naive RSA -> identical placement statistics, but genuinely O(N).
+    constexpr double TARGET_PER_CELL = 2.0;
+    double box_vol = 1.0;
+    for (std::size_t d = 0; d < Ndim; ++d) box_vol *= box[d];
+    double cell_edge = std::pow(box_vol / std::max(1.0, static_cast<double>(N) / TARGET_PER_CELL),
+                                1.0 / static_cast<double>(Ndim));
+    if (!(cell_edge > 0.0)) cell_edge = Dmax;        // degenerate guard
+
+    std::vector<long> ncell(Ndim);
     std::vector<double> cell_size(Ndim);
     std::vector<std::size_t> stride(Ndim, 1);
     std::size_t total_cells = 1;
     for (std::size_t d = 0; d < Ndim; ++d) {
-        std::size_t nc = static_cast<std::size_t>(std::floor(box[d] / Dmax));
+        long nc = std::lround(box[d] / cell_edge);
         if (nc < 1) nc = 1;
         ncell[d] = nc;
         cell_size[d] = box[d] / static_cast<double>(nc);
-        total_cells *= nc;
+        total_cells *= static_cast<std::size_t>(nc);
     }
-    for (std::size_t d = 1; d < Ndim; ++d) stride[d] = stride[d - 1] * ncell[d - 1];
+    for (std::size_t d = 1; d < Ndim; ++d)
+        stride[d] = stride[d - 1] * static_cast<std::size_t>(ncell[d - 1]);
 
     std::vector<std::vector<std::uint32_t>> cells(total_cells);
 
@@ -219,22 +238,20 @@ void initialize_positions_celllist(
     std::mt19937_64 rng{seed ? seed : 0x9E3779B97F4A7C15ULL};
     std::uniform_real_distribution<double> ud(0.0, 1.0);
 
-    auto cell_of = [&](const std::vector<double>& p) {
-        std::size_t id = 0;
-        for (std::size_t d = 0; d < Ndim; ++d) {
-            long c = static_cast<long>(p[d] / cell_size[d]);
-            if (c < 0) c = 0;
-            if (c >= static_cast<long>(ncell[d])) c = static_cast<long>(ncell[d]) - 1;
-            id += static_cast<std::size_t>(c) * stride[d];
+    // wrapped (periodic) / range-checked (hard wall) cell coordinate on one axis.
+    auto wrap_coord = [&](long c, std::size_t d, long& out) -> bool {
+        if (walls[d] == 0) {                         // periodic
+            long n = ncell[d];
+            if (n == 1) { out = 0; return true; }
+            c %= n; if (c < 0) c += n; out = c; return true;
         }
-        return id;
+        if (c < 0 || c >= ncell[d]) return false;    // hard wall: outside grid
+        out = c; return true;
     };
-
-    std::size_t nneigh = 1;
-    for (std::size_t d = 0; d < Ndim; ++d) nneigh *= 3;
 
     std::vector<double> xt(Ndim);
     std::vector<long> ci(Ndim);
+    std::vector<long> hw(Ndim);
     const std::size_t MAX_ATTEMPTS = std::size_t{1} << 22;  // ~4e6; dilute RSA accepts in O(1)
 
     for (std::size_t count = 0; count < N; ++count) {
@@ -264,47 +281,61 @@ void initialize_positions_celllist(
                 if (sumsq > (Rsph - Dc * 0.5) * (Rsph - Dc * 0.5)) continue;
             }
 
+            // centre cell of the trial
             for (std::size_t d = 0; d < Ndim; ++d) {
                 long c = static_cast<long>(xt[d] / cell_size[d]);
                 if (c < 0) c = 0;
-                if (c >= static_cast<long>(ncell[d])) c = static_cast<long>(ncell[d]) - 1;
+                if (c >= ncell[d]) c = ncell[d] - 1;
                 ci[d] = c;
             }
+            std::size_t center = 0;
+            for (std::size_t d = 0; d < Ndim; ++d)
+                center += static_cast<std::size_t>(ci[d]) * stride[d];
 
+            // overlap test: only the trial's own cell. Halo registration
+            // guarantees every overlapping placed partner is listed there.
             bool ok = true;
-            for (std::size_t m = 0; m < nneigh && ok; ++m) {
-                std::size_t t = m, ncidx = 0;
-                bool valid = true;
+            for (std::uint32_t idx : cells[center]) {
+                double s = 0.0;
                 for (std::size_t d = 0; d < Ndim; ++d) {
-                    long o = static_cast<long>(t % 3) - 1; t /= 3;
-                    long nc = ci[d] + o;
-                    if (walls[d] == 0) {       // periodic wrap
-                        if (ncell[d] == 1) nc = 0;
-                        else { nc %= static_cast<long>(ncell[d]);
-                               if (nc < 0) nc += static_cast<long>(ncell[d]); }
-                    } else {                   // clamp, no wrap
-                        if (nc < 0 || nc >= static_cast<long>(ncell[d])) { valid = false; break; }
-                    }
-                    ncidx += static_cast<std::size_t>(nc) * stride[d];
+                    double dx = xt[d] - x[idx][d];
+                    if (walls[d] == 0) dx -= box[d] * std::nearbyint(dx / box[d]);
+                    s += dx * dx;
                 }
-                if (!valid) continue;
-                for (std::uint32_t idx : cells[ncidx]) {
-                    double s = 0.0;
-                    for (std::size_t d = 0; d < Ndim; ++d) {
-                        double dx = xt[d] - x[idx][d];
-                        if (walls[d] == 0) dx -= box[d] * std::nearbyint(dx / box[d]);
-                        s += dx * dx;
-                    }
-                    double r_ij = 0.5 * (D[idx] + Dc);
-                    if (s <= r_ij * r_ij) { ok = false; break; }
-                }
+                double r_ij = 0.5 * (D[idx] + Dc);
+                if (s <= r_ij * r_ij) { ok = false; break; }
             }
+            if (!ok) continue;
 
-            if (ok) {
-                x[count] = xt;
-                cells[cell_of(xt)].push_back(static_cast<std::uint32_t>(count));
-                placed = true;
+            // accept: place, then register in every cell within reach Dc.
+            x[count] = xt;
+            std::size_t halo = 1;
+            for (std::size_t d = 0; d < Ndim; ++d) {
+                long h = static_cast<long>(std::ceil(Dc / cell_size[d])) + 1;
+                if (h > ncell[d]) h = ncell[d];
+                hw[d] = h;
+                halo *= static_cast<std::size_t>(2 * h + 1);
             }
+            for (std::size_t m = 0; m < halo; ++m) {
+                std::size_t t = m, hidx = 0;
+                bool valid = true;
+                double mindist2 = 0.0;
+                for (std::size_t d = 0; d < Ndim; ++d) {
+                    long span = 2 * hw[d] + 1;
+                    long o = static_cast<long>(t % static_cast<std::size_t>(span)) - hw[d];
+                    t /= static_cast<std::size_t>(span);
+                    double gap = 0.0;          // min spatial gap from xt to this cell (unwrapped)
+                    if (o > 0)      gap = static_cast<double>(ci[d] + o) * cell_size[d] - xt[d];
+                    else if (o < 0) gap = xt[d] - static_cast<double>(ci[d] + o + 1) * cell_size[d];
+                    if (gap > 0.0) mindist2 += gap * gap;
+                    long wc;
+                    if (!wrap_coord(ci[d] + o, d, wc)) { valid = false; break; }
+                    hidx += static_cast<std::size_t>(wc) * stride[d];
+                }
+                if (valid && mindist2 < Dc * Dc)
+                    cells[hidx].push_back(static_cast<std::uint32_t>(count));
+            }
+            placed = true;
         }
     }
 
@@ -376,6 +407,12 @@ InitializerResult initialize_particles(const InitializerConfig& config) {
 
     if (Ndim < 2) {
         throw std::runtime_error("--Ndim must be >=2");
+    }
+    // Robustness: a caller that omits walls (binding does not set it from the
+    // dict) must default to fully periodic rather than indexing walls[d] out of
+    // bounds. Pad/truncate to Ndim; missing entries are periodic (0).
+    if (walls.size() != Ndim) {
+        walls.resize(Ndim, 0);
     }
     if (box.empty()) box.assign(Ndim, 1.0);
     if (phi <= 0 || phi >= 1 || N == 0) {
