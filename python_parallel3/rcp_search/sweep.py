@@ -227,7 +227,7 @@ def run_one_case(family, shape_param, size, seed, Ndim, *,
                  dmaxL_tol=0.20, N_cap=250_000, grid_n=5000,
                  alpha_tukey=0.0025, phi_init=0.30, initializer_phi=0.11,
                  neighbor_max=0, speed="quick", N_override=None,
-                 phi_jammed=None, reorder_interval=None):
+                 phi_jammed=None, reorder_interval=None, bundle_opts=None):
     """Build the model, size N (or use N_override), pack, return a
     self-describing census row dict. `size` is the family's user-controlled
     size axis (SR for power/gaussian, truncation `a` for lognormal). Returns a
@@ -307,6 +307,10 @@ def run_one_case(family, shape_param, size, seed, Ndim, *,
         wall_s=float(wall),
         **{k: stats[k] for k in stats},     # m1..m6, d_min, d_max
     )
+    # optional targeted save/bundle (default off -> census behaves as before)
+    if bundle_opts:
+        from .bundling import save_outputs
+        base["saved"] = save_outputs(packing, base, bundle_opts)
     return base
 
 
@@ -317,7 +321,7 @@ def run_one_case(family, shape_param, size, seed, Ndim, *,
 def run_sweep_sequential(cases, save_dir, *, dmaxL_tol=0.20, N_cap=250_000,
                          Ndim=3, grid_n=5000, alpha_tukey=0.0025,
                          speed="quick", reorder_interval=None,
-                         local_N_hardcap=None, verbose=True):
+                         local_N_hardcap=None, verbose=True, bundle_opts=None):
     """Run a list of cases one at a time, appending self-describing rows.
     Idempotent: cases already in the census are skipped.
 
@@ -360,7 +364,7 @@ def run_sweep_sequential(cases, save_dir, *, dmaxL_tol=0.20, N_cap=250_000,
         row = run_one_case(fam, p, sz, seed, Ndim, dmaxL_tol=dmaxL_tol,
                            N_cap=N_cap, grid_n=grid_n, alpha_tukey=alpha_tukey,
                            speed=speed, N_override=N_override,
-                           reorder_interval=reorder_interval)
+                           reorder_interval=reorder_interval, bundle_opts=bundle_opts)
         if clamped:
             row["local_N_hardcapped"] = True
         with open(out, "a") as f:
@@ -484,7 +488,8 @@ def run_sweep_parallel(cases, save_dir, *, T=4, total_cpus=None,
                        mem_budget_gb=100.0, dmaxL_tol=0.20, N_cap=250_000,
                        Ndim=3, grid_n=5000, alpha_tukey=0.0025, speed="quick",
                        reorder_interval=None,
-                       max_kills_per_case=2, mp_context="fork", verbose=True):
+                       max_kills_per_case=2, mp_context="fork", verbose=True,
+                       bundle_opts=None):
     """Run the grid in parallel: `total_cpus // T` cases concurrent, each at
     T engine threads. Idempotent (skips done), appends self-describing rows.
 
@@ -521,6 +526,8 @@ def run_sweep_parallel(cases, save_dir, *, T=4, total_cpus=None,
     for c in pending:
         c["speed"] = speed; c["T"] = T
         c["reorder_interval"] = reorder_interval
+        if bundle_opts is not None:
+            c["bundle_opts"] = bundle_opts   # flows to run_one_case via _sweep_worker(**a)
     if verbose:
         print(f"[sweep] pending={len(pending)} skipped={skipped} "
               f"invalid={len(invalid_rows)}", flush=True)

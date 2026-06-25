@@ -71,6 +71,8 @@ from .sweep import (
     run_sweep_sequential,
     load_sweep_census,
 )
+# optional targeted save/bundle for the webapp + analysis (lazy deps inside)
+from .bundling import bundle_from_npz, save_outputs, save_npz
 from .persistence import (
     SearchState,
     load_config_sidecar,
@@ -111,6 +113,8 @@ __all__ = [
     "set_perturb_weights", "theta_to_dataframe", "initialize_theta", "evaluate_model_pdf",
     "sample_diameters", "clip_theta", "perturb_theta", "universal_pdf_R",
     "tukey_window_on_interval", "lognormal_diagnostics", "center_for_geometric_mean",
+    # bundling (optional save/bundle for webapp + analysis)
+    "bundle_from_npz", "save_outputs", "save_npz",
     # jobs
     "create_packing", "run_one_custom_packing", "run_packing_job",
     "make_packing_job", "run_jobs", "resolve_n_workers",
