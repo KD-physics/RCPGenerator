@@ -5755,8 +5755,11 @@ std::pair<PackingResult, PackingTrace> run_packing_observed(
         }
 
         if ((step > 500 && mu_flag == 1)) {
-            std::vector<double> XX(phi_history.begin() + step - 250, phi_history.begin() + step - 1);
-            double delta_XX = *std::max_element(XX.begin(), XX.end()) - *std::min_element(XX.begin(), XX.end());
+            // Cycle 23: phi-plateau early-out for the rung 1->0 transition
+            // DISABLED (see trigger below). XX/delta_XX computed the phi range
+            // over the last 250 steps; no longer used.
+            // std::vector<double> XX(phi_history.begin() + step - 250, phi_history.begin() + step - 1);
+            // double delta_XX = *std::max_element(XX.begin(), XX.end()) - *std::min_element(XX.begin(), XX.end());
 
             // Cycle 17 H12: rung 1->0 trigger denominator is tunable.
             // Default 3 (original). H12 tested 5 at N=50K SR=11: minor speed
@@ -5803,7 +5806,17 @@ std::pair<PackingResult, PackingTrace> run_packing_observed(
                 if (dl < 1500.0) dl = 1500.0;
                 return static_cast<std::size_t>(dl);
             }();
-            if (delta_XX < 5e-6 || step - phi_max.second > 3500 || (step > static_cast<int>(rung1_deadline))) {
+            // Cycle 23: rung 1->0 transition gated on the rung-1 DEADLINE ONLY.
+            // The two early-outs below (phi-plateau delta_XX<5e-6, and no-new-
+            // phi-max-in-3500-steps stall) fired prematurely at large N for
+            // narrow distributions (Weibull k>=1, and analogous power-law cases),
+            // ending rung-1 early AND shortening the downstream oscillation
+            // period (osc = 0.5 * rung-1 end step) -> under-compaction, phi
+            // ~0.003-0.004 low and non-monotonic vs Dmax/L. Safety fix: always
+            // run the full rung-1 budget. (Costs wall time on fast-converging
+            // cases; revisit later.) Original OR-condition preserved here:
+            // if (delta_XX < 5e-6 || step - phi_max.second > 3500 || (step > static_cast<int>(rung1_deadline))) {
+            if (step > static_cast<int>(rung1_deadline)) {
                 // Cycle 19 Step 2: arm adaptive feedback mu decay.
                 // mu / 10 (= mu_1 / 10): empirically the winning ratio.
                 // Keeps mu_1 → mu_0 a decade decay, so t_relax measured
