@@ -3581,7 +3581,12 @@ void get_forces_nd_3(
     double& dkappa,
     std::vector<std::size_t>& z,
     const double* packed_d0,
-    double kappa)
+    double kappa,
+    // Cascade (additive): per-particle "kappa radius" = fixed?0:D[i]/2, and the
+    // active-only diameter sum. nullptr / negative -> standard path (byte-identical):
+    // the masked dkappa terms below reduce EXACTLY to the originals.
+    const double* rk_data,
+    double sumD_active)
 {
     double K = 1.0;
 
@@ -3760,7 +3765,7 @@ void get_forces_nd_3(
                g_floop_test_cycles, g_floop_overlap_cycles, probe, \
                extra_mic, mic_scale, use_simd3, use_simd2, \
                g_fl_lo, g_fl_hi, packed_d0, kappa, use_packed, \
-               use_fp32_stub, x_shadow) \
+               use_fp32_stub, x_shadow, rk_data) \
         reduction(+:U_red, Lc_red, dkappa_red, Fmean_red, count_red) \
         reduction(max:max_min_red)
     {
@@ -3936,7 +3941,7 @@ void get_forces_nd_3(
                             F_t[i * 3 + d] += fcomp;
                             F_t[j * 3 + d] -= fcomp;
                         }
-                        dkappa_red = dkappa_red + K * r_ij * (dist - r_ij);
+                        dkappa_red = dkappa_red + K * (rk_data ? (rk_data[i] + rk_data[j]) : r_ij) * (dist - r_ij);
                         Fmean_red = Fmean_red + F_mag;
                     }
                 }
@@ -4039,7 +4044,7 @@ void get_forces_nd_3(
                             F_t[i * 2 + d] += fcomp;
                             F_t[j * 2 + d] -= fcomp;
                         }
-                        dkappa_red = dkappa_red + K * r_ij * (dist - r_ij);
+                        dkappa_red = dkappa_red + K * (rk_data ? (rk_data[i] + rk_data[j]) : r_ij) * (dist - r_ij);
                         Fmean_red = Fmean_red + F_mag;
                     }
                 }
@@ -4096,7 +4101,7 @@ void get_forces_nd_3(
                         F_t[j * Ndim + d] -= fcomp;
                     }
 
-                    dkappa_red = dkappa_red + K * r_ij * (dist - r_ij);
+                    dkappa_red = dkappa_red + K * (rk_data ? (rk_data[i] + rk_data[j]) : r_ij) * (dist - r_ij);
                     Fmean_red = Fmean_red + F_mag;
                 }
             }
@@ -4174,7 +4179,7 @@ void get_forces_nd_3(
                             ++count;
                             double fcomp = F_mag * dx[d];
                             F[i * Ndim + d] += fcomp;
-                            dkappa = dkappa + 2 * K * r_ij * (dist - r_ij);
+                            dkappa = dkappa + 2 * K * (rk_data ? rk_data[i] : r_ij) * (dist - r_ij);
                             Fmean = Fmean + F_mag;
                         }
                     }
@@ -4212,7 +4217,7 @@ void get_forces_nd_3(
                     {
                         F[i * Ndim + M] = F[i * Ndim + M] + F_mag * dx[M];
                     }
-                    dkappa = dkappa + 2 * K * r_ij * (d_ij - r_ij);
+                    dkappa = dkappa + 2 * K * (rk_data ? rk_data[i] : r_ij) * (d_ij - r_ij);
                     Fmean = Fmean + F_mag;
                 }
             }
@@ -4227,7 +4232,7 @@ void get_forces_nd_3(
         sumD += Di;
     }
 
-    dkappa = dkappa + mu * sumD;
+    dkappa = dkappa + mu * (sumD_active >= 0.0 ? sumD_active : sumD);  // cascade: active-only pressure
     Fmean = -Fmean / count;
 }
 
@@ -4324,6 +4329,13 @@ std::pair<PackingResult, PackingTrace> run_packing_observed(
         for (std::size_t d = 0; d < Ndim; ++d)
             x[i * Ndim + d] = input.positions[i][d];
     std::vector<double> x_last = x;
+    // Cascade (additive): per-particle frozen-diameter mask. Empty/all-zero ->
+    // has_fixed=false and every cascade branch below is skipped, so the one-shot
+    // path is byte-identical. Permuted alongside D0 on reorder (see below).
+    std::vector<std::int8_t> fixed_flags = input.fixed;
+    if (!fixed_flags.empty() && fixed_flags.size() != N) fixed_flags.assign(N, 0);
+    const bool has_fixed = std::any_of(fixed_flags.begin(), fixed_flags.end(),
+                                       [](std::int8_t f) { return f != 0; });
     // Cycle 20: per-particle diameter anchor for the growth-aware refresh
     // trigger. Diameter growth between refreshes consumes pair-shell budget
     // exactly like displacement does ((Di+Dj)/2 grows while the candidate
@@ -4594,7 +4606,10 @@ std::pair<PackingResult, PackingTrace> run_packing_observed(
     // helper self-heals after any pairs_data resize — every resize site
     // is followed by a full-refresh dispatch, which rebuilds all rows.
     std::vector<double> packed_d0_mirror;
-    const bool packed_d0_on = rcp_packed_d0() && (Ndim == 2 || Ndim == 3);
+    // Cascade: the packed-D0 SIMD mirror multiplies a per-slot D0 by the global
+    // kappa, which would wrongly scale frozen particles. Disable it when has_fixed
+    // so the force loop falls back to the per-particle D[j] gather (correct sizes).
+    const bool packed_d0_on = rcp_packed_d0() && (Ndim == 2 || Ndim == 3) && !has_fixed;
     auto packed_d0_ptr = [&]() -> double* {
         if (!packed_d0_on) return nullptr;
         if (packed_d0_mirror.size() != pairs_data.size())
@@ -4835,6 +4850,12 @@ std::pair<PackingResult, PackingTrace> run_packing_observed(
             std::vector<double> tmp(N);
             for (std::size_t k = 0; k < N; ++k) tmp[k] = D0[perm[k]];
             D0 = std::move(tmp);
+        }
+        // Cascade: the frozen-diameter mask must travel with the spatial reorder.
+        if (!fixed_flags.empty()) {
+            std::vector<std::int8_t> tmp(N);
+            for (std::size_t k = 0; k < N; ++k) tmp[k] = fixed_flags[perm[k]];
+            fixed_flags = std::move(tmp);
         }
         // Flat N*Ndim arrays (ADAM state).
         auto apply_perm_flat = [&](std::vector<double>& arr) {
@@ -5662,9 +5683,18 @@ std::pair<PackingResult, PackingTrace> run_packing_observed(
             // D0[i]*kappa regardless of thread, so values are
             // byte-identical to the serial scan.
             const std::size_t nD = D0.size();
-            #pragma omp parallel for schedule(static)
-            for (std::size_t i = 0; i < nD; ++i) {
-                D[i] = D0[i] * kappa;
+            if (!has_fixed) {
+                #pragma omp parallel for schedule(static)
+                for (std::size_t i = 0; i < nD; ++i) {
+                    D[i] = D0[i] * kappa;
+                }
+            } else {
+                // Cascade: frozen particles keep their diameter (D0); only the
+                // active class scales with kappa. Branch hoisted out of the loop.
+                #pragma omp parallel for schedule(static)
+                for (std::size_t i = 0; i < nD; ++i) {
+                    D[i] = fixed_flags[i] ? D0[i] : D0[i] * kappa;
+                }
             }
         }
         g_t_bk_dupdate.end();
@@ -5673,7 +5703,9 @@ std::pair<PackingResult, PackingTrace> run_packing_observed(
         //   min(D) = D0_min_cached * kappa.
         // When runtime_fix_diameter is true, D == D0 and kappa is held at 1
         // (see target_phi branch above), so D0_min_cached IS Dmin.
-        double Dmin_lastest = D0_min_cached * (runtime_fix_diameter ? 1.0 : kappa);
+        double Dmin_lastest = has_fixed
+            ? *std::min_element(D.begin(), D.end())          // cascade: mixed scaling
+            : D0_min_cached * (runtime_fix_diameter ? 1.0 : kappa);
 
         coeff = std::pow(M_PI, Ndim / 2.0) / std::tgamma(Ndim / 2.0 + 1.0);
         // current_volume = sum_i coeff * (D[i]/2)^Ndim
@@ -5683,7 +5715,15 @@ std::pair<PackingResult, PackingTrace> run_packing_observed(
         if (!runtime_fix_diameter) {
             for (std::size_t k = 0; k < Ndim; ++k) kappa_to_Ndim *= kappa;
         }
-        current_volume = coeff * S_D0_cached * kappa_to_Ndim;
+        if (has_fixed) {
+            // cascade: frozen particles do not scale with kappa, so the O(1)
+            // S_D0*kappa^Ndim shortcut is invalid; recompute the volume directly.
+            current_volume = 0.0;
+            for (std::size_t i = 0; i < N; ++i)
+                current_volume += coeff * std::pow(D[i] / 2.0, Ndim);
+        } else {
+            current_volume = coeff * S_D0_cached * kappa_to_Ndim;
+        }
 
         box_volume = std::accumulate(box.begin(), box.end(), 1.0, std::multiplies<double>());
 
@@ -6117,10 +6157,24 @@ std::pair<PackingResult, PackingTrace> run_packing_observed(
                           std::exp(-static_cast<double>(step) /
                                    rcp_mu1_boost_tau()))
             : mu;
+        // Cascade: per-particle kappa-radius (fixed -> 0, excluded from dkappa) and
+        // the active-only diameter sum for the pressure term. Built only when
+        // has_fixed; otherwise pass nullptr/-1 -> get_forces_nd_3 byte-identical.
+        const double* rk_ptr = nullptr; double sumD_active = -1.0;
+        std::vector<double> rk_flat_cascade;
+        if (has_fixed) {
+            rk_flat_cascade.resize(N); sumD_active = 0.0;
+            for (std::size_t i = 0; i < N; ++i) {
+                if (fixed_flags[i]) { rk_flat_cascade[i] = 0.0; }
+                else { rk_flat_cascade[i] = D[i] * 0.5; sumD_active += D[i]; }
+            }
+            rk_ptr = rk_flat_cascade.data();
+        }
         get_forces_nd_3(pairs_data.data(), pair_offsets.data(), x.data(), N, Ndim, D, box, walls, F, U, min_dist, max_min_dist, Lc, Fmean, mu_eff, dkappa, z,
                         // Cycle 21k: packed-D0 + the kappa the last D-update used
                         // (D[j] == D0[j]*kappa bit-for-bit at this point).
-                        packed_d0_on ? packed_d0_mirror.data() : nullptr, kappa);
+                        packed_d0_on ? packed_d0_mirror.data() : nullptr, kappa,
+                        rk_ptr, sumD_active);
         g_t_forces.end();
         // Cycle 20: missed-pair sentinel — validates the candidate lists the
         // forces above just consumed. Off unless RCP_SENTINEL is set.
