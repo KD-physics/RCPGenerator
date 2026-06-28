@@ -61,7 +61,8 @@ VIZ.Renderer2D = function (container, data0, opts) {
       viewState = Object.assign({}, viewState, vs); dk.setProps({ viewState }); if (VIZ.onView) VIZ.onView(viewState);
     },
     onAfterRender: () => { window.__rendered = true; if (VIZ.diag) VIZ.diag.update();
-      if (VIZ.stats && VIZ.stats.renderer) VIZ.stats.request(); }
+      if (VIZ.stats && VIZ.stats.renderer) VIZ.stats.request();
+      if (VIZ.__exportHook) VIZ.__exportHook(); }   // one-shot PNG capture (export.js)
   });
 
   const api = {
