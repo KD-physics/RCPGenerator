@@ -27,6 +27,9 @@ struct PackingConfig {
 struct PackingInput {
     std::vector<std::vector<double>> positions;
     std::vector<double> diameters;
+    // Cascade (additive): per-particle flag, 1 = diameter frozen (exempt from the
+    // global kappa scaling). Empty / all-zero -> standard one-shot path (unchanged).
+    std::vector<std::int8_t> fixed;
 };
 
 struct PackingResult {
@@ -224,7 +227,12 @@ void get_forces_nd_3(
     // multiply by kappa instead of gathering D[j]. kappa MUST be the same
     // value the D-update pass used (D[j] == D0[j]*kappa bit-for-bit).
     const double* packed_d0 = nullptr,
-    double kappa = 1.0);
+    double kappa = 1.0,
+    // Cascade (additive): per-particle kappa-radius (fixed->0) + active-only diameter
+    // sum. Defaults nullptr/-1 -> standard path, byte-identical (masked dkappa terms
+    // reduce exactly to the originals).
+    const double* rk_data = nullptr,
+    double sumD_active = -1.0);
 
 // Cycle 5a: m, v, v_update, m_hat, v_hat moved to flat double* layout.
 // They are addressed as [k * Ndim + d] for particle k, dimension d. The
