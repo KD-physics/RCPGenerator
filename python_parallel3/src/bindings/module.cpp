@@ -81,6 +81,7 @@ rcpgenerator::PackingInput packing_input_from_dict(const py::dict& source) {
     rcpgenerator::PackingInput input;
     assign_if_present(source, "positions", input.positions);
     assign_if_present(source, "diameters", input.diameters);
+    assign_if_present(source, "fixed", input.fixed);   // cascade: frozen-diameter mask
     return input;
 }
 
