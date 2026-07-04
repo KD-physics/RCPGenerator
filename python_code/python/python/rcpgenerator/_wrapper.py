@@ -116,6 +116,10 @@ class Packing:
         self.phi_history = []
         self.force_history = []
         self.energy_history = []
+        self.max_overlap_history = []
+        self.mu_flag_history = []
+        self.mu_history = []
+        self.alpha_history = []
         self.trajectory_positions = []
         self.trajectory_diameters = []
         self.trajectory_steps = []
@@ -192,6 +196,7 @@ class Packing:
             "walls": deepcopy(self.walls),
             "fix_height": self.fix_height,
             "dist": deepcopy(self.dist),
+            "seed": self.seed,   # deterministic, seed-varying initial configuration
         }
 
     def _collect_pack_input(self) -> dict[str, Any]:
@@ -234,6 +239,10 @@ class Packing:
         self.phi_history = []
         self.force_history = []
         self.energy_history = []
+        self.max_overlap_history = []
+        self.mu_flag_history = []
+        self.mu_history = []
+        self.alpha_history = []
 
     def _clear_trajectory(self) -> None:
         self.trajectory_positions = []
@@ -300,6 +309,10 @@ class Packing:
             self.phi_history = result["phi_history"]
             self.force_history = result["force_history"]
             self.energy_history = result["energy_history"]
+            self.max_overlap_history = result.get("max_overlap_history", [])
+            self.mu_flag_history = result.get("mu_flag_history", [])
+            self.mu_history = result.get("mu_history", [])
+            self.alpha_history = result.get("alpha_history", [])
         finally:
             object.__setattr__(self, "_mutating_internal_state", False)
 

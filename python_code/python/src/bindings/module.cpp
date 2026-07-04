@@ -6,6 +6,8 @@
 #include <string>
 #include <vector>
 
+#include <omp.h>
+
 #include <pybind11/pybind11.h>
 #include <pybind11/stl.h>
 
@@ -65,6 +67,7 @@ rcpgenerator::InitializerConfig initializer_config_from_dict(const py::dict& sou
     assign_if_present(source, "Ndim", config.Ndim);
     assign_if_present(source, "box", config.box);
     assign_if_present(source, "fix_height", config.fix_height);
+    assign_if_present(source, "seed", config.seed);
     if (source.contains(py::str("walls"))) {
         config.walls = cast_walls(source[py::str("walls")]);
     }
@@ -78,6 +81,7 @@ rcpgenerator::PackingInput packing_input_from_dict(const py::dict& source) {
     rcpgenerator::PackingInput input;
     assign_if_present(source, "positions", input.positions);
     assign_if_present(source, "diameters", input.diameters);
+    assign_if_present(source, "fixed", input.fixed);   // cascade: frozen-diameter mask
     return input;
 }
 
@@ -97,6 +101,7 @@ rcpgenerator::PackingRunOptions packing_run_options_from_dict(const py::dict& so
     rcpgenerator::PackingRunOptions options;
     assign_if_present(source, "max_steps", options.max_steps);
     assign_if_present(source, "fix_diameter", options.fix_diameter);
+    assign_if_present(source, "reorder_interval", options.reorder_interval);
     if (source.contains(py::str("mu"))) {
         options.has_mu_override = true;
         options.mu_override = source[py::str("mu")].cast<double>();
@@ -104,6 +109,11 @@ rcpgenerator::PackingRunOptions packing_run_options_from_dict(const py::dict& so
     if (source.contains(py::str("target_phi"))) {
         options.has_target_phi = true;
         options.target_phi = source[py::str("target_phi")].cast<double>();
+    }
+    if (source.contains(py::str("initial_phi_target"))) {
+        options.has_initial_phi_target = true;
+        options.initial_phi_target =
+            source[py::str("initial_phi_target")].cast<double>();
     }
     return options;
 }
@@ -150,10 +160,26 @@ py::dict packing_result_to_dict(const rcpgenerator::PackingResult& result) {
     output["phi_history"] = result.phi_history;
     output["force_history"] = result.force_history;
     output["energy_history"] = result.energy_history;
+    // Cycle 16: per-step diagnostics for ADAM convergence study.
+    output["max_overlap_history"] = result.max_overlap_history;
+    output["mu_history"] = result.mu_history;
+    output["alpha_history"] = result.alpha_history;
+    output["mu_flag_history"] = result.mu_flag_history;
+    // Cycle 18: per-particle troublemaker stats from last window.
+    output["pp_F_sq_sum"] = result.pp_F_sq_sum;
+    output["pp_F_sign_flips"] = result.pp_F_sign_flips;
+    output["pp_pos_range_max"] = result.pp_pos_range_max;
+    output["pp_contact_sum"] = result.pp_contact_sum;
+    output["pp_signflip_resets"] = result.pp_signflip_resets;
+    output["pp_window_steps"] = result.pp_window_steps;
+    // Cycle 18 Phase A: spike event log (flat, 8 doubles per event).
+    output["spike_log"] = result.spike_log;
+    output["reorder_log"] = result.reorder_log;
     output["steps"] = result.steps;
     output["phi"] = result.phi;
     output["max_min_dist"] = result.max_min_dist;
     output["force_magnitude"] = result.force_magnitude;
+    output["particle_origin"] = result.particle_origin;
     return output;
 }
 
@@ -173,6 +199,31 @@ py::dict packing_trace_to_dict(const rcpgenerator::PackingTrace& trace) {
 
 PYBIND11_MODULE(_rcpgenerator, m) {
     m.doc() = "Thin pybind11 bindings for rcpgenerator";
+
+    // Default to single-threaded so behavior matches the legacy serial build
+    // unless the user explicitly opts into threading via set_num_threads().
+    // OMP_NUM_THREADS environment variable, if set, overrides this default.
+    if (std::getenv("OMP_NUM_THREADS") == nullptr) {
+        omp_set_num_threads(1);
+    }
+
+    m.def(
+        "set_num_threads",
+        [](int n) {
+            if (n < 1) {
+                throw std::invalid_argument("num_threads must be >= 1");
+            }
+            omp_set_num_threads(n);
+        },
+        py::arg("n"),
+        "Set the number of OpenMP threads used by the parallel kernels. "
+        "Default is 1 (single-threaded — bit-equivalent to the legacy build). "
+        "Pass n > 1 to enable parallel force loop, neighbor build, etc.");
+
+    m.def(
+        "get_num_threads",
+        []() { return omp_get_max_threads(); },
+        "Return the current OpenMP thread count.");
 
     m.def(
         "initialize_particles",
