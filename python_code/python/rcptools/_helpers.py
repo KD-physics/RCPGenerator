@@ -69,7 +69,12 @@ def safe_compute_phi(packing):
 
     V_particles = hypersphere_volume_from_diameter(D, ndim)
     V_box = float(np.prod(box))
-    return V_particles / V_box if V_box > 0 else 0.0
+    # curved (hyperspherical) container: reference phi to the container volume, not the box.
+    import math as _math
+    _w = getattr(packing, "walls", None)
+    _t = -int(_w[0]) if (_w is not None and len(_w) and int(_w[0]) < 0) else 0
+    _cf = (_math.pi ** (_t / 2.0) / _math.gamma(_t / 2.0 + 1.0) * (0.5 ** _t)) if _t >= 2 else 1.0
+    return (V_particles / V_box / _cf) if V_box > 0 else 0.0
 
 
 def auto_neighbor_max(N, Ndim, size_ratio=1.0):

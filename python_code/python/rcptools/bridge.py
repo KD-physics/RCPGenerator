@@ -27,6 +27,15 @@ def _load_npz(npz):
 def _f32(arr, path):
     np.asarray(arr, dtype="<f4").tofile(path)
 
+def _container_frac(walls, d):
+    """Box fraction filled by a curved (hyperspherical) container (walls[0] = -t); 1.0 if flat."""
+    import math
+    t = -int(walls[0]) if (walls is not None and len(walls) and int(walls[0]) < 0) else 0
+    if t < 2:
+        return 1.0
+    return math.pi ** (t / 2.0) / math.gamma(t / 2.0 + 1.0) * (0.5 ** t)
+
+
 def write_bundle(out_dir, pos, dia, box, walls=None, layers=None):
     out = pathlib.Path(out_dir); out.mkdir(parents=True, exist_ok=True)
     pos = np.asarray(pos, float); dia = np.asarray(dia, float); box = list(map(float, box))
@@ -40,7 +49,7 @@ def write_bundle(out_dir, pos, dia, box, walls=None, layers=None):
            "walls": ([int(w) for w in walls] if walls is not None else None),
            "positions": {"file": "pos.f32", "dtype": "float32", "shape": [N, d]},
            "diameters": {"file": "dia.f32", "dtype": "float32", "shape": [N]},
-           "phi": float((np.pi/6 if d == 3 else np.pi/4) * (dia**d).sum() / np.prod(box)),
+           "phi": float((np.pi/6 if d == 3 else np.pi/4) * (dia**d).sum() / np.prod(box) / _container_frac(walls, d)),
            "layers": []}
     man["analysis_summary"] = {}
     for lyr in (layers or []):
