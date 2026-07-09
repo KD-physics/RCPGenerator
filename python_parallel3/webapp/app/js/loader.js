@@ -3,12 +3,30 @@
 // layer types are read generically from the manifest.
 window.VIZ = window.VIZ || {};
 
+// --- boundary helpers (shared by native-2D load and 3D cross-sections) -------------
+VIZ.circlePath = function (cx, cy, R, n) {
+  n = n || 96; const path = [];
+  for (let i = 0; i <= n; i++) { const t = i / n * 2 * Math.PI; path.push([cx + R * Math.cos(t), cy + R * Math.sin(t)]); }
+  return path;
+};
+VIZ.boxEdges = function (Lx, Ly, xDashed, yDashed) {   // per-edge; dashed = periodic, solid = hard
+  return [{ path: [[0, 0], [0, Ly]], dashed: !!xDashed }, { path: [[Lx, 0], [Lx, Ly]], dashed: !!xDashed },
+          { path: [[0, 0], [Lx, 0]], dashed: !!yDashed }, { path: [[0, Ly], [Lx, Ly]], dashed: !!yDashed }];
+};
+VIZ.boundaryForBox = function (box, walls) {   // native 2D container shape from walls
+  const t = walls[0] < 0 ? -walls[0] : 0;      // walls[0] <= -2 -> disk of diameter box[0]
+  if (t >= 2) return { segments: [{ path: VIZ.circlePath(box[0] / 2, box[0] / 2, box[0] / 2), dashed: false }] };
+  return { segments: VIZ.boxEdges(box[0], box[1], walls[0] === 0, walls[1] === 0) };
+};
+
 VIZ.normalize = function (man, buffers) {
   const N = man.N, d = man.ndim;
   const out = { N, ndim: d, box: man.box, phi: man.phi,
+                walls: (man.walls != null ? man.walls : null),   // per-dim BC; null -> legacy dashed box
                 positions: new Float32Array(buffers[man.positions.file]),
                 diameters: new Float32Array(buffers[man.diameters.file]),
                 layers: {} };
+  if (d === 2 && out.walls) out.boundary = VIZ.boundaryForBox(man.box, out.walls);
   for (const L of (man.layers || [])) {
     out.layers[L.name] = (L.type === 'scalar_per_particle')
       ? { type: L.type, values: new Float32Array(buffers[L.file]) }

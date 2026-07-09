@@ -6,11 +6,19 @@ window.VIZ = window.VIZ || {};
 
 VIZ.addGhosts = function (data) {
   const [Lx, Ly] = data.box, N = data.N, p = data.positions, dia = data.diameters;
+  // Periodic images (ghosts) are created ONLY for PERIODIC dimensions. Hard walls and
+  // curved (disk/cylinder/sphere) boundaries have no periodic image, so wrapping them
+  // drew spurious particles OUTSIDE the container. Periodicity: data._periodic (set per
+  // in-plane dim by the slicer), else derived from data.walls, else all-periodic (legacy).
+  const per = data._periodic ? data._periodic
+    : (data.walls ? [0, 1].map(d => { const w = data.walls, t = (w[0] < 0 ? -w[0] : 0); return d < t ? false : (w[d] === 0); })
+                  : [true, true]);
+  const px = per[0], py = per[1];
   const gx = [], gy = [], gd = [], gi = [];           // ghost x,y,dia, source index
   for (let i = 0; i < N; i++) {
     const x = p[i * 2], y = p[i * 2 + 1], r = dia[i] * 0.5;
-    const sx = x < r ? Lx : (x > Lx - r ? -Lx : 0);
-    const sy = y < r ? Ly : (y > Ly - r ? -Ly : 0);
+    const sx = px ? (x < r ? Lx : (x > Lx - r ? -Lx : 0)) : 0;
+    const sy = py ? (y < r ? Ly : (y > Ly - r ? -Ly : 0)) : 0;
     if (sx) { gx.push(x + sx); gy.push(y); gd.push(dia[i]); gi.push(i); }
     if (sy) { gx.push(x); gy.push(y + sy); gd.push(dia[i]); gi.push(i); }
     if (sx && sy) { gx.push(x + sx); gy.push(y + sy); gd.push(dia[i]); gi.push(i); }

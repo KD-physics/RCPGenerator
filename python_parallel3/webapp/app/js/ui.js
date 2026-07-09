@@ -34,11 +34,14 @@ VIZ.buildUI = function (renderer, data, source) {
   const palSel = el('select', { id: 'palette' });
   [...Object.keys(VIZ.colormaps), 'random'].forEach(n => palSel.appendChild(
     el('option', { value: n, textContent: n + (VIZ.COLORBLIND_SAFE.includes(n) ? ' (cb-safe)' : '') })));
+  // log color scale (default ON): diameters span orders of magnitude, so a linear
+  // ramp is near-useless. Ignored for 'random'/palette (categorical) colorings.
+  const logChk = el('input', { id: 'logScale', type: 'checkbox' }); logChk.checked = true;
   function applyColor() {
     const n = colorSel.value === '(solid)' ? null : colorSel.value;
-    VIZ.applyColorBy(renderer, n, palSel.value); VIZ.stats.draw();
+    VIZ.applyColorBy(renderer, n, palSel.value, null, logChk.checked); VIZ.stats.draw();
   }
-  colorSel.onchange = applyColor; palSel.onchange = applyColor;
+  colorSel.onchange = applyColor; palSel.onchange = applyColor; logChk.onchange = applyColor;
 
   // 3D slice slider
   let sliceRow = null;
@@ -62,6 +65,7 @@ VIZ.buildUI = function (renderer, data, source) {
   panel.appendChild(el('div', { textContent: 'RCP Packing Visualizer', style: 'font-weight:600;margin-bottom:8px' }));
   panel.appendChild(row('color by', colorSel));
   panel.appendChild(row('palette', palSel));
+  panel.appendChild(row('log color scale', logChk));
   // background colour of the render area (presets + custom picker)
   const bgSel = el('select', { id: 'bgSelect' });
   Object.keys(VIZ.BACKGROUNDS).forEach(n => bgSel.appendChild(el('option', { value: VIZ.BACKGROUNDS[n], textContent: n })));
@@ -90,5 +94,5 @@ VIZ.buildUI = function (renderer, data, source) {
   // default to color-by diameter so palettes recolor immediately (not "(solid)")
   colorSel.value = 'diameter'; applyColor();
   VIZ.stats.request();
-  window.__ui = { colorSel, palSel, dpi, expBtn, statsCanvas };
+  window.__ui = { colorSel, palSel, logChk, dpi, expBtn, statsCanvas };
 };

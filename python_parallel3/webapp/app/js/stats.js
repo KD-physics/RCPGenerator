@@ -23,7 +23,10 @@ VIZ.stats = {
   compute() {
     const cur = this.renderer.currentData(), idx = this.visibleIndices();
     const lp = cur.layers && cur.layers.local_phi ? cur.layers.local_phi.values : null;
-    const dia = cur.diameters; let sphi = 0; const phivals = [], dvals = [];
+    // P(diameter) uses the TRUE 3D diameter, not the sliced cut-disk radius: a 3D
+    // cross-section stores the real sphere diameter in _diam3d (per visible slice
+    // particle); native 2D has none -> use diameters.
+    const dia = cur._diam3d || cur.diameters; let sphi = 0; const phivals = [], dvals = [];
     let dmin = Infinity, dmax = -Infinity;
     for (const i of idx) {
       if (lp) { phivals.push(lp[i]); sphi += lp[i]; }
@@ -48,6 +51,6 @@ VIZ.stats = {
       hist.counts.forEach((c, i) => { const bh = (c / mx) * h; ctx.fillRect(8 + i * w, y0 + h - bh, Math.max(1, w - 1), bh); });
     };
     bar(s.phi_hist, 36, 90, 'P(local phi)  [0..1]', '#5a96e6');
-    bar(s.diam_hist, 150, 90, 'P(diameter)  [min..max]', '#7ad07a');
+    bar(s.diam_hist, 150, 90, 'P(diameter, 3D)  [min..max]', '#7ad07a');
   }
 };

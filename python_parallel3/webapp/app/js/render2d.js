@@ -33,20 +33,32 @@ VIZ.Renderer2D = function (container, data0, opts) {
     if (state.colorBy && cur.colors) { attrs.getFillColor = { value: cur.colors, size: 3 }; delete props.getFillColor; }
     return new D.ScatterplotLayer(props);
   }
-  function boundaryLayer() {                       // periodic box outline (dashed if available)
-    const [Lx, Ly] = cur.box;
-    const props = { id: 'boundary', data: [{ path: [[0, 0], [Lx, 0], [Lx, Ly], [0, Ly], [0, 0]] }],
-                    getPath: d => d.path, getColor: state.boundaryColor, widthUnits: 'pixels',
-                    getWidth: 2, widthMinPixels: 1.5, parameters: { depthTest: false } };
-    if (D.PathStyleExtension) { props.extensions = [new D.PathStyleExtension({ dash: true })];
+  // Boundary: solid = hard wall, dashed = periodic; a solid circle is the cross-section
+  // of a disk/cylinder/sphere container. cur.boundary (from the bundle's walls, built in
+  // loader/slice) is a list of {path, dashed} segments. Absent -> legacy dashed box.
+  function pathLayer(id, paths, dashed) {
+    if (!paths.length) return null;
+    const props = { id, data: paths.map(p => ({ path: p })), getPath: d => d.path,
+                    getColor: state.boundaryColor, widthUnits: 'pixels', getWidth: 2,
+                    widthMinPixels: 1.5, parameters: { depthTest: false } };
+    if (dashed && D.PathStyleExtension) { props.extensions = [new D.PathStyleExtension({ dash: true })];
       props.getDashArray = [7, 6]; props.dashJustified = true; }
     return new D.PathLayer(props);
+  }
+  function boundaryLayers() {
+    if (cur.boundary && cur.boundary.segments) {
+      const dash = cur.boundary.segments.filter(s => s.dashed).map(s => s.path);
+      const solid = cur.boundary.segments.filter(s => !s.dashed).map(s => s.path);
+      return [pathLayer('boundary-dash', dash, true), pathLayer('boundary-solid', solid, false)].filter(Boolean);
+    }
+    const [Lx, Ly] = cur.box;   // legacy default: dashed periodic box
+    return [pathLayer('boundary', [[[0, 0], [Lx, 0], [Lx, Ly], [0, Ly], [0, 0]]], true)].filter(Boolean);
   }
   function buildLayers() {
     const layers = [particleLayer()];
     for (const name of state.activeOverlays)
       if (VIZ.overlays[name]) { const l = VIZ.overlays[name](cur, state, viewState); if (l) layers.push(l); }
-    if (state.showBoundary !== false) layers.push(boundaryLayer());
+    if (state.showBoundary !== false) layers.push(...boundaryLayers());
     return layers;
   }
 

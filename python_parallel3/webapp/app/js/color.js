@@ -4,22 +4,30 @@
 window.VIZ = window.VIZ || {};
 
 VIZ.scalarFor = function (cur, name) {
-  if (name === 'diameter') return cur.diameters;
+  if (name === 'diameter') {
+    if (cur._diam3d) {                              // 3D slice: color by the TRUE sphere diameter, not the cross-section
+      const src = cur._srcIndex, out = new Float32Array(cur.N);
+      for (let i = 0; i < cur.N; i++) out[i] = cur._diam3d[src ? src[i] : i];
+      return out;
+    }
+    return cur.diameters;
+  }
   const L = cur.layers && cur.layers[name];
   return (L && L.type === 'scalar_per_particle') ? L.values : null;
 };
 
-VIZ.applyColorBy = function (renderer, name, cmapName, domain) {
+VIZ.applyColorBy = function (renderer, name, cmapName, domain, logScale) {
   const cur = renderer.currentData();
   if (!name) { cur.colors = null; renderer.state.colorBy = null; renderer.refresh();
                return { domain: null }; }
   // render-class palette: 'p<k>' -> random assignment of palette[k]'s colors per
   // particle (ghost-consistent via _srcIndex). Matches rcpgenerator/render.py.
   if (name[0] === 'p' && VIZ.renderPalettes && VIZ.renderPalettes[name.slice(1)]) {
-    const pal = VIZ.renderPalettes[name.slice(1)], src = cur._srcIndex;
+    const pal = VIZ.renderPalettes[name.slice(1)], src = cur._srcIndex, orig = cur._srcIdx;
     const cols = new Uint8Array(cur.N * 3);
     for (let i = 0; i < cur.N; i++) {
-      const key = (src ? src[i] : i) >>> 0;
+      const rs = (src ? src[i] : i);                 // real-particle index within this frame
+      const key = (orig ? orig[rs] : rs) >>> 0;      // -> ORIGINAL particle index: stable color across z-slices
       const c = pal[((key * 2654435761) >>> 0) % pal.length];
       cols[i * 3] = c[0]; cols[i * 3 + 1] = c[1]; cols[i * 3 + 2] = c[2];
     }
@@ -41,13 +49,20 @@ VIZ.applyColorBy = function (renderer, name, cmapName, domain) {
   if (domain) { [lo, hi] = domain; }
   else { lo = Infinity; hi = -Infinity; const n = cur._nreal != null ? cur._nreal : cur.N;
          for (let i = 0; i < n; i++) { const v = vals[i]; if (v < lo) lo = v; if (v > hi) hi = v; } }
-  const span = (hi - lo) || 1;
+  // Log color scale (default on): diameters span orders of magnitude, so a linear
+  // ramp crushes everything but the biggest particles into one end of the colormap.
+  // Only valid for strictly-positive data; silently fall back to linear otherwise.
+  const useLog = !!logScale && lo > 0 && hi > 0;
+  const tlo = useLog ? Math.log(lo) : lo;
+  const span = ((useLog ? Math.log(hi) : hi) - tlo) || 1;
   const cols = new Uint8Array(cur.N * 3);
   for (let i = 0; i < cur.N; i++) {
-    const c = cmap((vals[i] - lo) / span);
+    let v = vals[i];
+    if (useLog) v = v > 0 ? Math.log(v) : tlo;
+    const c = cmap((v - tlo) / span);
     cols[i * 3] = c[0]; cols[i * 3 + 1] = c[1]; cols[i * 3 + 2] = c[2];
   }
   cur.colors = cols; renderer.state.colorBy = name; renderer.state.cmap = cmapName;
-  renderer.state.domain = [lo, hi]; renderer.refresh();
-  return { domain: [lo, hi] };
+  renderer.state.domain = [lo, hi]; renderer.state.logScale = useLog; renderer.refresh();
+  return { domain: [lo, hi], logScale: useLog };
 };
