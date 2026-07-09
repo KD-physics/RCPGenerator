@@ -4336,6 +4336,11 @@ std::pair<PackingResult, PackingTrace> run_packing_observed(
     if (!fixed_flags.empty() && fixed_flags.size() != N) fixed_flags.assign(N, 0);
     const bool has_fixed = std::any_of(fixed_flags.begin(), fixed_flags.end(),
                                        [](std::int8_t f) { return f != 0; });
+    // Cascade (additive): the frozen-diameter mask is a STARTUP scaffold only.
+    // At the rung-1->0 trigger it is released (see below) so every class is free
+    // to densify / shrink-to-contact together (McGeary final settle). Guarded by
+    // has_fixed throughout -> the one-shot path (has_fixed=false) never sees it.
+    bool cascade_released = false;
     // Cycle 20: per-particle diameter anchor for the growth-aware refresh
     // trigger. Diameter growth between refreshes consumes pair-shell budget
     // exactly like displacement does ((Di+Dj)/2 grows while the candidate
@@ -5868,6 +5873,22 @@ std::pair<PackingResult, PackingTrace> run_packing_observed(
                 alpha /= 2.0;
                 mu_flag = 0;
                 mu_change = step;
+                // Cascade (additive, has_fixed-guarded): release the frozen-
+                // diameter scaffold at the FIRST rung-1->0 trigger so every class
+                // is now free to densify / shrink-to-contact together (the McGeary
+                // final settle). Re-anchor D0 for the frozen particles so that
+                // D = D0*kappa stays exactly continuous across the release (no size
+                // jump), then clear the mask. has_fixed stays true, so Dmin /
+                // current_volume keep their O(N) recompute (no stale cache from the
+                // changed D0), and the all-zero mask makes the D-update and the
+                // dkappa/pressure terms reduce identically to the standard path.
+                if (has_fixed && !cascade_released) {
+                    for (std::size_t ci = 0; ci < fixed_flags.size(); ++ci) {
+                        if (fixed_flags[ci]) D0[ci] = D[ci] / kappa;
+                        fixed_flags[ci] = 0;
+                    }
+                    cascade_released = true;
+                }
             }
         }
 
