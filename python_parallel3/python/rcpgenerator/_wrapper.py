@@ -10,6 +10,17 @@ from typing import Any
 from ._rcpgenerator import initialize_particles as _initialize_particles
 from ._rcpgenerator import run_packing_observed as _run_packing_observed
 from ._rcpgenerator import run_packing as _run_packing
+
+
+def _container_fraction(walls):
+    """Box fraction filled by a curved (hyperspherical) container: walls[0] = -t marks the
+    first t dims as one t-ball of diameter box[0]; returns 1.0 for a flat / periodic box.
+    Reported phi is divided by this so a confined packing is referenced to the actual
+    container volume (disk / cylinder / sphere), not the bounding box."""
+    t = -int(walls[0]) if (walls and int(walls[0]) < 0) else 0
+    if t < 2:
+        return 1.0
+    return math.pi ** (t / 2.0) / math.gamma(t / 2.0 + 1.0) * (0.5 ** t)
 from .render import animate_packing_2d as _animate_packing_2d
 from .render import render_packing as _render_packing
 
@@ -116,6 +127,10 @@ class Packing:
         self.phi_history = []
         self.force_history = []
         self.energy_history = []
+        self.max_overlap_history = []
+        self.mu_flag_history = []
+        self.mu_history = []
+        self.alpha_history = []
         self.trajectory_positions = []
         self.trajectory_diameters = []
         self.trajectory_steps = []
@@ -235,6 +250,10 @@ class Packing:
         self.phi_history = []
         self.force_history = []
         self.energy_history = []
+        self.max_overlap_history = []
+        self.mu_flag_history = []
+        self.mu_history = []
+        self.alpha_history = []
 
     def _clear_trajectory(self) -> None:
         self.trajectory_positions = []
@@ -295,12 +314,17 @@ class Packing:
             self.box = result["box"]
             self.walls = result["walls"]
             self.steps = result["steps"]
-            self.phi_final = result["phi"]
+            _cf = _container_fraction(result["walls"])   # curved container -> phi vs disk/sphere volume, not the box
+            self.phi_final = result["phi"] / _cf
             self.max_min_dist = result["max_min_dist"]
             self.force_magnitude = result["force_magnitude"]
-            self.phi_history = result["phi_history"]
+            self.phi_history = ([v / _cf for v in result["phi_history"]] if _cf != 1.0 else result["phi_history"])
             self.force_history = result["force_history"]
             self.energy_history = result["energy_history"]
+            self.max_overlap_history = result.get("max_overlap_history", [])
+            self.mu_flag_history = result.get("mu_flag_history", [])
+            self.mu_history = result.get("mu_history", [])
+            self.alpha_history = result.get("alpha_history", [])
         finally:
             object.__setattr__(self, "_mutating_internal_state", False)
 
