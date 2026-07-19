@@ -4,12 +4,47 @@ build-backend = "scikit_build_core.build"
 
 [project]
 name = "rcpgenerator"
-version = "0.3.0"
+version = "1.0.0"
 description = "Fast random close packing generator for polydisperse spheres in N dimensions (OpenMP + SIMD C++ core with a Python API)"
 readme = "README.md"
-license = { file = "LICENSE" }
+authors = [
+    { name = "Kenneth Desmond" },
+]
+license = "MIT"
+license-files = ["LICENSE"]
 requires-python = ">=3.10"
+keywords = [
+    "random close packing",
+    "sphere packing",
+    "particle packing",
+    "computational physics",
+    "granular materials",
+]
+classifiers = [
+    "Development Status :: 5 - Production/Stable",
+    "Intended Audience :: Science/Research",
+    "Operating System :: MacOS",
+    "Operating System :: Microsoft :: Windows",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: C++",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+    "Topic :: Scientific/Engineering :: Physics",
+]
 dependencies = ["matplotlib>=3.10", "numpy>=1.23", "pandas>=1.5", "scipy>=1.9"]
+
+[project.urls]
+Homepage = "https://github.com/KD-physics/RCPGenerator"
+Repository = "https://github.com/KD-physics/RCPGenerator"
+Documentation = "https://github.com/KD-physics/RCPGenerator/blob/main/python_code/python/README.md"
+"Getting Started" = "https://github.com/KD-physics/RCPGenerator/blob/main/getting_started.ipynb"
+Examples = "https://github.com/KD-physics/RCPGenerator/tree/main/python_code/python/examples"
+Issues = "https://github.com/KD-physics/RCPGenerator/issues"
+Viewer = "https://kd-physics.github.io/RCPGenerator/webapp/index.html"
 
 [tool.scikit-build]
 cmake.source-dir = "."

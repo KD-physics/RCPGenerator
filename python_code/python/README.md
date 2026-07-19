@@ -1,17 +1,136 @@
 # rcpgenerator
 
-Fast random close packing (RCP) generator for polydisperse spheres in N dimensions — a
-parallel C++/OpenMP core with SIMD-accelerated inner loops, wrapped in a stateful Python
-API. Supply a size distribution (or explicit diameters) and a container, and get back a
-jammed configuration. 2D disks, 3D spheres, hyperspheres; periodic, hard-wall, and curved
-(disk / cylinder / sphere) boundaries; size ratios exceeding 100 in 2D.
+`rcpgenerator` is a Python package for generating dense packings of polydisperse
+particles with a compiled C++/OpenMP engine. It supports 2D disks, 3D spheres, and
+higher-dimensional hyperspheres in periodic boxes, hard-wall boxes, and curved
+containers. The high-level `rcpgenerator.Packing` API manages initialization,
+relaxation, results, and rendering. The distribution also includes `rcptools` for
+packing analysis, parameter searches, persistence, and viewer-bundle export.
 
-This is a **performance release** — several times faster than the original with improved
-convergence — while the Python API and the packings it produces are unchanged. One install
-provides two importable packages: **`rcpgenerator`** (the engine) and **`rcptools`** (search,
-per-packing analysis, and bundle / visualisation helpers).
+Project resources: [repository](https://github.com/KD-physics/RCPGenerator) ·
+[Getting Started notebook](https://github.com/KD-physics/RCPGenerator/blob/main/getting_started.ipynb) ·
+[examples](https://github.com/KD-physics/RCPGenerator/tree/main/python_code/python/examples) ·
+[hosted packing viewer](https://kd-physics.github.io/RCPGenerator/webapp/index.html) ·
+[issue tracker](https://github.com/KD-physics/RCPGenerator/issues)
 
-## Install
+## Installation
+
+```bash
+pip install rcpgenerator
+```
+
+Version 1.0.0 wheels are built and tested for CPython 3.10–3.14 on:
+
+- Windows x86-64
+- Linux x86-64
+- macOS Apple Silicon
+- macOS Intel
+
+GitHub Actions has verified wheel building, dependency repair, clean installation, and
+the installed-package smoke test for every listed Python version and platform. Wheels
+have also been installed and run manually on Windows x86-64, macOS Apple Silicon, and
+Linux x86-64. The macOS Intel wheels are verified through GitHub Actions; no manual test
+on a physical Intel Mac is currently claimed.
+
+Installing a compatible wheel does not require Git, CMake, Visual Studio, Xcode, a
+local C++ compiler, or a separately configured OpenMP installation. The compiled
+extension and its required OpenMP runtime are handled by the platform wheel.
+
+## Quickstart
+
+```python
+import rcpgenerator
+
+rcpgenerator.set_num_threads(1)  # optional; the default uses all available threads
+
+packing = rcpgenerator.Packing(
+    phi=0.08,
+    N=64,
+    Ndim=2,
+    box=[1.0, 1.0],
+    walls=[0, 0],  # 0 = periodic, 1 = hard wall
+    dist={"type": "mono", "d": 1.0},
+    neighbor_max=0,  # automatic capacity
+    seed=20240719,
+)
+result = packing.pack()
+
+print("phi =", packing.phi_final)
+print("steps =", packing.steps)
+print("positions =", len(result["positions"]))
+
+# Display the packing in an interactive Python session:
+# packing.show_packing()
+```
+
+The [`examples` directory](https://github.com/KD-physics/RCPGenerator/tree/main/python_code/python/examples)
+contains complete box, bidisperse, polydisperse, circular, cylindrical, spherical,
+and target-packing-fraction cases.
+
+## Containers and boundaries
+
+For a rectangular `box`, each entry in `walls` controls the corresponding dimension:
+
+- `0` selects a periodic boundary.
+- `1` selects a hard wall.
+- A negative first entry, `-t`, selects one hyperspherical hard boundary over the
+  first `t` dimensions. Its diameter is the first component of `box`: `-2` gives a
+  disk in 2D or a cylindrical cross-section in 3D, while `-3` gives a sphere in 3D.
+- `fix_height=True` makes the final box dimension a fixed multiple of the first
+  particle diameter.
+
+See the [Getting Started notebook](https://github.com/KD-physics/RCPGenerator/blob/main/getting_started.ipynb)
+for configuration details and worked examples.
+
+## Interactive packing viewer
+
+`rcptools.bridge.write_bundle` creates a viewer bundle containing `manifest.json`,
+`pos.f32`, and `dia.f32`:
+
+```python
+from rcptools.bridge import write_bundle
+
+write_bundle(
+    "my_packing",
+    packing.positions,
+    packing.diameters,
+    packing.box,
+    walls=packing.walls,
+)
+```
+
+Open the [hosted packing viewer](https://kd-physics.github.io/RCPGenerator/webapp/index.html)
+and select the generated bundle folder. Solid boundaries represent hard walls and
+dashed boundaries represent periodic boundaries; the viewer can inspect 2D packings
+directly and 3D packings by cross-section.
+
+The viewer application itself is not included in the Python wheel. Its development
+files and `launch.py` helper are available only in the repository's
+[`python_code/python/webapp` directory](https://github.com/KD-physics/RCPGenerator/tree/main/python_code/python/webapp).
+
+## `rcptools`
+
+The installed distribution also provides the `rcptools` package. It contains packing
+search and scheduling tools, persistence helpers, bundle export, and analyses including
+chord, pore, and void-fill workflows. Some analysis workflows have additional
+data- or method-specific requirements; consult their module documentation and the
+[repository examples](https://github.com/KD-physics/RCPGenerator/tree/main/python_code/python/examples)
+before using them in an automated study.
+
+## Interpretation and limitations
+
+Packing is an iterative numerical procedure. Convergence behavior and runtime depend on
+the particle distribution, dimensionality, boundaries, initial state, and packing
+settings. Inspect the returned diagnostics—such as `steps`, `phi`, `max_min_dist`,
+`force_magnitude`, and the recorded histories—and apply validation appropriate to the
+intended scientific use. For reproducibility studies, record the package version, seed,
+thread count, inputs, and relevant platform details.
+
+## Building from source
+
+Source builds require Git, a C++17 compiler, CMake-compatible build tooling, and a usable
+OpenMP development/runtime installation. Platform-specific compiler setup is the
+builder's responsibility.
 
 ```bash
 git clone https://github.com/KD-physics/RCPGenerator.git
@@ -19,87 +138,41 @@ cd RCPGenerator/python_code/python
 pip install -v .
 ```
 
-Requires a C++17 compiler with OpenMP. A guided tour is in `getting_started.ipynb` (repo root).
-
-### Optional native optimization for local builds
-
-Normal builds use portable CPU instructions so their wheels can run on other machines. For a
-local-only source build tuned to the current CPU, pass the default-off CMake option through pip:
+Normal source builds use portable CPU instructions. A local build may explicitly tune
+the compiled core for the current machine:
 
 ```bash
 CMAKE_ARGS="-DRCP_NATIVE_OPTIMIZATION=ON" pip install -v .
 ```
 
-Do not use that option for a wheel intended to be distributed to another machine. GCC builds
-enable `-march=native` and the existing 512-bit vector-width preference; Clang builds enable
-`-march=native`. Other compilers emit a CMake warning and retain their default architecture.
+In PowerShell, set the option before installing:
 
-## Quickstart
-
-```python
-import rcpgenerator
-rcpgenerator.set_num_threads(4)                 # optional; default = all cores
-
-p = rcpgenerator.Packing(phi=0.11, N=1000, Ndim=3, box=[1., 1., 1.],
-                         walls=[0, 0, 0],       # 0 = periodic, 1 = hard wall
-                         dist={"type": "lognormal", "mu": 0.0, "sigma": 0.3},
-                         neighbor_max=0, seed=0)
-p.pack()
-print("phi =", p.phi_final, " steps =", p.steps)
-p.show_packing()                                # inline render
+```powershell
+$env:CMAKE_ARGS = "-DRCP_NATIVE_OPTIMIZATION=ON"
+pip install -v .
 ```
 
-## Containers & boundaries (`walls`)
+GCC native builds enable `-march=native` and the configured 512-bit vector-width
+preference; Clang native builds enable `-march=native`. Other compilers emit a CMake
+warning and retain their default architecture. A native-optimized build is intended only
+for the machine on which it is compiled. Do not redistribute it as a portable wheel.
 
-- `0` = periodic, `1` = hard wall, per dimension.
-- A leading negative `-t` = one hyperspherical hard boundary over the first `t` dims
-  (its diameter is the first `box` component): `-2` → disk (2D) / cylinder (3D),
-  `-3` → sphere (3D).
-- `fix_height=True` makes the last box dimension a fixed multiple of the first particle
-  diameter.
+## Method and citation
 
-`examples/` covers box (mono / bidisperse / lognormal / power-law), circular, cylindrical,
-spherical, and target-φ staging cases; run them with `python examples/run_all_examples.py`.
+The package uses an iterative expansion–relaxation method based on the approach described
+by Desmond and Weeks, with a compiled neighbor-search and relaxation implementation.
 
-## Interactive web viewer
+- Desmond, K. W. and Weeks, E. R. “Random close packing of disks and spheres in
+  confined geometries.” *Physical Review E* **80**, 051305 (2009).
+  [arXiv:0903.0864](https://arxiv.org/abs/0903.0864)
+- Desmond, K. W. and Weeks, E. R. “Influence of particle size distribution on random
+  close packing of spheres.” *Physical Review E* **90**, 022204 (2014).
+  [arXiv:1303.4627](https://arxiv.org/abs/1303.4627)
 
-Save any packing as a **bundle** (`manifest.json` + raw `pos.f32` / `dia.f32`) and open it in
-the viewer to rotate, slice, and colour it:
+An RCPGenerator manuscript is in preparation and is expected to be posted to arXiv. A
+package-specific software citation, the preferred manuscript citation, and any archival
+software DOI will be added after those records exist. Until then, cite the relevant
+method-background paper and record the `rcpgenerator` version used.
 
-```python
-from rcptools.bridge import write_bundle
-write_bundle("bundles/my_packing", p.positions, p.diameters, list(p.box), walls=list(p.walls))
-```
-
-The viewer ships in the package (`webapp/`). Build a self-contained HTML for your bundle and
-open it in any browser:
-
-```bash
-python webapp/launch.py bundles/my_packing
-```
-
-(Or serve `webapp/` with a local web server — e.g. `python -m http.server` in `webapp/` — and
-load the `bundles/my_packing` folder via the **Choose bundle folder** button.)
-
-In the viewer a **solid** boundary is a hard wall and a **dashed** boundary is periodic; a
-sphere's cross-section circle grows and shrinks as you scrub through z. (Dragging a whole
-*folder* onto a `file://` page is unreliable across browsers — use `launch.py`, the button, or
-multiselect the three files.)
-
-## `rcptools`
-
-A companion toolbox: search over size-distribution families, per-packing analyses
-(`rcptools.analysis`: pore network, chords, void fill), and bundle export (`rcptools.bridge`).
-It grew out of a density-search effort; explore it with `import rcptools; dir(rcptools)`.
-
-## Method & citation
-
-Iterative expansion–relaxation (Desmond & Weeks 2009) driven by an ADAM-based inflation
-schedule, with a kd-tree neighbour manager for high polydispersity.
-
-- Desmond, K. W. & Weeks, E. R. *Random close packing of disks and spheres in confined
-  geometries.* Phys. Rev. E **80**, 051305 (2009). [arXiv:0903.0864](https://arxiv.org/abs/0903.0864)
-- Desmond, K. W. & Weeks, E. R. *Influence of particle size distribution on random close
-  packing of spheres.* Phys. Rev. E **90**, 022204 (2014). [arXiv:1303.4627](https://arxiv.org/abs/1303.4627)
-
-Released under the MIT License.
+`rcpgenerator` is distributed under the
+[MIT License](https://github.com/KD-physics/RCPGenerator/blob/main/python_code/python/LICENSE).
