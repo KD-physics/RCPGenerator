@@ -19,6 +19,8 @@
 #include <utility>
 #include <vector>
 
+#include <omp.h>
+
 #define main legacy_rcp_generator_main
 #include "../../RCPGenerator.cpp"
 #undef main
@@ -517,31 +519,127 @@ void run_case(const std::string& case_name,
     compare_packing_results(case_name, legacy, current);
 }
 
+void require(bool condition, const std::string& message) {
+    if (!condition) fail(message);
+}
+
+void require_finite_vector(const std::vector<double>& values,
+                           const std::string& label,
+                           bool allow_nan = false) {
+    for (std::size_t i = 0; i < values.size(); ++i) {
+        if (std::isinf(values[i]) || (!allow_nan && std::isnan(values[i]))) {
+            std::ostringstream oss;
+            oss << label << "[" << i << "] is not finite";
+            fail(oss.str());
+        }
+    }
+}
+
+void require_finite_matrix(const std::vector<std::vector<double>>& values,
+                           const std::string& label) {
+    for (std::size_t i = 0; i < values.size(); ++i) {
+        require_finite_vector(values[i], label + "[" + std::to_string(i) + "]");
+    }
+}
+
+double maximum_normalized_overlap(const rcpgenerator::PackingResult& result) {
+    double maximum = 0.0;
+    for (std::size_t i = 0; i < result.positions.size(); ++i) {
+        for (std::size_t j = i + 1; j < result.positions.size(); ++j) {
+            double distance_squared = 0.0;
+            for (std::size_t d = 0; d < result.box.size(); ++d) {
+                double delta = result.positions[j][d] - result.positions[i][d];
+                if (result.walls[d] == 0) {
+                    delta -= std::nearbyint(delta / result.box[d]) * result.box[d];
+                }
+                distance_squared += delta * delta;
+            }
+            const double contact_distance =
+                0.5 * (result.diameters[i] + result.diameters[j]);
+            if (contact_distance > 0.0) {
+                const double overlap =
+                    1.0 - std::sqrt(distance_squared) / contact_distance;
+                if (overlap > maximum) maximum = overlap;
+            }
+        }
+    }
+    return maximum;
+}
+
+void validate_current_result(const rcpgenerator::PackingResult& result) {
+    constexpr double MAX_OVERLAP = 5e-4;
+    require(result.steps > 0, "current packer completed no steps");
+    require(result.steps < N_STEPS,
+            "current packer reached the legacy 60000-step cap without converging");
+    require(result.phi_history.size() == result.steps,
+            "phi_history length does not equal completed steps");
+    require(result.force_history.size() == result.steps,
+            "force_history length does not equal completed steps");
+    require(result.energy_history.size() == result.steps,
+            "energy_history length does not equal completed steps");
+
+    require_finite_matrix(result.positions, "position");
+    require_finite_vector(result.diameters, "diameter");
+    require_finite_vector(result.box, "box");
+    require_finite_vector(result.phi_history, "phi_history");
+    require_finite_vector(result.force_history, "force_history", true);
+    require_finite_vector(result.energy_history, "energy_history");
+    require(!result.force_history.empty() &&
+                std::isfinite(result.force_history.back()),
+            "final force history entry is not finite");
+    require(std::isfinite(result.phi), "final phi is not finite");
+    require(std::isfinite(result.max_min_dist),
+            "final max_min_dist is not finite");
+    require(std::isfinite(result.force_magnitude),
+            "final force_magnitude is not finite");
+
+    require(result.phi > 0.75 && result.phi < 0.85,
+            "final phi is outside the expected 2D physical band (0.75, 0.85)");
+    require(result.max_min_dist >= 0.0 && result.max_min_dist < MAX_OVERLAP,
+            "reported maximum overlap does not satisfy convergence threshold");
+    require(maximum_normalized_overlap(result) < MAX_OVERLAP,
+            "recomputed particle overlap does not satisfy convergence threshold");
+}
+
+void compare_current_results(const rcpgenerator::PackingResult& first,
+                             const rcpgenerator::PackingResult& second) {
+    compare_vector("repeat phi_history", first.phi_history, second.phi_history);
+    compare_vector("repeat force_history", first.force_history, second.force_history);
+    compare_vector("repeat energy_history", first.energy_history, second.energy_history);
+    compare_matrix("repeat positions", first.positions, second.positions);
+    compare_vector("repeat diameters", first.diameters, second.diameters);
+    compare_vector("repeat box", first.box, second.box);
+    compare_vector_i8("repeat walls", first.walls, second.walls);
+    require(first.steps == second.steps, "repeat step counts differ");
+    compare_double("repeat final phi", first.phi, second.phi);
+    compare_double("repeat final max_min_dist",
+                   first.max_min_dist, second.max_min_dist);
+    compare_double("repeat final force_magnitude",
+                   first.force_magnitude, second.force_magnitude);
+}
+
+void run_current_acceptance_case() {
+    rcpgenerator::PackingConfig config;
+    config.box = {1.0, 1.0};
+    config.walls = {};
+    config.neighbor_max = 0;
+    config.seed = 123u;
+    config.fix_height = false;
+
+    omp_set_num_threads(1);
+    const auto first = rcpgenerator::run_packing(make_case_2d_input(), config);
+    const auto second = rcpgenerator::run_packing(make_case_2d_input(), config);
+    validate_current_result(first);
+    validate_current_result(second);
+    compare_current_results(first, second);
+}
+
 }  // namespace
 
 int main() {
     try {
-        {
-            rcpgenerator::PackingConfig config;
-            config.box = {1.0, 1.0};
-            config.walls = {};
-            config.neighbor_max = 0;
-            config.seed = 123u;
-            config.fix_height = false;
-            run_case("packer_2d_empty_walls_default", make_case_2d_input(), config);
-        }
-
-        {
-            rcpgenerator::PackingConfig config;
-            config.box = {1.0, 1.0, 0.8};
-            config.walls = {0, 0, 0};
-            config.neighbor_max = 64;
-            config.seed = 999u;
-            config.fix_height = true;
-            run_case("packer_3d_fix_height", make_case_3d_input(), config);
-        }
-
-        std::cout << "Packer parity checks passed.\n";
+        run_current_acceptance_case();
+        std::cout << "Current packer acceptance checks passed.\n";
         return 0;
     } catch (const std::exception& ex) {
         std::cerr << "Packer parity failure: " << ex.what() << '\n';

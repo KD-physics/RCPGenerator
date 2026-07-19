@@ -1,0 +1,55 @@
+name: Python wheel build and test
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  wheels:
+    name: ${{ matrix.name }} / CPython 3.10-3.14
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Linux x86-64
+            runner: ubuntu-24.04
+          - name: Windows x86-64
+            runner: windows-2022
+          - name: macOS Apple Silicon
+            runner: macos-15
+          - name: macOS Intel
+            runner: macos-15-intel
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install macOS OpenMP runtime
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          brew install libomp
+          echo "CMAKE_PREFIX_PATH=$(brew --prefix libomp)" >> "$GITHUB_ENV"
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install wheel builder
+        run: python -m pip install "cibuildwheel==4.1.0" "delvewheel==1.10.0"
+
+      - name: Build, repair, and test wheels
+        working-directory: python_code/python
+        run: python -m cibuildwheel --output-dir wheelhouse
+        env:
+          CMAKE_ARGS: "-DRCP_NATIVE_OPTIMIZATION=OFF"
+          MACOSX_DEPLOYMENT_TARGET: "12.0"
+
+      - name: Retain built wheels
+        uses: actions/upload-artifact@v4
+        with:
+          name: rcpgenerator-${{ matrix.name }}
+          path: python_code/python/wheelhouse/*.whl
+          if-no-files-found: error

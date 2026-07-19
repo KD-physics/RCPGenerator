@@ -8,9 +8,28 @@ version = "0.3.0"
 description = "Fast random close packing generator for polydisperse spheres in N dimensions (OpenMP + SIMD C++ core with a Python API)"
 readme = "README.md"
 license = { file = "LICENSE" }
-requires-python = ">=3.9"
+requires-python = ">=3.10"
 dependencies = ["matplotlib>=3.10", "numpy>=1.23", "pandas>=1.5", "scipy>=1.9"]
 
 [tool.scikit-build]
 cmake.source-dir = "."
 build.verbose = true
+
+[tool.cibuildwheel]
+build = "cp310-* cp311-* cp312-* cp313-* cp314-*"
+skip = "*-musllinux_*"
+build-verbosity = 1
+test-command = "python {project}/tests/wheel_smoke.py"
+test-requires = ["numpy"]
+
+[tool.cibuildwheel.linux]
+archs = ["x86_64"]
+repair-wheel-command = "auditwheel repair -w {dest_dir} {wheel}"
+
+[tool.cibuildwheel.windows]
+archs = ["AMD64"]
+repair-wheel-command = "python -m delvewheel repair -w {dest_dir} {wheel}"
+
+[tool.cibuildwheel.macos]
+archs = ["native"]
+repair-wheel-command = "delocate-wheel --require-archs {delocate_archs} -w {dest_dir} -v {wheel}"

@@ -38,8 +38,20 @@
 // Cycle 15a: cycle-counter instrumentation (rdtsc). Lets us measure
 // cycles-per-candidate inside the inner force loop and get_pairs walk to
 // quantify L1/L2/L3 contention. Toggled via env var RCP_CYCLE_PROBE=1.
+#if defined(_MSC_VER)
+#include <intrin.h>
+#elif defined(__i386__) || defined(__x86_64__)
 #include <x86intrin.h>
+#endif
 #include <cstdlib>
+
+static inline std::uint64_t rcp_read_cycles() {
+#if defined(_MSC_VER) || defined(__i386__) || defined(__x86_64__)
+    return __rdtsc();
+#else
+    return 0;
+#endif
+}
 
 static std::atomic<std::uint64_t> g_floop_cycles{0};
 static std::atomic<std::uint64_t> g_floop_candidates{0};
@@ -1211,10 +1223,10 @@ void get_pairs_nd_3(
     t *= g_rcp_shell_scale_dyn;   // Cycle 21k adaptive shell
 
     const bool probe_sort = rcp_cycle_probe_enabled();
-    std::uint64_t sort_tsc0 = probe_sort ? __rdtsc() : 0;
+    std::uint64_t sort_tsc0 = probe_sort ? rcp_read_cycles() : 0;
     auto sort_idx = sort_indices_by_column_flat(x, N, Ndim, 0);
     if (probe_sort) {
-        g_gpairs_sort_cycles.fetch_add(__rdtsc() - sort_tsc0,
+        g_gpairs_sort_cycles.fetch_add(rcp_read_cycles() - sort_tsc0,
                                        std::memory_order_relaxed);
         g_gpairs_sort_calls.fetch_add(1, std::memory_order_relaxed);
     }
@@ -1282,7 +1294,7 @@ void get_pairs_nd_3(
         std::uint64_t tls_cyc_cell = 0;
         std::uint64_t tls_cyc_dist = 0;
         std::uint64_t tls_cyc_write = 0;
-        std::uint64_t tsc_start = probe_gp ? __rdtsc() : 0;
+        std::uint64_t tsc_start = probe_gp ? rcp_read_cycles() : 0;
         #pragma omp for schedule(dynamic, 32)
         for (std::size_t i = 0; i < N; ++i) {
         if (refresh[i] != 1) continue;
@@ -1410,7 +1422,7 @@ void get_pairs_nd_3(
         }  // close omp for body
 
         if (probe_gp) {
-            tls_cycles = __rdtsc() - tsc_start;
+            tls_cycles = rcp_read_cycles() - tsc_start;
             g_gpairs_cycles.fetch_add(tls_cycles, std::memory_order_relaxed);
             g_gpairs_candidates.fetch_add(tls_candidates, std::memory_order_relaxed);
             g_gpairs_accepted.fetch_add(tls_accepted, std::memory_order_relaxed);
@@ -2087,7 +2099,9 @@ private:
     // test in get_pairs_kdtree's outer accept-write path is NOT marked
     // fast-math — it stays IEEE-deterministic to preserve byte-equivalence
     // with sort+walk on borderline pairs.
-    __attribute__((optimize("fast-math","tree-vectorize")))
+#if defined(__GNUC__) && !defined(__clang__)
+    __attribute__((optimize("fast-math", "tree-vectorize")))
+#endif
     void range_query_recursive_3d(std::uint32_t root_idx, const double* xq,
                                   double Di, double t_shell,
                                   const double* x, const double* D_arr,
@@ -2102,8 +2116,10 @@ private:
             const KdNode& n = nodes[node_idx];
             // Prefetch children early (H13).
             if (n.children[0] != KD_NULL) {
+#if defined(__GNUC__) || defined(__clang__)
                 __builtin_prefetch(&nodes[n.children[0]], 0, 0);
                 __builtin_prefetch(&nodes[n.children[1]], 0, 0);
+#endif
             }
             // Branchless bbox-min-d2 for Ndim=3 (H12).
             const double diff0 = std::max(0.0,
@@ -2763,7 +2779,7 @@ void get_pairs_kdtree(
     }
     // kdtree Cycle 4: probe bracket — master-thread wall covers all phases.
     const bool kd_probe_on = rcp_cycle_probe_enabled();
-    const std::uint64_t kd_tsc_fn_start = kd_probe_on ? __rdtsc() : 0;
+    const std::uint64_t kd_tsc_fn_start = kd_probe_on ? rcp_read_cycles() : 0;
     const std::uint64_t kd_tsc_setup_start = kd_tsc_fn_start;
 
     // ----- D-stats with index caching (Cycle 6 H4) --------------------------
@@ -2897,7 +2913,7 @@ void get_pairs_kdtree(
     const std::size_t kd_R = kd_refresh_list.size();
 
     if (kd_probe_on) {
-        g_kd_setup_cycles.fetch_add(__rdtsc() - kd_tsc_setup_start,
+        g_kd_setup_cycles.fetch_add(rcp_read_cycles() - kd_tsc_setup_start,
                                     std::memory_order_relaxed);
     }
 
@@ -2938,7 +2954,7 @@ void get_pairs_kdtree(
         (refresh_count_total * KD_PATCH_REFRESH_THRESHOLD_FRAC > N) ||
         (g_rcp_shell_scale_dyn > 1.0);
 
-    const std::uint64_t kd_tsc_build_start = kd_probe_on ? __rdtsc() : 0;
+    const std::uint64_t kd_tsc_build_start = kd_probe_on ? rcp_read_cycles() : 0;
     if (need_full_rebuild) {
         if (use_octree) {
             oct_tree.build(x, D.data(), N, Ndim);
@@ -3068,7 +3084,7 @@ void get_pairs_kdtree(
         ++g_kd_patches_since_rebuild;
     }
     const std::uint64_t kd_build_cycles_this_call =
-        kd_probe_on ? (__rdtsc() - kd_tsc_build_start) : 0;
+        kd_probe_on ? (rcp_read_cycles() - kd_tsc_build_start) : 0;
     if (kd_probe_on) {
         g_kd_build_cycles.fetch_add(kd_build_cycles_this_call,
                                     std::memory_order_relaxed);
@@ -3158,7 +3174,7 @@ void get_pairs_kdtree(
         g_kd_xwrite_buffers.resize(kd_max_threads);
 
     // ----- For each refreshed i, query tree, then enforce asymmetric write --
-    const std::uint64_t kd_tsc_qregion_start = kd_probe_on ? __rdtsc() : 0;
+    const std::uint64_t kd_tsc_qregion_start = kd_probe_on ? rcp_read_cycles() : 0;
     #pragma omp parallel shared(warningIssued)
     {
         std::vector<std::uint32_t> candidates;
@@ -3179,7 +3195,7 @@ void get_pairs_kdtree(
         std::uint64_t tls_kd_cand  = 0;
         std::uint64_t tls_kd_acc   = 0;
         std::uint64_t tls_kd_total = 0;
-        const std::uint64_t tls_kd_tsc_thread_start = kd_probe_on ? __rdtsc() : 0;
+        const std::uint64_t tls_kd_tsc_thread_start = kd_probe_on ? rcp_read_cycles() : 0;
 
         // Cycle 10 H29: drive the parallel-for over the sparse refresh-list
         // (kd_R entries) instead of all N. Every iteration now does real work
@@ -3207,26 +3223,26 @@ void get_pairs_kdtree(
             // here was caught by the per-step missed-pair sentinel as rare
             // boundary-pair misses in 2D (interaction range is a larger
             // fraction of the box there). Strictly conservative fix.
-            const std::uint64_t tsc_img0 = kd_probe_on ? __rdtsc() : 0;
+            const std::uint64_t tsc_img0 = kd_probe_on ? rcp_read_cycles() : 0;
             const double* xi = x + i * Ndim;
             const ImageSet img = compute_image_set(
                 xi, r_c_max + kd_radius_inflation, box.data(), Ndim);
-            if (kd_probe_on) tls_kd_image += __rdtsc() - tsc_img0;
+            if (kd_probe_on) tls_kd_image += rcp_read_cycles() - tsc_img0;
 
             // Iterate the cartesian product of per-axis image offsets.
             // We unroll up to Ndim=8 here in a generic way using indices.
             std::size_t idx[KD_MAX_NDIM] = {0};
             for (std::uint32_t img_k = 0; img_k < img.total_images; ++img_k) {
                 // Build xq for this image
-                const std::uint64_t tsc_img1 = kd_probe_on ? __rdtsc() : 0;
+                const std::uint64_t tsc_img1 = kd_probe_on ? rcp_read_cycles() : 0;
                 for (std::size_t d = 0; d < Ndim; ++d) {
                     const std::int8_t off = img.offsets[d][idx[d]];
                     xq[d] = xi[d] + static_cast<double>(off) * box[d];
                 }
-                if (kd_probe_on) tls_kd_image += __rdtsc() - tsc_img1;
+                if (kd_probe_on) tls_kd_image += rcp_read_cycles() - tsc_img1;
 
                 candidates.clear();
-                const std::uint64_t tsc_q0 = kd_probe_on ? __rdtsc() : 0;
+                const std::uint64_t tsc_q0 = kd_probe_on ? rcp_read_cycles() : 0;
                 // Cycle 6 H3: pass Di + (t_shell + inflation) so the tree
                 // uses per-subtree max_D for tight pruning and per-pair
                 // leaf cutoffs. The inflation handles drift of unrefreshed
@@ -3242,7 +3258,7 @@ void get_pairs_kdtree(
                                      x, D.data(), Ndim, candidates);
                 }
                 if (kd_probe_on) {
-                    tls_kd_query += __rdtsc() - tsc_q0;
+                    tls_kd_query += rcp_read_cycles() - tsc_q0;
                     tls_kd_cand  += candidates.size();
                 }
 
@@ -3256,7 +3272,7 @@ void get_pairs_kdtree(
                     // shorter when wrap is via a different image. Removing
                     // it costs more than it saves due to accept-write
                     // contention on the extra candidates.)
-                    const std::uint64_t tsc_m0 = kd_probe_on ? __rdtsc() : 0;
+                    const std::uint64_t tsc_m0 = kd_probe_on ? rcp_read_cycles() : 0;
                     double d2;
                     if (Ndim == 3) {
                         const double* xj = x + j * 3u;
@@ -3277,11 +3293,11 @@ void get_pairs_kdtree(
                     }
                     const double r_c = (Di + D[j]) * 0.5 + t_shell;
                     const bool reject = (d2 >= r_c * r_c);
-                    if (kd_probe_on) tls_kd_mic += __rdtsc() - tsc_m0;
+                    if (kd_probe_on) tls_kd_mic += rcp_read_cycles() - tsc_m0;
                     if (reject) continue;
                     if (kd_probe_on) ++tls_kd_acc;
 
-                    const std::uint64_t tsc_w0 = kd_probe_on ? __rdtsc() : 0;
+                    const std::uint64_t tsc_w0 = kd_probe_on ? rcp_read_cycles() : 0;
                     if (j > i) {
                         // Own-write to slot_i
                         std::uint32_t& cnt = slot_i[0];
@@ -3329,7 +3345,7 @@ void get_pairs_kdtree(
                             static_cast<std::uint32_t>(i));
                     }
                     // else: j < i and refresh[j] == 1 — j's own walk handles it
-                    if (kd_probe_on) tls_kd_write += __rdtsc() - tsc_w0;
+                    if (kd_probe_on) tls_kd_write += rcp_read_cycles() - tsc_w0;
                 }
 
                 // Advance to next image index combo
@@ -3342,7 +3358,7 @@ void get_pairs_kdtree(
 
         // kdtree Cycle 4: fold thread-locals into atomics on parallel-exit.
         if (kd_probe_on) {
-            tls_kd_total = __rdtsc() - tls_kd_tsc_thread_start;
+            tls_kd_total = rcp_read_cycles() - tls_kd_tsc_thread_start;
             g_kd_image_cycles.fetch_add(tls_kd_image, std::memory_order_relaxed);
             g_kd_query_cycles.fetch_add(tls_kd_query, std::memory_order_relaxed);
             g_kd_mic_cycles.fetch_add(tls_kd_mic,     std::memory_order_relaxed);
@@ -3371,6 +3387,22 @@ void get_pairs_kdtree(
             std::uint32_t* slot_j = pairs_data + pair_offsets[j];
             const std::uint32_t cap_j = max_neighbors_per_particle[j];
             std::uint32_t cntj = slot_j[0];
+            // Dedup BEFORE the capacity check, matching the three sibling
+            // append sites (kdtree own-write above, and both sort+walk
+            // own/cross-write). Multi-image KD queries can enqueue the same
+            // (j, i_writer) pair from several shifted images; the later
+            // sort+unique only dedups AFTER this merge, so without a dedup
+            // here transient duplicates consume slots and can force a FALSE
+            // overflow in tight-capacity rows (e.g. small dense periodic
+            // cells where cap clamps to N). Skipping known duplicates changes
+            // nothing for normal runs (the row ends deduped either way) — it
+            // only removes the spurious overflow. xwrite buffers stay tiny, so
+            // the added scan cost is negligible.
+            bool dupj = false;
+            for (std::uint32_t kk = 1; kk <= cntj; ++kk) {
+                if (slot_j[kk] == i_writer) { dupj = true; break; }
+            }
+            if (dupj) continue;
             if (cntj < cap_j) {
                 slot_j[0] = cntj + 1;
                 slot_j[cntj + 1] = i_writer;
@@ -3417,7 +3449,7 @@ void get_pairs_kdtree(
 
     // Cycle 7 measurement: record query-region wall per regime.
     if (kd_probe_on) {
-        const std::uint64_t qregion = __rdtsc() - kd_tsc_qregion_start;
+        const std::uint64_t qregion = rcp_read_cycles() - kd_tsc_qregion_start;
         const int regime = rcp_kd_regime_for_step(g_shadow_current_step);
         g_kd_regime_query_cyc[regime].fetch_add(qregion,
                                                 std::memory_order_relaxed);
@@ -3430,7 +3462,7 @@ void get_pairs_kdtree(
     // Cycle 7 H11: also dedup via std::unique after sort, since the
     // deferred-buffer merge can introduce duplicates (multi-image returns
     // produce same (j, i) from multiple shifted queries).
-    const std::uint64_t kd_tsc_sort_start = kd_probe_on ? __rdtsc() : 0;
+    const std::uint64_t kd_tsc_sort_start = kd_probe_on ? rcp_read_cycles() : 0;
     // Cycle 10 H31: iterate the sparse dirty list instead of all N. With
     // mid-regime dirty count ~5K and N=500K, this collapses the parallel-for
     // chunk count from N/static ≈ 125K/thread to ~1K/thread total — cuts the
@@ -3459,7 +3491,7 @@ void get_pairs_kdtree(
         }
     }
     if (kd_probe_on) {
-        g_kd_sort_cycles.fetch_add(__rdtsc() - kd_tsc_sort_start,
+        g_kd_sort_cycles.fetch_add(rcp_read_cycles() - kd_tsc_sort_start,
                                    std::memory_order_relaxed);
     }
 
@@ -3487,7 +3519,7 @@ void get_pairs_kdtree(
     (void)walls;
 
     if (kd_probe_on) {
-        g_kd_total_cycles.fetch_add(__rdtsc() - kd_tsc_fn_start,
+        g_kd_total_cycles.fetch_add(rcp_read_cycles() - kd_tsc_fn_start,
                                     std::memory_order_relaxed);
         g_kd_calls.fetch_add(1, std::memory_order_relaxed);
     }
@@ -3784,7 +3816,7 @@ void get_forces_nd_3(
         // and whether the 38 cyc/cand surplus is in test or overlap.
         std::uint64_t tls_cyc_test = 0;
         std::uint64_t tls_cyc_overlap = 0;
-        std::uint64_t tsc_start = probe ? __rdtsc() : 0;
+        std::uint64_t tsc_start = probe ? rcp_read_cycles() : 0;
 
         #pragma omp for schedule(static)
         for (std::size_t i = 0; i < N; ++i) {
@@ -4118,7 +4150,7 @@ void get_forces_nd_3(
         g_floop_candidates.fetch_add(tls_candidates, std::memory_order_relaxed);
         g_floop_overlaps.fetch_add(tls_overlaps, std::memory_order_relaxed);
         if (probe) {
-            tls_cycles = __rdtsc() - tsc_start;
+            tls_cycles = rcp_read_cycles() - tsc_start;
             g_floop_cycles.fetch_add(tls_cycles, std::memory_order_relaxed);
             g_floop_test_cycles.fetch_add(tls_cyc_test, std::memory_order_relaxed);
             g_floop_overlap_cycles.fetch_add(tls_cyc_overlap, std::memory_order_relaxed);
@@ -5020,6 +5052,12 @@ std::pair<PackingResult, PackingTrace> run_packing_observed(
     }
 
     std::size_t steps = 0;
+    // Number of steps whose per-step history entries are fully written (all
+    // *_history series filled through [0, hist_filled)). The history buffers are
+    // over-allocated to hist_size = step_cap + 1 for indexing headroom; this
+    // tracks the actually-filled prefix so the returned series carry no trailing
+    // zero (see the resize before the result is assembled).
+    std::size_t hist_filled = 0;
     const std::size_t max_steps = step_cap;   // resolved above: N-scaled default (cap no longer binds real runs), options.max_steps honored if passed
     // Cycle 10: how often to re-reorder. 0 disables (baseline / debugging).
     const std::size_t REORDER_INTERVAL = options.reorder_interval;
@@ -6537,6 +6575,7 @@ std::pair<PackingResult, PackingTrace> run_packing_observed(
         g_t_bookkeep.begin();
 
         U_history[step - 1] = U;
+        hist_filled = step;   // all per-step history series now filled through [0, step)
 
         const bool should_report =
             observer && progress_interval > 0 && (step % progress_interval == 0);
@@ -6643,6 +6682,18 @@ std::pair<PackingResult, PackingTrace> run_packing_observed(
     result.particle_origin = std::move(particle_origin);
     result.box = std::move(box);
     result.walls = std::move(walls);
+    // Trim the per-step history series to the number of steps actually
+    // recorded. They are over-allocated to hist_size = step_cap + 1 for indexing
+    // headroom, but the loop fills only [0, hist_filled); returning the full
+    // allocation left a trailing zero, making every *_history read one element
+    // longer than the step count. Return exactly the filled prefix.
+    phi_history.resize(hist_filled);
+    F_history.resize(hist_filled);
+    U_history.resize(hist_filled);
+    max_overlap_history.resize(hist_filled);
+    mu_hist.resize(hist_filled);
+    alpha_hist.resize(hist_filled);
+    mu_flag_hist.resize(hist_filled);
     result.phi_history = std::move(phi_history);
     result.force_history = std::move(F_history);
     // Cycle 16: surface the diagnostic series to Python.
@@ -6673,7 +6724,13 @@ std::pair<PackingResult, PackingTrace> run_packing_observed(
     // Cycle 18 Phase A: spike log goes through whether pp is enabled or not.
     result.spike_log = std::move(spike_log_buf);
     result.reorder_log = std::move(reorder_log_buf);
-    result.steps = steps;
+    // Report the number of COMPLETED packing iterations, which equals the
+    // filled length of every per-step history series. The loop-entry counter
+    // `steps` also counts a terminating check-only iteration (convergence hits
+    // OscPhase::DONE and breaks before that iteration writes history), so it can
+    // read one higher than the histories. Using hist_filled keeps the public
+    // contract internally consistent: result.steps == len(phi/force/energy_history).
+    result.steps = hist_filled;
     result.phi = phi;
     result.max_min_dist = max_min_dist;
     result.force_magnitude = F_magnitude;

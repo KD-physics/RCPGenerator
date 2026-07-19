@@ -21,6 +21,19 @@ pip install -v .
 
 Requires a C++17 compiler with OpenMP. A guided tour is in `getting_started.ipynb` (repo root).
 
+### Optional native optimization for local builds
+
+Normal builds use portable CPU instructions so their wheels can run on other machines. For a
+local-only source build tuned to the current CPU, pass the default-off CMake option through pip:
+
+```bash
+CMAKE_ARGS="-DRCP_NATIVE_OPTIMIZATION=ON" pip install -v .
+```
+
+Do not use that option for a wheel intended to be distributed to another machine. GCC builds
+enable `-march=native` and the existing 512-bit vector-width preference; Clang builds enable
+`-march=native`. Other compilers emit a CMake warning and retain their default architecture.
+
 ## Quickstart
 
 ```python
