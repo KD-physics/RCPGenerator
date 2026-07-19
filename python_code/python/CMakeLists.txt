@@ -14,6 +14,13 @@ option(
 )
 
 # OpenMP for parallel force loop (Phase 1 parallelization)
+# MSVC's classic OpenMP mode is limited to OpenMP 2.0. The core uses tasks,
+# min/max reductions, and unsigned loop indices, all of which require MSVC's
+# LLVM OpenMP runtime. FindOpenMP supports this selector in CMake 3.30+;
+# scikit-build-core supplies a current CMake for wheel builds.
+if(MSVC)
+    set(OpenMP_RUNTIME_MSVC llvm)
+endif()
 find_package(OpenMP REQUIRED)
 
 add_library(rcpgenerator_core
