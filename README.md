@@ -6,7 +6,7 @@
 
 Sections:    [Install](#install-the-current-python-package) | [Quickstart](#python-quickstart) | [Examples](#example-packings) | [Packing app](#interactive-packing-app) | [Large-packing visualizer](#large-packing-visualizer) | [Citation](#method-interpretation-and-citation) 
 
-Quick Links: [Colab Getting Started](https://github.com/KD-physics/RCPGenerator/blob/main/getting_started.ipynb) | [Packing app](https://kd-physics.github.io/RCPGenerator/webapp/index.html) | [Packing visualizer](https://kd-physics.github.io/RCPGenerator/python_code/python/webapp/app/index.html) | [Python API documentation](https://github.com/KD-physics/RCPGenerator/blob/main/python_code/python/README.md)  
+Quick Links:  [Run in Colab ↗](https://colab.research.google.com/github/KD-physics/RCPGenerator/blob/main/getting_started.ipynb) | [Packing app](https://kd-physics.github.io/RCPGenerator/webapp/index.html) | [Packing visualizer](https://kd-physics.github.io/RCPGenerator/python_code/python/webapp/app/index.html) | [Python API documentation](https://github.com/KD-physics/RCPGenerator/blob/main/python_code/python/README.md)  
 
 RCPGenerator is an open-source Python package for generating dense, disordered
 packings of polydisperse particles. It supports 2D disks, 3D spheres, and
