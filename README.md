@@ -157,9 +157,10 @@ then adapted into Python. Continued development in the Python package changed th
 convergence logic, μ scheduling, neighbor handling, diagnostics, and public interface.
 
 The standalone C++ and MATLAB implementations under `legacy/` remain available and
-functional, but they represent the earlier algorithm. They should not be expected to
-follow the same numerical trajectory, convergence behavior, scheduler, output contract,
-or API as the maintained Python package.
+functional, but they represent the earlier algorithm. They do not implement the version
+of the algorithm described in the RCPGenerator manuscript. They should not be expected
+to follow the same numerical trajectory, convergence behavior, scheduler, output
+contract, or API as the maintained Python package.
 
 ### Legacy C++ interface
 
