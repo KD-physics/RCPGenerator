@@ -13,7 +13,7 @@ The maintained implementation is the `rcpgenerator` Python package. Its numerica
 engine is current C++ code compiled into a Python extension with pybind11 and OpenMP;
 it is not the standalone C++ program preserved in `legacy/`. The repository also
 contains the `rcptools` analysis and search toolkit, worked examples, a Getting
-Started notebook, and an interactive packing viewer.
+Started notebook, and an interactive packing app.
 
 RCPGenerator is intended for computational studies of random close packing, sphere
 packing, granular materials, colloids, dense particle systems, powders, confinement,
@@ -26,7 +26,7 @@ Project resources:
 - [Python package documentation](https://github.com/KD-physics/RCPGenerator/blob/main/python_code/python/README.md)
 - [Getting Started notebook](https://github.com/KD-physics/RCPGenerator/blob/main/getting_started.ipynb)
 - [Python examples](https://github.com/KD-physics/RCPGenerator/tree/main/python_code/python/examples)
-- [Interactive packing viewer](https://kd-physics.github.io/RCPGenerator/webapp/index.html)
+- [Interactive packing app](https://kd-physics.github.io/RCPGenerator/webapp/index.html)
 - [Issue tracker](https://github.com/KD-physics/RCPGenerator/issues)
 - [RCPGenerator manuscript](https://arxiv.org/abs/2608.12235)
 
@@ -105,18 +105,44 @@ viewer-bundle export, interpretation guidance, and the complete public API.
 |:---:|:---:|:---:|:---:|
 | Dense 2D packing with periodic and hard-wall boundaries | Dense 2D disks in a circular container | 3D spheres with cylindrical confinement | 3D spheres with spherical confinement |
 
-## Interactive packing viewer
+## Interactive packing app
 
-[Open the hosted RCP packing viewer](https://kd-physics.github.io/RCPGenerator/webapp/index.html)
+[Open the hosted RCP packing app](https://kd-physics.github.io/RCPGenerator/webapp/index.html)
 
-![RCPGenerator interactive packing viewer](Images/WebApp.png)
+![RCPGenerator interactive packing app](Images/WebApp.png)
 
-The viewer supports direct inspection of 2D packings and cross-sectional inspection of
-3D packings, with pan, zoom, slicing, coloring, overlays, and field-of-view statistics.
-The installed `rcptools.bridge.write_bundle` function exports the `manifest.json`,
-`pos.f32`, and `dia.f32` bundle files accepted by the viewer. Viewer development files
-are available in [`webapp/`](https://github.com/KD-physics/RCPGenerator/tree/main/webapp)
-and in the Python project source.
+The hosted app is an interactive 2D demonstration of the packing process. Choose the number of particles, initial packing fraction, and diameter distribution; generate an initial periodic packing; and then run or stop the ADAM-based relaxation directly in the browser.
+
+While the packing runs, the μ and learning-rate sliders can be adjusted in real time. This makes it possible to explore how the particle-growth control and optimization step size affect overlaps, energy, packing fraction, and the evolution of the configuration. The resulting particle positions and diameters can be downloaded as a CSV file.
+
+The app is intended for interactive exploration and education. It is a browser-based 2D implementation and is separate from the maintained `rcpgenerator` Python package and its compiled numerical engine.
+
+## Large-packing visualizer
+
+🔍 [Open the large-packing visualizer](https://kd-physics.github.io/RCPGenerator/python_code/python/webapp/app/index.html)
+
+The Python project also contains a separate visualizer for inspecting packings produced by `rcpgenerator`. It is designed as “Google Maps for packings”: users can smoothly pan and zoom from the full system down to individual particles while the rendering remains crisp and visually consistent.
+
+The visualizer displays 2D packings directly and explores 3D packings through an adjustable cross-sectional slice. It supports periodic wrapping, hard and curved boundaries, coloring by particle diameter or supplied scalar data, optional pore and Voronoi-derived overlays, live field-of-view statistics, multiple colormaps, and high-resolution PNG export.
+
+Create a visualizer bundle from a Python packing with
+`rcptools.bridge.write_bundle`:
+
+```python
+from rcptools.bridge import write_bundle
+
+write_bundle(
+    "my_packing",
+    packing.positions,
+    packing.diameters,
+    packing.box,
+    walls=packing.walls,
+)
+```
+
+A bundle contains manifest.json, pos.f32, and dia.f32, with optional analysis layers. The visualizer can load a bundle folder or ZIP file, and repository tools can also generate a self-contained HTML file with the packing data embedded for offline inspection.
+
+The visualizer is maintained in the python_code/python/webapp directory (https://github.com/KD-physics/RCPGenerator/tree/main/python_code/python/webapp). It is a repository tool and is not the hosted interactive packing app above. The visualizer application itself is not installed as part of the Python wheel.
 
 ## Boundaries and containers
 
