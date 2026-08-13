@@ -263,7 +263,7 @@ manuscript. Packing is a numerical procedure whose convergence and runtime depen
 the particle distribution, initial state, dimensions, boundaries, and run settings;
 validate the returned diagnostics for the intended scientific application.
 
-Preferred citation:
+Code citation:
 
 - Desmond, K. “Random close packing at extreme size ratios with an Adam-based
   inflation protocol.” arXiv:2608.12235 (2026).
