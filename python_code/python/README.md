@@ -23,8 +23,8 @@ Version 1.0.0 wheels are built and tested for CPython 3.10–3.14 on:
 
 - Windows x86-64
 - Linux x86-64
-- macOS Apple Silicon
-- macOS Intel
+- macOS 15 or later on Apple Silicon
+- macOS 14 or later on Intel
 
 GitHub Actions has verified wheel building, dependency repair, clean installation, and
 the installed-package smoke test for every listed Python version and platform. Wheels
@@ -162,6 +162,9 @@ for the machine on which it is compiled. Do not redistribute it as a portable wh
 The package uses an iterative expansion–relaxation method based on the approach described
 by Desmond and Weeks, with a compiled neighbor-search and relaxation implementation.
 
+- Desmond, K. “Random close packing at extreme size ratios with an Adam-based
+  inflation protocol.” arXiv:2608.12235 (2026).
+  [arXiv:2608.12235](https://arxiv.org/abs/2608.12235)
 - Desmond, K. W. and Weeks, E. R. “Random close packing of disks and spheres in
   confined geometries.” *Physical Review E* **80**, 051305 (2009).
   [arXiv:0903.0864](https://arxiv.org/abs/0903.0864)
@@ -169,10 +172,8 @@ by Desmond and Weeks, with a compiled neighbor-search and relaxation implementat
   close packing of spheres.” *Physical Review E* **90**, 022204 (2014).
   [arXiv:1303.4627](https://arxiv.org/abs/1303.4627)
 
-An RCPGenerator manuscript is in preparation and is expected to be posted to arXiv. A
-package-specific software citation, the preferred manuscript citation, and any archival
-software DOI will be added after those records exist. Until then, cite the relevant
-method-background paper and record the `rcpgenerator` version used.
+Use the RCPGenerator arXiv manuscript as the preferred scientific citation and record
+the `rcpgenerator` version used. The two earlier papers provide method background.
 
 `rcpgenerator` is distributed under the
 [MIT License](https://github.com/KD-physics/RCPGenerator/blob/main/python_code/python/LICENSE).
