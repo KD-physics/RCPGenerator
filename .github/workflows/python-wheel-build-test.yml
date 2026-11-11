@@ -51,7 +51,25 @@ jobs:
           CMAKE_ARGS: "-DRCP_NATIVE_OPTIMIZATION=OFF"
           MACOSX_DEPLOYMENT_TARGET: ${{ matrix.macos_target }}
 
+      - name: Install CPython 3.12 wheel for platform tests
+        working-directory: python_code/python
+        run: |
+          python -m pip install "matplotlib>=3.10" "numpy>=1.23" "pandas>=1.5" "scipy>=1.9"
+          python -m pip install --no-index --find-links wheelhouse --no-deps "rcpgenerator==1.1.0"
+
+      - name: Run installed-wheel platform tests outside source tree
+        working-directory: ${{ runner.temp }}
+        env:
+          OMP_NUM_THREADS: "1"
+          MPLBACKEND: "Agg"
+          MPLCONFIGDIR: ${{ runner.temp }}/matplotlib
+        run: |
+          python "${{ github.workspace }}/python_code/python/tests/test_permute_quench.py" --quick
+          python "${{ github.workspace }}/python_code/python/tests/test_examples.py" --quick
+          python "${{ github.workspace }}/python_code/python/tests/test_ndim.py"
+
       - name: Retain built wheels
+        if: always()
         uses: actions/upload-artifact@v7
         with:
           name: rcpgenerator-${{ matrix.name }}

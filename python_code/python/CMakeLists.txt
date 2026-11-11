@@ -26,6 +26,7 @@ find_package(OpenMP REQUIRED)
 add_library(rcpgenerator_core
     src/core/initialize_particles.cpp
     src/core/rcp_generator.cpp
+    src/core/diameter_permute.cpp
 )
 set_target_properties(rcpgenerator_core PROPERTIES
     POSITION_INDEPENDENT_CODE ON

@@ -1,4 +1,5 @@
 #include "rcpgenerator/rcp_generator.hpp"
+#include "rcpgenerator/diameter_permute.hpp"
 
 #include <algorithm>
 #include <atomic>
@@ -241,6 +242,18 @@ static bool rcp_fp32_stub() {
 // (over-compression; phi overshoot on relax). The `mu` VARIABLE is never
 // modified, so the rung 1->0 transition machinery (mu_decay_target =
 // mu/10, oscillation bases) is untouched by construction.
+// H12c [163]: reopen mu-kick fraction for variant-B bottleneck (small fraction of the
+// rung-1 mu -> slight overlap ~1e-4 that reopens cages a bit). File-scope so it adds no
+// static-local guard inside the byte-exact run_packing_observed hot path.
+static double rcp_bneck_kick_frac() {
+    static const double v = []() {
+        const char* s = std::getenv("RCP_BNECK_KICK_FRAC");
+        if (!s || !s[0]) return 0.05;
+        double x = std::atof(s);
+        return (x > 0.0 && x < 1.0) ? x : 0.05;
+    }();
+    return v;
+}
 static double rcp_mu1_boost() {
     static const double v = []() {
         const char* s = std::getenv("RCP_MU1_BOOST");
@@ -589,6 +602,7 @@ static KernelTimer g_t_adam;
 static KernelTimer g_t_position;
 static KernelTimer g_t_refresh;
 static KernelTimer g_t_bookkeep;  // everything else inside the main loop
+static KernelTimer g_t_swap;      // diameter-SWAP sweeps (zero calls when swap == 0)
 
 // Sub-timers inside get_forces_nd_3 — for Cycle 3 scaling diagnosis.
 // Total of these < g_t_forces (begin/end overhead).
@@ -621,6 +635,20 @@ static std::uint64_t g_pflat_version = 0;
 // sentinel as a growing miss window between two reorders (stale Dmax index
 // -> query radius too small for big-particle pairs).
 static std::uint64_t g_rcp_perm_epoch = 0;
+// checkpoint-deterministic mode [log 044/B4]: when a run checkpoints, the
+// kd/oct tree must hold NO cross-step state (the patch path's leaf staleness
+// is path-dependent and unserializable at reasonable cost), so every pair
+// update takes the full-rebuild branch. Statistically equivalent to the
+// patched default; bitwise different (documented mode semantics).
+static bool g_rcp_ckpt_deterministic = false;
+// kdtree D-stat cache, hoisted from get_pairs so checkpoint/resume can
+// serialize it: the cache is PATH-DEPENDENT (stale indices survive hits) and
+// bitwise resume must reproduce the unbroken run's staleness [log 044/B3].
+static std::size_t g_dstat_max_idx = 0, g_dstat_min_idx = 0, g_dstat_med_idx = 0;
+static std::size_t g_dstat_N = 0;
+static double g_dstat_D0 = 0.0, g_dstat_Dmid = 0.0;
+static bool g_dstat_valid = false;
+static std::uint64_t g_dstat_epoch = ~0ull;
 // Cycle 21k adaptive shell multiplier. Single writer (the run loop, once
 // per step before the refresh check); the pair backends read it inside
 // the dispatch call that follows on the same thread.
@@ -688,6 +716,7 @@ static void print_timing_summary(double total_wall, std::size_t steps) {
     show("position+pbc     ", g_t_position);
     show("refresh_check    ", g_t_refresh);
     show("bookkeep         ", g_t_bookkeep);
+    show("swap_sweep       ", g_t_swap);
     show("  bk.D-update    ", g_t_bk_dupdate);
     show("  bk.meanforce   ", g_t_bk_meanforce);
     show("  bk.alpha       ", g_t_bk_alpha);
@@ -2794,16 +2823,16 @@ void get_pairs_kdtree(
     // accommodates FP rounding while catching any real permutation.
     double Dmax, Dmin, median;
     {
-        static std::size_t cached_max_idx = 0;
-        static std::size_t cached_min_idx = 0;
-        static std::size_t cached_med_idx = 0;
-        static std::size_t cached_N = 0;
-        static double cached_D0 = 0.0, cached_Dmid = 0.0;
-        static bool cached_valid = false;
+        auto& cached_max_idx = g_dstat_max_idx;
+        auto& cached_min_idx = g_dstat_min_idx;
+        auto& cached_med_idx = g_dstat_med_idx;
+        auto& cached_N = g_dstat_N;
+        auto& cached_D0 = g_dstat_D0; auto& cached_Dmid = g_dstat_Dmid;
+        auto& cached_valid = g_dstat_valid;
         // Cycle 21d: deterministic invalidation on permutation. The ratio
         // check below stays as belt-and-braces, but it can false-negative
         // under size ties (see g_rcp_perm_epoch comment).
-        static std::uint64_t cached_epoch = ~0ull;
+        auto& cached_epoch = g_dstat_epoch;
         bool hit = false;
         if (cached_valid && cached_N == N && cached_D0 != 0.0 &&
             cached_Dmid != 0.0 && cached_epoch == g_rcp_perm_epoch) {
@@ -2949,6 +2978,7 @@ void get_pairs_kdtree(
     // that, and the widened phase is the high-refresh early phase where
     // full rebuild wins anyway.
     const bool need_full_rebuild =
+        g_rcp_ckpt_deterministic ||          // [log 044/B4] no tree state across steps
         (g_kd_tree_N != N) ||
         (g_kd_patches_since_rebuild >= KD_MAX_PATCHES_BETWEEN_REBUILDS) ||
         (refresh_count_total * KD_PATCH_REFRESH_THRESHOLD_FRAC > N) ||
@@ -3525,6 +3555,414 @@ void get_pairs_kdtree(
     }
 }
 
+// ============================================================================
+// [227] N-dimensional k-d tree pair search, used only for Ndim >= 4.
+//
+// 2D and 3D keep their own optimised backends untouched. For Ndim >= 4 the only
+// path used to be sort+walk (sort along x, scan an x-window), whose candidate count
+// per particle grows like N * (reach / L): in 4-6D that is a large fraction of N.
+// This backend replaces only the CANDIDATE GENERATION: a dimension-generic k-d tree
+// (double bounding boxes of Ndim entries, per-node max diameter for tight pruning,
+// median splits cycling through the axes). Every candidate is then judged by exactly
+// the sort+walk acceptance test (same shell t, r_c = Di/2 + t + float(Dj/2), same
+// dx-first squared distance, minimum image on every axis) and stored by exactly the
+// sort+walk rules (pair kept in the lower-index particle's row; refreshed rows rebuilt;
+// cross-writes into unrefreshed rows; every row sorted), so the neighbour lists are
+// identical to sort+walk's and runs are bit-for-bit the same, only faster. The tree is
+// rebuilt on every call (O(N log N), parallel); the queries run in parallel over the
+// refreshed particles with per-thread deferred cross-writes, so results do not depend
+// on the thread count. RCP_PAIRS_BACKEND=sortwalk selects the old path; =shadow runs
+// both and compares the pair sets on every call.
+// ============================================================================
+namespace {
+struct KdTreeND {
+    static constexpr std::uint32_t LEAF = 32;
+    static constexpr std::uint32_t PAR_MIN = 4096;   // below this subtree size, build serially
+    std::size_t nd = 0;
+    std::vector<std::uint32_t> perm, child0, child1, first, count;
+    std::vector<double> lo, hi, maxD;                // lo/hi: nd entries per node
+    std::atomic<std::uint32_t> next{0};
+
+    void build(const double* x, const double* D, std::size_t N, std::size_t Ndim) {
+        nd = Ndim;
+        perm.resize(N);
+        for (std::size_t k = 0; k < N; ++k) perm[k] = static_cast<std::uint32_t>(k);
+        const std::size_t upper = 4 * N / LEAF + 64;
+        if (child0.size() < upper) {
+            child0.resize(upper); child1.resize(upper); first.resize(upper); count.resize(upper);
+            maxD.resize(upper);
+        }
+        if (lo.size() < upper * nd) { lo.resize(upper * nd); hi.resize(upper * nd); }
+        next.store(1, std::memory_order_relaxed);
+        built_n = N;
+        if (N == 0) return;
+        #pragma omp parallel
+        {
+            #pragma omp single
+            build_rec(x, D, 0, 0, static_cast<std::uint32_t>(N), 0);
+        }
+        node_count = next.load(std::memory_order_relaxed);
+        leaves.clear();
+        for (std::uint32_t n = 0; n < node_count; ++n)
+            if (child0[n] == KD_NULL) leaves.push_back(n);
+    }
+
+    // Keep the topology, recompute every box and max diameter from the current positions and
+    // diameters: O(N Ndim). Boxes stay exact, so queries remain a superset of the exact test;
+    // only pruning efficiency degrades as particles drift, which a periodic rebuild restores.
+    // Children always have larger indices than their parent, so a reverse sweep is bottom-up.
+    void refit(const double* x, const double* D) {
+        #pragma omp parallel for schedule(static)
+        for (std::size_t k = 0; k < leaves.size(); ++k) {
+            const std::uint32_t node = leaves[k];
+            double* nlo = &lo[std::size_t(node) * nd];
+            double* nhi = &hi[std::size_t(node) * nd];
+            for (std::size_t d = 0; d < nd; ++d) {
+                nlo[d] = std::numeric_limits<double>::infinity();
+                nhi[d] = -std::numeric_limits<double>::infinity();
+            }
+            double mx = 0.0;
+            for (std::uint32_t q = first[node]; q < first[node] + count[node]; ++q) {
+                const std::uint32_t p = perm[q];
+                const double* xp = x + std::size_t(p) * nd;
+                for (std::size_t d = 0; d < nd; ++d) {
+                    if (xp[d] < nlo[d]) nlo[d] = xp[d];
+                    if (xp[d] > nhi[d]) nhi[d] = xp[d];
+                }
+                if (D[p] > mx) mx = D[p];
+            }
+            maxD[node] = mx;
+        }
+        for (std::uint32_t n = node_count; n-- > 0;) {
+            if (child0[n] == KD_NULL) continue;
+            const std::uint32_t l = child0[n], r = child1[n];
+            for (std::size_t d = 0; d < nd; ++d) {
+                lo[std::size_t(n) * nd + d] = std::min(lo[std::size_t(l) * nd + d], lo[std::size_t(r) * nd + d]);
+                hi[std::size_t(n) * nd + d] = std::max(hi[std::size_t(l) * nd + d], hi[std::size_t(r) * nd + d]);
+            }
+            maxD[n] = std::max(maxD[l], maxD[r]);
+        }
+    }
+
+    std::size_t built_n = 0;
+    std::uint32_t node_count = 0;
+    std::vector<std::uint32_t> leaves;
+
+    // Candidates for particle position xq: every particle p whose minimum-image distance is
+    // <= (Di + D[p]) / 2 + reach. One traversal covers every periodic image: the distance from xq
+    // to a node's box is the minimum over the box and its copies shifted by +-L on each axis (a
+    // lower bound on the minimum-image distance to any particle inside). A superset of the exact
+    // test applied by the caller.
+    void query(const double* xq, double Di, double reach, const double* x, const double* D,
+               const double* L, const double* invL, std::vector<std::uint32_t>& out) const {
+        std::uint32_t stack[128];
+        int top = 0;
+        stack[top++] = 0;
+        while (top > 0) {
+            const std::uint32_t n = stack[--top];
+            const double* nlo = &lo[std::size_t(n) * nd];
+            const double* nhi = &hi[std::size_t(n) * nd];
+            double dbb2 = 0.0;
+            for (std::size_t d = 0; d < nd; ++d) {
+                const double direct = std::max(0.0, std::max(nlo[d] - xq[d], xq[d] - nhi[d]));
+                const double wrapped = std::min(xq[d] + L[d] - nhi[d], nlo[d] - xq[d] + L[d]);
+                const double diff = std::max(0.0, std::min(direct, wrapped));
+                dbb2 += diff * diff;
+            }
+            const double rn = (Di + maxD[n]) * 0.5 + reach;
+            if (dbb2 > rn * rn) continue;
+            if (child0[n] == KD_NULL) {
+                const std::uint32_t f = first[n], c = count[n];
+                for (std::uint32_t k = 0; k < c; ++k) {
+                    const std::uint32_t p = perm[f + k];
+                    const double* xp = x + std::size_t(p) * nd;
+                    double d2 = 0.0;
+                    for (std::size_t d = 0; d < nd; ++d) {
+                        double dq = xp[d] - xq[d];
+                        dq -= std::nearbyint(dq * invL[d]) * L[d];
+                        d2 += dq * dq;
+                    }
+                    const double rp = (Di + D[p]) * 0.5 + reach;
+                    if (d2 <= rp * rp) out.push_back(p);
+                }
+                continue;
+            }
+            stack[top++] = child0[n];
+            stack[top++] = child1[n];
+        }
+    }
+
+private:
+    void build_rec(const double* x, const double* D, std::uint32_t node,
+                   std::uint32_t b, std::uint32_t e, std::uint32_t depth) {
+        const std::uint32_t cnt = e - b;
+        double* nlo = &lo[std::size_t(node) * nd];
+        double* nhi = &hi[std::size_t(node) * nd];
+        if (cnt <= LEAF) {
+            for (std::size_t d = 0; d < nd; ++d) {
+                nlo[d] = std::numeric_limits<double>::infinity();
+                nhi[d] = -std::numeric_limits<double>::infinity();
+            }
+            double mx = 0.0;
+            for (std::uint32_t k = b; k < e; ++k) {
+                const std::uint32_t p = perm[k];
+                const double* xp = x + std::size_t(p) * nd;
+                for (std::size_t d = 0; d < nd; ++d) {
+                    if (xp[d] < nlo[d]) nlo[d] = xp[d];
+                    if (xp[d] > nhi[d]) nhi[d] = xp[d];
+                }
+                if (D[p] > mx) mx = D[p];
+            }
+            maxD[node] = mx; first[node] = b; count[node] = cnt;
+            child0[node] = KD_NULL; child1[node] = KD_NULL;
+            return;
+        }
+        const std::size_t sd = depth % nd;
+        const std::uint32_t mid = b + cnt / 2;
+        const std::size_t ndim = nd;
+        std::nth_element(perm.begin() + b, perm.begin() + mid, perm.begin() + e,
+                         [x, ndim, sd](std::uint32_t a, std::uint32_t c) {
+                             return x[std::size_t(a) * ndim + sd] < x[std::size_t(c) * ndim + sd];
+                         });
+        const std::uint32_t l = next.fetch_add(2, std::memory_order_relaxed);
+        const std::uint32_t r = l + 1;
+        child0[node] = l; child1[node] = r; count[node] = 0;
+        if (cnt >= PAR_MIN) {
+            #pragma omp task firstprivate(l, b, mid, depth) shared(x, D)
+            build_rec(x, D, l, b, mid, depth + 1);
+            #pragma omp task firstprivate(r, mid, e, depth) shared(x, D)
+            build_rec(x, D, r, mid, e, depth + 1);
+            #pragma omp taskwait
+        } else {
+            build_rec(x, D, l, b, mid, depth + 1);
+            build_rec(x, D, r, mid, e, depth + 1);
+        }
+        const double* llo = &lo[std::size_t(l) * nd]; const double* lhi = &hi[std::size_t(l) * nd];
+        const double* rlo = &lo[std::size_t(r) * nd]; const double* rhi = &hi[std::size_t(r) * nd];
+        for (std::size_t d = 0; d < nd; ++d) {
+            nlo[d] = std::min(llo[d], rlo[d]);
+            nhi[d] = std::max(lhi[d], rhi[d]);
+        }
+        maxD[node] = std::max(maxD[l], maxD[r]);
+    }
+};
+
+// RCP_KDND_STATS=1: counters for the cost model of this backend, printed to stderr at process exit.
+// Off by default; when off nothing is counted or timed.
+struct KdNdStats {
+    bool on = false;
+    std::uint64_t calls = 0, refreshed = 0, candidates = 0, accepted = 0, n = 0, ndim = 0, rebuilds = 0;
+    double build_s = 0.0, query_s = 0.0;
+    KdNdStats() {
+        const char* s = std::getenv("RCP_KDND_STATS");
+        on = s && s[0] && s[0] != '0';
+    }
+    ~KdNdStats() {
+        if (!on || calls == 0) return;
+        const double q = refreshed ? static_cast<double>(refreshed) : 1.0;
+        std::fprintf(stderr,
+                     "[kdnd-stats] Ndim=%llu N=%llu calls=%llu rebuilds=%llu refreshed_per_call=%.2f "
+                     "candidates_per_query=%.2f accepted_per_query=%.2f build_ms_per_call=%.4f "
+                     "query_us_per_particle=%.4f\n",
+                     static_cast<unsigned long long>(ndim), static_cast<unsigned long long>(n),
+                     static_cast<unsigned long long>(calls), static_cast<unsigned long long>(rebuilds),
+                     refreshed / static_cast<double>(calls),
+                     candidates / q, accepted / q, 1e3 * build_s / calls, 1e6 * query_s / q);
+    }
+};
+static KdNdStats g_kdnd_stats;
+}  // namespace
+
+void get_pairs_kdtree_nd(
+    std::size_t N,
+    std::size_t Ndim,
+    const double* x,
+    const std::vector<double>& D,
+    const std::vector<double>& box,
+    const std::vector<std::int8_t>& walls,
+    const std::vector<std::uint32_t>& refresh,
+    const std::uint32_t* max_neighbors_per_particle,
+    const std::uint64_t* pair_offsets,
+    std::uint32_t* pairs_data,
+    std::uint32_t* out_max_observed,
+    std::uint32_t* out_min_observed,
+    double* packed_d0,
+    const double* D0_data)
+{
+    (void)walls;   // like sort+walk: minimum image on every axis (walls keep particles apart)
+    if (N == 0) {
+        if (out_max_observed) *out_max_observed = 0;
+        if (out_min_observed) *out_min_observed = 0;
+        ++g_pairs_version;
+        return;
+    }
+    // Shell thickness exactly as sort+walk computes it.
+    const double Dmax = *std::max_element(D.begin(), D.end());
+    const double Dmin = *std::min_element(D.begin(), D.end());
+    std::vector<double> Dsorted = D;
+    std::nth_element(Dsorted.begin(), Dsorted.begin() + N / 2, Dsorted.end());
+    const double median = Dsorted[N / 2];
+    double t = std::min(std::max(median * 1.02, Dmin * 2.25), Dmax) * 0.5;
+    t *= g_rcp_shell_scale_dyn;   // Cycle 21k adaptive shell
+    std::vector<double> inv_box(Ndim);
+    for (std::size_t d = 0; d < Ndim; ++d) inv_box[d] = 1.0 / box[d];
+    // The tree proposes a superset: its Euclidean, double-precision test gets a small margin
+    // over the exact test (float rounding of Dj/2, image-shift rounding).
+    const double margin = 1e-6 * Dmax;
+
+    std::vector<std::uint32_t> refreshed;
+    refreshed.reserve(N);
+    for (std::size_t k = 0; k < N; ++k)
+        if (refresh[k] == 1) refreshed.push_back(static_cast<std::uint32_t>(k));
+    const std::size_t R = refreshed.size();
+
+    // Tree maintenance: refit the existing topology (O(N Ndim)) on most calls; rebuild (O(N log N))
+    // when the particle set or dimension changed, every 32 calls, when more than 1/20 of the
+    // particles were refreshed (early, mobile regime), or while the adaptive shell is widened.
+    // The pair lists do not depend on which is done: the exact test decides membership.
+    const bool stats = g_kdnd_stats.on;
+    const auto tb0 = std::chrono::steady_clock::now();
+    static KdTreeND tree;
+    static std::size_t calls_since_rebuild = 0;
+    static std::uint64_t built_epoch = ~0ULL;   // particle renumbering (spatial reorder) scatters leaves
+    const bool rebuild = tree.built_n != N || tree.nd != Ndim || calls_since_rebuild >= 32 ||
+                         R * 20 > N || g_rcp_shell_scale_dyn > 1.0 || built_epoch != g_rcp_perm_epoch;
+    if (rebuild) {
+        tree.build(x, D.data(), N, Ndim);
+        calls_since_rebuild = 0;
+        built_epoch = g_rcp_perm_epoch;
+    }
+    else { tree.refit(x, D.data()); ++calls_since_rebuild; }
+    const auto tb1 = std::chrono::steady_clock::now();
+    if (stats) { if (rebuild) ++g_kdnd_stats.rebuilds; }
+
+    const int nthreads = omp_get_max_threads();
+    std::vector<std::vector<std::pair<std::uint32_t, std::uint32_t>>> xwrite(nthreads);
+    bool overflow = false;
+    std::string overflow_msg;
+
+    std::uint64_t cand_total = 0, acc_total = 0;
+    #pragma omp parallel reduction(+:cand_total, acc_total)
+    {
+        auto& xbuf = xwrite[omp_get_thread_num()];
+        std::vector<std::uint32_t> cand;
+        cand.reserve(512);
+        #pragma omp for schedule(dynamic, 32)
+        for (std::size_t r = 0; r < R; ++r) {
+            const std::size_t i = refreshed[r];
+            std::uint32_t* slot_i = pairs_data + pair_offsets[i];
+            slot_i[0] = 0;
+            const std::uint32_t cap_i = max_neighbors_per_particle[i];
+            const double Di = D[i];
+            const double Di_half_plus_t = Di * 0.5 + t;
+            const double* xi = x + i * Ndim;
+            cand.clear();
+            tree.query(xi, Di, t + margin, x, D.data(), box.data(), inv_box.data(), cand);
+            cand_total += cand.size();
+            {
+                for (const std::uint32_t jj : cand) {
+                    const std::size_t j = jj;
+                    if (j == i) continue;
+                    // the exact sort+walk acceptance test
+                    double dx = x[j * Ndim] - xi[0];
+                    dx -= std::nearbyint(dx * inv_box[0]) * box[0];
+                    const double r_c = Di_half_plus_t + static_cast<double>(static_cast<float>(D[j] * 0.5));
+                    if (!(std::fabs(dx) < r_c)) continue;
+                    double d2 = dx * dx;
+                    for (std::size_t d = 1; d < Ndim; ++d) {
+                        double dz = x[j * Ndim + d] - xi[d];
+                        dz -= std::nearbyint(dz * inv_box[d]) * box[d];
+                        d2 += dz * dz;
+                    }
+                    if (d2 >= r_c * r_c) continue;
+                    ++acc_total;
+                    if (j > i) {
+                        std::uint32_t& cnt = slot_i[0];
+                        bool dup = false;   // defensive: a row never holds the same j twice
+                        for (std::uint32_t kk = 1; kk <= cnt; ++kk)
+                            if (slot_i[kk] == jj) { dup = true; break; }
+                        if (dup) continue;
+                        if (cnt < cap_i) {
+                            ++cnt;
+                            slot_i[cnt] = jj;
+                        } else {
+                            #pragma omp critical(warn_neighbor_overflow_kdnd)
+                            if (!overflow) {
+                                overflow = true;
+                                overflow_msg = rcp_nb_overflow_msg("kdtree-nd own-write", i, cap_i);
+                            }
+                        }
+                    } else if (refresh[j] == 0) {
+                        xbuf.emplace_back(jj, static_cast<std::uint32_t>(i));
+                    }
+                    // else: j < i and refreshed -> j's own query stores the pair
+                }
+            }
+        }
+    }
+    if (stats) {
+        const auto tq1 = std::chrono::steady_clock::now();
+        g_kdnd_stats.calls += 1; g_kdnd_stats.refreshed += R; g_kdnd_stats.n = N; g_kdnd_stats.ndim = Ndim;
+        g_kdnd_stats.candidates += cand_total; g_kdnd_stats.accepted += acc_total;
+        g_kdnd_stats.build_s += std::chrono::duration<double>(tb1 - tb0).count();
+        g_kdnd_stats.query_s += std::chrono::duration<double>(tq1 - tb1).count();
+    }
+    // rows touched this call: the refreshed ones (rebuilt) and the cross-write recipients. Only
+    // these can be unsorted; every other row is unchanged since its last sort (as in the 3D kd-tree).
+    std::vector<std::uint32_t> dirty(refreshed);
+    static std::vector<std::uint8_t> is_dirty;
+    if (is_dirty.size() != N) is_dirty.assign(N, 0);
+    for (const std::uint32_t k : refreshed) is_dirty[k] = 1;
+    // cross-writes into unrefreshed rows, serially, with the same dedup and capacity rule
+    for (int th = 0; th < nthreads && !overflow; ++th) {
+        for (const auto& jp : xwrite[th]) {
+            const std::uint32_t j = jp.first, iw = jp.second;
+            std::uint32_t* slot_j = pairs_data + pair_offsets[j];
+            const std::uint32_t cntj = slot_j[0];
+            bool dup = false;
+            for (std::uint32_t kk = 1; kk <= cntj; ++kk)
+                if (slot_j[kk] == iw) { dup = true; break; }
+            if (dup) continue;
+            if (cntj < max_neighbors_per_particle[j]) {
+                slot_j[0] = cntj + 1;
+                slot_j[cntj + 1] = iw;
+                if (!is_dirty[j]) { is_dirty[j] = 1; dirty.push_back(j); }
+            } else {
+                overflow = true;
+                overflow_msg = rcp_nb_overflow_msg("kdtree-nd cross-write", j, max_neighbors_per_particle[j]);
+                break;
+            }
+        }
+    }
+    for (const std::uint32_t k : dirty) is_dirty[k] = 0;   // reset for the next call (also on overflow)
+    if (overflow) throw std::runtime_error(overflow_msg);
+
+    // canonical form, as sort+walk: every row sorted (only touched rows can be out of order)
+    #pragma omp parallel for schedule(dynamic, 64)
+    for (std::size_t r = 0; r < dirty.size(); ++r) {
+        const std::size_t i = dirty[r];
+        std::uint32_t* slot = pairs_data + pair_offsets[i];
+        const std::uint32_t cnt = slot[0];
+        if (cnt > 1) std::sort(slot + 1, slot + 1 + cnt);
+        if (packed_d0) {
+            double* pk = packed_d0 + pair_offsets[i];
+            for (std::uint32_t k = 1; k <= cnt; ++k) pk[k] = D0_data[slot[k]];
+        }
+    }
+    if (out_max_observed || out_min_observed) {
+        std::uint32_t lmax = 0, lmin = std::numeric_limits<std::uint32_t>::max();
+        #pragma omp parallel for schedule(static) reduction(max:lmax) reduction(min:lmin)
+        for (std::size_t i = 0; i < N; ++i) {
+            const std::uint32_t c = pairs_data[pair_offsets[i]];
+            if (c > lmax) lmax = c;
+            if (c < lmin) lmin = c;
+        }
+        if (out_max_observed) *out_max_observed = lmax;
+        if (out_min_observed) *out_min_observed = lmin;
+    }
+    ++g_pairs_version;
+}
+
 // Dispatch wrapper. The 5 call sites in run_packing_observed call this
 // instead of get_pairs_nd_3 directly. Backend behavior:
 //   - SortWalk: production path, identical to before scaffolding
@@ -3547,12 +3985,36 @@ static void get_pairs_dispatch(
     const double* D0_data)
 {
     PairsBackend backend = rcp_pairs_backend();
-    // Cycle 21h: the kdtree is structurally Ndim <= 3 (H18 float bbox[3]).
-    // The code is general-purpose across dimensions, so for Ndim > 3 the
-    // dimension-generic sort+walk backend is used regardless of the
-    // default/env selection.
-    if (Ndim > 3 && backend != PairsBackend::SortWalk) {
-        backend = PairsBackend::SortWalk;
+    // Cycle 21h: the 2D/3D kdtree is structurally Ndim <= 3 (H18 float bbox[3]).
+    // [227] Ndim >= 4 has its own dimension-generic k-d tree (get_pairs_kdtree_nd), which
+    // reproduces sort+walk's neighbour lists exactly; RCP_PAIRS_BACKEND=sortwalk selects the
+    // old path and =shadow runs both and compares every call.
+    if (Ndim > 3) {
+        if (backend == PairsBackend::SortWalk) {
+            get_pairs_nd_3(N, Ndim, x, D, box, walls, refresh,
+                           max_neighbors_per_particle, pair_offsets, pairs_data,
+                           out_max_observed, out_min_observed, packed_d0, D0_data);
+            return;
+        }
+        if (backend == PairsBackend::KdTree) {
+            get_pairs_kdtree_nd(N, Ndim, x, D, box, walls, refresh,
+                                max_neighbors_per_particle, pair_offsets, pairs_data,
+                                out_max_observed, out_min_observed, packed_d0, D0_data);
+            return;
+        }
+        const std::uint64_t total_nd = pair_offsets[N];
+        static thread_local std::vector<std::uint32_t> shadow_nd;
+        if (shadow_nd.size() != total_nd) shadow_nd.resize(total_nd);
+        std::memcpy(shadow_nd.data(), pairs_data, total_nd * sizeof(std::uint32_t));
+        std::uint32_t smax = 0, smin = std::numeric_limits<std::uint32_t>::max();
+        get_pairs_kdtree_nd(N, Ndim, x, D, box, walls, refresh,
+                            max_neighbors_per_particle, pair_offsets, shadow_nd.data(),
+                            &smax, &smin, nullptr, nullptr);
+        get_pairs_nd_3(N, Ndim, x, D, box, walls, refresh,
+                       max_neighbors_per_particle, pair_offsets, pairs_data,
+                       out_max_observed, out_min_observed, packed_d0, D0_data);
+        compare_pairs_sets(N, pair_offsets, pairs_data, shadow_nd.data());
+        return;
     }
     if (backend == PairsBackend::SortWalk) {
         get_pairs_nd_3(N, Ndim, x, D, box, walls, refresh,
@@ -3618,7 +4080,8 @@ void get_forces_nd_3(
     // active-only diameter sum. nullptr / negative -> standard path (byte-identical):
     // the masked dkappa terms below reduce EXACTLY to the originals.
     const double* rk_data,
-    double sumD_active)
+    double sumD_active,
+    SwapEdgeSink* swap_sink)
 {
     double K = 1.0;
 
@@ -3790,6 +4253,15 @@ void get_forces_nd_3(
             xs[k] = static_cast<float>(x_data[k]);
     }
     const float* x_shadow = use_fp32_stub ? g_x_shadow.data() : nullptr;
+    // SWAP near-pair collection (only when a sink is supplied, i.e. on sweep steps).
+    const double swap_margin = swap_sink ? swap_sink->margin : 0.0;
+    if (swap_sink) {
+        // capacity = every pair-list entry (worst case all near)
+        std::size_t total_entries = 0;
+        if (swap_sink->want_edges)
+            for (std::size_t i = 0; i < N; ++i) total_entries += pairs_data[pair_offsets[i]];
+        swap_sink->reset(nthreads, total_entries, N);
+    }
     #pragma omp parallel default(none) \
         shared(x_data, pairs_data, pair_offsets, D_data, box_data, inv_box, \
                F_data, z_data, N, Ndim, K, F_stride, z_stride, \
@@ -3797,13 +4269,17 @@ void get_forces_nd_3(
                g_floop_test_cycles, g_floop_overlap_cycles, probe, \
                extra_mic, mic_scale, use_simd3, use_simd2, \
                g_fl_lo, g_fl_hi, packed_d0, kappa, use_packed, \
-               use_fp32_stub, x_shadow, rk_data) \
+               use_fp32_stub, x_shadow, rk_data, swap_sink, swap_margin) \
         reduction(+:U_red, Lc_red, dkappa_red, Fmean_red, count_red) \
         reduction(max:max_min_red)
     {
         const int tid = omp_get_thread_num();
         double*      F_t = F_data + tid * F_stride;
         std::size_t* z_t = z_data + tid * z_stride;
+        SwapEdge* swap_edges = (swap_sink && swap_sink->want_edges) ? swap_sink->per_thread[tid].data() : nullptr;
+        std::size_t swap_n = 0;
+        double* swap_g = (swap_sink && swap_sink->want_gsum)
+            ? swap_sink->gsum_thread.data() + static_cast<std::size_t>(tid) * swap_sink->gstride : nullptr;
         std::uint64_t tls_cycles = 0;
         std::uint64_t tls_candidates = 0;
         std::uint64_t tls_overlaps = 0;
@@ -3936,6 +4412,22 @@ void get_forces_nd_3(
                     const __mmask8 m = lanemask &
                         _mm512_cmp_pd_mask(d2v, r2_v, _CMP_LT_OQ);
                     tls_candidates += remaining >= 8 ? 8 : remaining;
+                    if (swap_edges) {   // SWAP: collect near pairs
+                        const __m512d cm_v = _mm512_add_pd(r_v, _mm512_set1_pd(swap_margin));
+                        unsigned nm = lanemask & _mm512_cmp_pd_mask(
+                            d2v, _mm512_mul_pd(cm_v, cm_v), _CMP_LT_OQ);
+                        if (nm) {
+                            alignas(64) double d2s[8];
+                            _mm512_store_pd(d2s, d2v);
+                            while (nm) {
+                                const int ln = __builtin_ctz(nm);
+                                nm &= nm - 1;
+                                swap_edges[swap_n++] = {static_cast<std::uint32_t>(i),
+                                                        static_cast<std::uint32_t>(pi[jdx + ln]),
+                                                        d2s[ln]};
+                            }
+                        }
+                    }
                     if (!m) continue;
 
                     alignas(64) double d2_arr[8], r_arr[8];
@@ -3975,6 +4467,7 @@ void get_forces_nd_3(
                         }
                         dkappa_red = dkappa_red + K * (rk_data ? (rk_data[i] + rk_data[j]) : r_ij) * (dist - r_ij);
                         Fmean_red = Fmean_red + F_mag;
+                        if (swap_g) { swap_g[i] += r_ij - dist; swap_g[j] += r_ij - dist; }   // SWAP proxy
                     }
                 }
                 // Cycle 21b: masked block covers the tail — nothing left
@@ -4041,6 +4534,22 @@ void get_forces_nd_3(
                     const __mmask8 m = lanemask &
                         _mm512_cmp_pd_mask(d2v, r2_v, _CMP_LT_OQ);
                     tls_candidates += remaining >= 8 ? 8 : remaining;
+                    if (swap_edges) {   // SWAP: collect near pairs
+                        const __m512d cm_v = _mm512_add_pd(r_v, _mm512_set1_pd(swap_margin));
+                        unsigned nm = lanemask & _mm512_cmp_pd_mask(
+                            d2v, _mm512_mul_pd(cm_v, cm_v), _CMP_LT_OQ);
+                        if (nm) {
+                            alignas(64) double d2s[8];
+                            _mm512_store_pd(d2s, d2v);
+                            while (nm) {
+                                const int ln = __builtin_ctz(nm);
+                                nm &= nm - 1;
+                                swap_edges[swap_n++] = {static_cast<std::uint32_t>(i),
+                                                        static_cast<std::uint32_t>(pi[jdx + ln]),
+                                                        d2s[ln]};
+                            }
+                        }
+                    }
                     if (!m) continue;
 
                     alignas(64) double d2_arr[8], r_arr[8];
@@ -4078,6 +4587,7 @@ void get_forces_nd_3(
                         }
                         dkappa_red = dkappa_red + K * (rk_data ? (rk_data[i] + rk_data[j]) : r_ij) * (dist - r_ij);
                         Fmean_red = Fmean_red + F_mag;
+                        if (swap_g) { swap_g[i] += r_ij - dist; swap_g[j] += r_ij - dist; }   // SWAP proxy
                     }
                 }
                 jdx = numNbr + 1;
@@ -4109,6 +4619,12 @@ void get_forces_nd_3(
                 // force. Ratio = rejection rate of the shell-margin pairs
                 // (the ones in list but with current distance > sum-of-radii).
                 ++tls_candidates;
+                if (swap_edges) {   // SWAP: collect near pairs, branch-free append
+                    const double cm = r_ij + swap_margin;
+                    swap_edges[swap_n] = {static_cast<std::uint32_t>(i),
+                                          static_cast<std::uint32_t>(j), d2};
+                    swap_n += (d2 < cm * cm) ? 1u : 0u;
+                }
 
                 const double r_ij_sq = r_ij * r_ij;
                 if (d2 < r_ij_sq) {
@@ -4135,10 +4651,13 @@ void get_forces_nd_3(
 
                     dkappa_red = dkappa_red + K * (rk_data ? (rk_data[i] + rk_data[j]) : r_ij) * (dist - r_ij);
                     Fmean_red = Fmean_red + F_mag;
+                    if (swap_g) { swap_g[i] += r_ij - dist; swap_g[j] += r_ij - dist; }   // SWAP proxy
                 }
             }
         }
 
+        if (swap_edges) swap_sink->count[tid] = swap_n;   // SWAP: publish edge count
+        if (swap_g) { swap_sink->g_lo[tid] = tls_lo; swap_sink->g_hi[tid] = tls_hi; }  // SWAP: g dirty range
         // Cycle 21e: publish this thread's touched range for the
         // range-limited zero (next call) and reduce (below).
         if (tid < 64) {
@@ -4185,6 +4704,22 @@ void get_forces_nd_3(
         const std::size_t base = i * Ndim;
         for (std::size_t d = 0; d < Ndim; ++d) F[base + d] += Fi_local[d];
         z[i] += zi;
+    }
+    if (swap_sink && swap_sink->want_gsum) {   // SWAP proxy: reduce per-thread g over
+        double* g_out = swap_sink->gsum.data();  // each thread's touched range only
+        const std::size_t* glo = swap_sink->g_lo.data();
+        const std::size_t* ghi = swap_sink->g_hi.data();
+        const double* gbase = swap_sink->gsum_thread.data();
+        const std::size_t gstride = swap_sink->gstride;
+        #pragma omp parallel for schedule(static)
+        for (std::size_t i = 0; i < N; ++i) {
+            double gi = 0.0;
+            for (int tt = 0; tt < nthreads; ++tt) {
+                if (i < glo[tt] || i >= ghi[tt]) continue;
+                gi += gbase[static_cast<std::size_t>(tt) * gstride + i];
+            }
+            g_out[i] = gi;
+        }
     }
     g_t_forces_reduce.end();
 
@@ -4457,10 +4992,9 @@ std::pair<PackingResult, PackingTrace> run_packing_observed(
         phi_modifier = sphere_volume(1 / 2., -walls[0]);
     }
 
-    if (fix_height)
-    {
-        box[Ndim - 1] = box[Ndim - 1] * D[0];
-    }
+    // [226] fix_height: the box arrives REALIZED (the initializer already set box[Ndim-1] = multiple x the largest
+    // diameter, and both Packing and run_packing pass that box on). Multiplying by D[0] again here shrank the height
+    // below one particle diameter (and D[0] is the largest particle only before the first spatial reorder).
 
     // Cycle 15o: caller can override the dim-specific initial phi.
     if (options.has_initial_phi_target) {
@@ -4536,13 +5070,39 @@ std::pair<PackingResult, PackingTrace> run_packing_observed(
         const std::uint32_t base = (neighborMax > 0) ? neighborMax : 200;
         const double scaling = static_cast<double>(Ndim) / 3.0;
         const double omega   = 1.0 + static_cast<double>(Ndim) / 6.0;
+        // [227] Ndim >= 4 with the AUTOMATIC base (neighbor_max = 0): the table base of 5500 reserves
+        // ~7,400 (4D) to ~14,800 (8D) slots per particle against a measured need of 39 / 79 / 150
+        // (max, monodisperse jammed, 4D / 5D / 6D) — at N = 2M in 5D that is ~74 GB of address space,
+        // more than the allocator grants on typical machines. Instead the cap is 4 x the expected
+        // number of neighbours inside the search shell of a jammed packing, plus 100: centres inside
+        // the reach ball R_i = (D_i + 1.01 Dmax)/2 + t, i.e. phi_J(d) R_i^d / <(D/2)^d>, with
+        // phi_J(d) = 0.448 x 0.66^(d-4) (fit to the measured 0.448 / 0.300 / 0.193). Scale-free and
+        // per particle (large particles get more). A user-supplied neighbor_max keeps the rule above;
+        // 2D and 3D are unchanged. Capacity never changes results, only whether a run fits.
+        double est_coef = 0.0, est_dmax = 0.0, est_t = 0.0;
+        if (Ndim >= 4 && N > 0 && config.neighbor_max == 0) {
+            est_dmax = *std::max_element(D.begin(), D.end());
+            std::vector<double> Ds(D.begin(), D.end());
+            std::nth_element(Ds.begin(), Ds.begin() + N / 2, Ds.end());
+            est_t = std::min(std::max(Ds[N / 2] * 1.02, dmin * 2.25), est_dmax) * 0.5;
+            double mean_vol = 0.0;
+            for (std::size_t i = 0; i < N; ++i) mean_vol += std::pow(D[i] * 0.5, static_cast<double>(Ndim));
+            mean_vol /= static_cast<double>(N);
+            const double phi_j = 0.448 * std::pow(0.66, static_cast<double>(Ndim) - 4.0);
+            if (mean_vol > 0.0) est_coef = 4.0 * phi_j / mean_vol;
+        }
         max_nb_out.assign(N, 0);
         offsets_out.assign(N + 1, 0);
         std::uint64_t off = 0;
         for (std::size_t i = 0; i < N; ++i) {
             const double ratio = D[i] / dmin;
-            const double cap_d = scaling *
+            double cap_d = scaling *
                 (50.0 * std::pow(ratio, omega) + static_cast<double>(base));
+            if (est_coef > 0.0) {
+                const double reach = (D[i] + 1.01 * est_dmax) * 0.5 + est_t;
+                cap_d = est_coef * std::pow(reach, static_cast<double>(Ndim)) + 100.0;
+                cap_d = std::min(cap_d, static_cast<double>(N));   // before the integer cast
+            }
             std::uint32_t cap = static_cast<std::uint32_t>(std::ceil(cap_d));
             if (static_cast<std::uint64_t>(cap) > N) {
                 cap = static_cast<std::uint32_t>(N);
@@ -4711,6 +5271,8 @@ std::pair<PackingResult, PackingTrace> run_packing_observed(
     // (Y, X, cycles) and the rung-1 deadline, ~lines 5180+ and ~5755). Keep the
     // two in sync if the schedule constants change.
     const std::size_t step_cap = [&]() -> std::size_t {
+        if (config.max_steps > 0)                                   // fail-soft cap [log 043]
+            return static_cast<std::size_t>(config.max_steps);
         if (options.max_steps > 0) return options.max_steps;        // passable override
         int Y = 2, X = 9; std::size_t cycles = 2;                   // RCP_SPEED=quick default
         if (const char* sp = std::getenv("RCP_SPEED")) {
@@ -4746,6 +5308,8 @@ std::pair<PackingResult, PackingTrace> run_packing_observed(
     std::vector<double> mu_hist(hist_size, 0.0);
     std::vector<double> alpha_hist(hist_size, 0.0);
     std::vector<std::int8_t> mu_flag_hist(hist_size, 0);
+    std::vector<float> zpos_hist(config.record_visibility ? hist_size : 0, 0.f);
+    std::vector<float> mueff_hist(config.record_visibility ? hist_size : 0, 0.f);
 
     double phi_min = 0.8;
     if (Ndim == 2) { phi_min = 0.76; }
@@ -4785,6 +5349,9 @@ std::pair<PackingResult, PackingTrace> run_packing_observed(
         return (v > 0.0) ? v : 2.5e-4;
     }();
     double mu = options.has_mu_override ? options.mu_override : initial_mu_default;
+    const double mu1_ref = mu;                 // mu-hold reference (rung-1 mu) [log 071]
+    long mu_hold_applied = 0;
+    double mu_ctrl_mult = config.mu_hold_mult;  // visibility controller state [log 073]
     bool runtime_fix_diameter = options.fix_diameter;
     bool target_phi_locked = false;
     int mu_flag = 1;
@@ -4831,6 +5398,102 @@ std::pair<PackingResult, PackingTrace> run_packing_observed(
     // un-reordered baseline particle-by-particle.
     std::vector<std::size_t> particle_origin(N);
     for (std::size_t k = 0; k < N; ++k) particle_origin[k] = k;
+
+    // Diameter-SWAP (additive). Everything guarded by swap_on; when config.swap == 0
+    // no swap code touches any array the packing loop reads (constraint C4).
+    const bool swap_on = config.swap > 0.0;
+    SwapParams swap_params;
+    swap_params.swap = config.swap;
+    swap_params.interval = std::max(1, config.swap_interval);
+    swap_params.mode = config.swap_mode;
+    swap_params.rank_window = config.swap_rank_window;
+    swap_params.size_tol = config.swap_size_tol;
+    swap_params.eps = config.swap_eps;
+    swap_params.start = config.swap_start;
+    swap_params.stop = config.swap_stop;
+    swap_params.phase = config.swap_phase;
+    swap_params.adam = config.swap_adam;
+    swap_params.max_per_particle = config.swap_max_per_particle;
+    swap_params.exact = config.swap_exact;
+    swap_params.window_rel = config.swap_window_rel;
+    swap_params.rank_space = config.swap_rank_space;
+    swap_params.ctrl = config.swap_ctrl;
+    swap_params.target_a = config.swap_a;
+    swap_params.target_R = config.swap_R;
+    swap_params.ctrl_eta = config.swap_eta;
+    swap_params.w_min = config.swap_wmin;
+    swap_params.w_max = config.swap_wmax;
+    swap_params.s_max = config.swap_smax;
+    swap_params.floor_budget = config.swap_floor_budget;
+    swap_params.rescue = config.swap_rescue;
+    swap_params.rescue_w = config.swap_rescue_w;
+    swap_params.rescue_interval = config.swap_rescue_interval;
+    swap_params.cycle3 = config.swap_cycle3;
+    swap_params.event_log_stride = config.swap_event_log_stride;
+    swap_params.event_log_cap = config.swap_event_log_cap;
+    swap_params.event_log_geom = config.swap_event_log_geom;
+    swap_params.geo = config.swap_geo;
+    swap_params.geo_T = config.swap_geo_T;
+    swap_params.geo_T_end = config.swap_geo_T_end;       // [135] H9 annealing
+    swap_params.geo_T_decay = config.swap_geo_T_decay;
+    swap_params.geo_w = config.swap_geo_w;
+    swap_params.geo_B = config.swap_geo_B;
+    swap_params.geo_k = std::max<long>(1, config.swap_geo_k);
+    swap_params.geo_start = config.swap_geo_start;
+    swap_params.geo_stop = config.swap_geo_stop;
+    swap_params.geo_cycle = config.swap_geo_cycle;             // H2 [117]
+    swap_params.geo_cycle_cap = config.swap_geo_cycle_cap;
+    swap_params.geo_cycle4 = config.swap_geo_cycle4;           // H34 [194]
+    swap_params.geo_cycle4_cap = config.swap_geo_cycle4_cap;
+    swap_params.geo_capk = config.swap_geo_capk;               // H7 [121/122]
+    swap_params.geo_cage = config.swap_geo_cage;               // H8 [129/130/131]
+    swap_params.geo_bottleneck = config.swap_geo_bottleneck;   // H12 [146/148]
+    swap_params.geo_cage_move = config.swap_geo_cage_move;     // [133] diagnostic position move
+    swap_params.geo_nonsep = config.swap_geo_nonsep;          // [172] H19 non-separable comparator
+    swap_params.geo_ctarget = config.swap_geo_ctarget;
+    swap_params.geo_nsk = config.swap_geo_nsk;
+    swap_params.geo_nonsep_start = config.swap_geo_nonsep_start;   // [190] H26 window
+    swap_params.geo_nonsep_stop = config.swap_geo_nonsep_stop;
+    swap_params.geo_capmode = config.swap_geo_capmode;
+    swap_params.idle_frac = config.swap_idle_frac;
+    SwapEngine swap_engine(swap_params, static_cast<std::uint64_t>(config.seed));
+    std::vector<std::uint32_t> swap_touched;
+    std::vector<double> swap_log_buf;      // per sweep: [step, mu_flag, cand, acc, dE, phi, contacts, e_scale]
+    std::uint64_t swap_total_accepted = 0;
+    SwapEdgeSink swap_sink;                // near-pair edges collected by get_forces_nd_3 on sweep steps
+    std::vector<double> swap_D0_layout;    // D0 at the last pair-layout computation (capacity guard)
+    bool swap_need_relayout = false;
+    std::size_t swap_relayouts = 0;
+    std::size_t swap_next_step = static_cast<std::size_t>(std::max<long>(0, swap_params.start));
+    std::size_t swap_cur_interval = static_cast<std::size_t>(swap_params.interval);
+    // [219] DISTRIBUTION MORPH state (inert unless morph_target is set): rank-keyed quantile interpolation
+    // of D0 from its state at morph_start toward the (sorted, volume-matched) target; feedback on max overlap.
+    const bool morph_on = !config.morph_target.empty();
+    const bool quench_on = config.quench_mode != 0;                      // [221]
+    const bool mu_pinned = config.mu_pin > 0.0 || quench_on;
+    std::vector<double> q_v(quench_on ? N * Ndim : 0, 0.0);              // FIRE velocities
+    std::vector<char> q_held(N, 0);
+    std::vector<char> q_light(N, 0);    // [223] two-level: 1 = relaxed by the local overdamped step, excluded from FIRE's sums
+    double q_dt = config.quench_dt0, q_alpha = config.quench_alpha0; long q_npos = 0, q_iter = 0;
+    std::vector<double> q_act; double q_act_med = 0.0;   // [224] activity-gated dissipation state
+    double q_res = 1.0, q_gres = 1.0; bool q_converged = false;
+    // [225] give-up triggers and wall bookkeeping. Wall contacts enter F in the force kernel but not z or the
+    // per-particle contact-force sums, so the quench adds them here; with no walls none of this runs.
+    int q_status = 0; long q_unjam_streak = 0, q_stall_ref_iter = 0; double q_stall_ref = -1.0; bool q_any_held = false;
+    std::vector<double> q_wall_s; std::vector<int> q_wall_n;
+    std::vector<double> q_log; std::vector<double> q_held_force(Ndim, 0.0); std::vector<double> q_minv;
+    bool morph_armed = false;               // reference captured at the first update step
+    double morph_lambda = 0.0, morph_rate = config.morph_rate0, morph_ref_maxov = 0.0, morph_vol0 = 0.0;
+    long morph_ok_streak = 0, morph_updates = 0, morph_holds = 0;
+    double morph_rate_ceiling = config.morph_rate_max;   // lowered to the last hold-free sustained rate on every trip
+    double morph_kappa0 = 0.0;                            // tracking baseline for the deflation guard (EMA over morph_kappa_tau updates)
+    double morph_last_safe = 0.0;                         // largest increment sustained for morph_grow_after in-band updates
+    long morph_hold_streak = 0;                           // consecutive held updates (kappa-lag stall detector)
+    bool morph_stalled = false;
+    std::vector<double> morph_q_start, morph_q_target;   // ascending quantile tables (size N)
+    std::vector<std::uint32_t> morph_order;              // argsort of D0 (ascending), rebuilt when the permutation epoch changes
+    std::uint64_t morph_order_epoch = ~0ULL;              // epoch at which morph_order was built (reorders/trades bump it)
+    std::vector<double> morph_log_buf;                   // 5 per update: step, lambda, increment, maxov, held
 
     // Cycle 17 H6 fix: moved accumulated_refresh declaration here (was at
     // line ~3956) so the reorder lambda below can capture it by reference.
@@ -4909,6 +5572,12 @@ std::pair<PackingResult, PackingTrace> run_packing_observed(
         apply_perm_flat(v_update_flat);
         apply_perm_flat(m_hat_flat);
         apply_perm_flat(v_hat_flat);
+        if (!q_v.empty()) apply_perm_flat(q_v);          // [221] FIRE velocities follow their particles through the reorder
+        if (quench_on) {
+            std::vector<char> th(N); for (std::size_t k = 0; k < N; ++k) th[k] = q_held[perm[k]]; q_held.swap(th);
+            { std::vector<char> tl(N); for (std::size_t k = 0; k < N; ++k) tl[k] = q_light[perm[k]]; q_light.swap(tl); }
+            if (q_minv.size() == N) { std::vector<double> tm(N); for (std::size_t k = 0; k < N; ++k) tm[k] = q_minv[perm[k]]; q_minv.swap(tm); }
+        }
         // Cycle 17 H6 fix: reorder triggers full pair-list rebuild via
         // `refresh = [1,1,...]` at line below, so K-batched accumulated
         // refresh flags are no longer relevant — zero them. Original code
@@ -4945,6 +5614,19 @@ std::pair<PackingResult, PackingTrace> run_packing_observed(
         x_last = x;
         D_last = D;
         shell_refill_anchor();   // Cycle 21k
+        // SWAP: index<->particle mapping changed; rank tables are rebuilt lazily and
+        // the per-particle swap counters travel with the particles. The layout was
+        // just recomputed from the current D -> snapshot D0 for the capacity guard.
+        if (swap_on) {
+            swap_D0_layout = D0;
+            swap_engine.invalidate_ranks();
+            auto& sc = swap_engine.swap_counts();
+            if (sc.size() == N) {
+                std::vector<std::uint64_t> tmp(N);
+                for (std::size_t k = 0; k < N; ++k) tmp[k] = sc[perm[k]];
+                sc = std::move(tmp);
+            }
+        }
     };
 
     alpha = 0.005;
@@ -4967,6 +5649,7 @@ std::pair<PackingResult, PackingTrace> run_packing_observed(
     // ===== profile timer reset (instrumentation) =====
     g_t_pairs.reset(); g_t_forces.reset(); g_t_adam.reset();
     g_t_position.reset(); g_t_refresh.reset(); g_t_bookkeep.reset();
+    g_t_swap.reset();
     g_t_forces_alloc.reset(); g_t_forces_xflat.reset();
     g_t_forces_pflat.reset(); g_t_forces_loop.reset();
     g_t_forces_reduce.reset();
@@ -4984,6 +5667,8 @@ std::pair<PackingResult, PackingTrace> run_packing_observed(
     ++g_rcp_perm_epoch;
     // Cycle 21k: the adaptive shell scale is static — reset per run.
     g_rcp_shell_scale_dyn = 1.0;
+    // checkpoint-deterministic mode for this run [log 044/B4]
+    g_rcp_ckpt_deterministic = !config.checkpoint_path.empty();
     auto profile_wall_start = std::chrono::steady_clock::now();
 
     rcp_rss_probe("pre-init-reorder");
@@ -5508,6 +6193,291 @@ std::pair<PackingResult, PackingTrace> run_packing_observed(
             }
         }
     }
+    if (swap_on && swap_D0_layout.size() != N) swap_D0_layout = D0;   // capacity-guard baseline
+
+    // ===================== checkpoint v3 [log 043] ==================================
+    // Periodic bitwise state checkpoints + resume. Opt-in via config.checkpoint_path.
+    // Layout: header (magic RCPS, ver 3, N, Ndim, step, seed, step_cap), a fixed
+    // 16-double inspector block (analysis/ckpt_inspect.py mirrors it), then the full
+    // opaque state in the exact order below (save/load are symmetric; a mismatch is
+    // a hard error, never a silent skip). Pair rows are dumped SPARSELY (count +
+    // occupied slots) so the lazy capacity buffer's untouched pages stay untouched.
+    const bool ckpt_on = !config.checkpoint_path.empty();
+    if (ckpt_on && (capture_positions || trajectory_interval > 0))
+        throw std::runtime_error("[ckpt] checkpointing does not support trajectory capture");
+    std::size_t ckpt_resumed_from = 0;
+    std::size_t ckpt_last_step_written = 0;
+    auto ckpt_wall_last = std::chrono::steady_clock::now();
+    auto ckpt_write = [&](std::size_t at_step) -> bool {
+        if (!ckpt_on) return true;
+        const std::string tmpp = config.checkpoint_path + ".tmp";
+        std::FILE* fp = std::fopen(tmpp.c_str(), "wb");
+        if (!fp) { std::cerr << "[ckpt] fopen failed: " << tmpp << "\n"; return false; }
+        bool ok = true;
+        auto W = [&](const void* q, std::size_t n) { ok = ok && std::fwrite(q, 1, n, fp) == n; };
+        auto WV = [&](const auto& vec) {
+            const std::uint64_t n = vec.size(); W(&n, 8);
+            if (n) W(vec.data(), n * sizeof(vec[0]));
+        };
+        auto WPFX = [&](const auto& vec, std::size_t used) {
+            const std::uint64_t n = std::min<std::uint64_t>(used, vec.size()); W(&n, 8);
+            if (n) W(vec.data(), static_cast<std::size_t>(n) * sizeof(vec[0]));
+        };
+#define RCP_CK(v) W(&(v), sizeof(v))
+        if (x.size() != N * Ndim || D0.size() != N || D.size() != N ||
+            box.size() != Ndim || particle_origin.size() != N) {
+            std::fclose(fp);
+            std::cerr << "[ckpt] REFUSING to write: state arrays moved-out/mis-sized"
+                      << " (x=" << x.size() << " D=" << D.size() << " D0=" << D0.size()
+                      << " box=" << box.size() << " origin=" << particle_origin.size()
+                      << ")\n";
+            return false;
+        }
+        const char magic[5] = "RCPS"; const std::uint32_t ver = 3;
+        const std::uint64_t N64 = N, Nd64 = Ndim, st64 = at_step,
+            seed64 = static_cast<std::uint64_t>(config.seed), cap64 = step_cap;
+        W(magic, 4); RCP_CK(ver); RCP_CK(N64); RCP_CK(Nd64); RCP_CK(st64);
+        RCP_CK(seed64); RCP_CK(cap64);
+        const double insp[16] = { double(at_step), double(mu_flag), mu, alpha, kappa,
+            phi / phi_modifier, max_min_dist, F_magnitude, double(int(osc_phase)),
+            double(hist_filled), double(swap_total_accepted), double(swap_relayouts),
+            shell_gr_ema, F_ema, double(steps), 0.0 };
+        W(insp, sizeof(insp));
+        RCP_CK(t); RCP_CK(alpha); RCP_CK(mu); RCP_CK(kappa); RCP_CK(m_kappa);
+        RCP_CK(v_kappa); RCP_CK(v_update_kappa); RCP_CK(m_hat_kappa); RCP_CK(v_hat_kappa);
+        RCP_CK(phi); RCP_CK(coeff); RCP_CK(current_volume); RCP_CK(box_volume);
+        RCP_CK(Dmin); RCP_CK(F_magnitude); RCP_CK(max_min_dist); RCP_CK(F_ema);
+        RCP_CK(shell_gr_ema); RCP_CK(shell_kappa_prev); RCP_CK(g_rcp_shell_scale_dyn);
+        RCP_CK(mu_change); RCP_CK(LastAlphaUpdate); RCP_CK(mu_flag);
+        RCP_CK(mu_decay_active); RCP_CK(mu_decay_target); RCP_CK(mu_decay_next_tick_step);
+        RCP_CK(alpha_rung1_frozen); RCP_CK(phi_max.first); RCP_CK(phi_max.second);
+        RCP_CK(osc_phase); RCP_CK(osc_mu_0); RCP_CK(osc_mu_minus1); RCP_CK(osc_start_step);
+        RCP_CK(osc_period); RCP_CK(osc_t_relax); RCP_CK(osc_final_start_step);
+        RCP_CK(osc_consec_conv);
+        RCP_CK(steps); RCP_CK(hist_filled);
+        RCP_CK(swap_next_step); RCP_CK(swap_cur_interval); RCP_CK(swap_need_relayout);
+        RCP_CK(swap_relayouts); RCP_CK(swap_total_accepted);
+        RCP_CK(cascade_released); RCP_CK(runtime_fix_diameter); RCP_CK(target_phi_locked);
+        RCP_CK(accumulated_has_refresh); RCP_CK(update_flag);
+        RCP_CK(d0_cache.first); RCP_CK(d0_cache.second);
+        RCP_CK(D0_min_cached); RCP_CK(S_D0_cached); RCP_CK(D0_max_cached);
+        RCP_CK(agg_max_neighbors); RCP_CK(agg_min_neighbors);
+        RCP_CK(g_rcp_perm_epoch); RCP_CK(pp_window_steps);
+        RCP_CK(g_dstat_max_idx); RCP_CK(g_dstat_min_idx); RCP_CK(g_dstat_med_idx);
+        RCP_CK(g_dstat_N); RCP_CK(g_dstat_D0); RCP_CK(g_dstat_Dmid);
+        RCP_CK(g_dstat_valid); RCP_CK(g_dstat_epoch);
+        WV(box); WV(x); WV(x_last); WV(D); WV(D0); WV(D_last);
+        WV(m_flat); WV(v_flat);
+        const std::uint8_t has_aux = rcp_fused_adam() ? 0 : 1; RCP_CK(has_aux);
+        if (has_aux) { WV(v_update_flat); WV(m_hat_flat); WV(v_hat_flat); }
+        const std::uint8_t has_verlet = (method != "ADAM") ? 1 : 0; RCP_CK(has_verlet);
+        if (has_verlet)
+            for (auto* nv : {&v_max, &a, &v_verlet, &a_old})
+                for (const auto& row : *nv) WV(row);
+        WV(fixed_flags); WV(theta_anchor); WV(refresh); WV(accumulated_refresh);
+        WV(particle_origin); WV(swap_D0_layout); WV(swap_log_buf); WV(spike_log_buf);
+        const std::uint8_t has_pp = pp_enabled ? 1 : 0; RCP_CK(has_pp);
+        if (has_pp) { WV(pp_F_sq_sum); WV(pp_F_sign_flips); WV(pp_pos_min_run);
+                      WV(pp_pos_max_run); WV(pp_contact_sum); WV(pp_F_sign_prev);
+                      WV(pp_signflip_resets); }
+        const std::uint8_t has_b6a = b6a_probe_on ? 1 : 0; RCP_CK(has_b6a);
+        if (has_b6a) WV(b6a_x_prev_step);
+        WPFX(phi_history, hist_filled); WPFX(F_history, hist_filled);
+        WPFX(U_history, hist_filled); WPFX(max_overlap_history, hist_filled);
+        WPFX(mu_hist, hist_filled); WPFX(alpha_hist, hist_filled);
+        WPFX(mu_flag_hist, hist_filled);
+        WV(pair_offsets); WV(max_neighbors_per_particle);
+        const std::uint64_t pcap = pairs_data.size(); RCP_CK(pcap);
+        for (std::size_t i = 0; i < N; ++i) {
+            const std::uint32_t cnt = pairs_data[pair_offsets[i]];
+            W(&cnt, 4);
+            if (cnt) W(&pairs_data[pair_offsets[i] + 1],
+                       static_cast<std::size_t>(cnt) * 4);
+        }
+        const std::uint8_t has_pd0 =
+            (packed_d0_on && !packed_d0_mirror.empty()) ? 1 : 0;
+        RCP_CK(has_pd0);
+        if (has_pd0) WV(packed_d0_mirror);
+        ok = ok && swap_engine.save_state(fp);
+        const char tail[5] = "RCPE"; W(tail, 4);
+#undef RCP_CK
+        std::fclose(fp);
+        // debug/archival mode: negative interval keeps every write as a
+        // distinct file path.STEP (used by the resume gates to snapshot the
+        // unbroken run mid-flight)
+        const std::string outp = (config.checkpoint_interval_s < 0 || config.checkpoint_every_steps > 0)
+            ? config.checkpoint_path + "." + std::to_string(at_step)
+            : config.checkpoint_path;
+        if (ok) ok = (std::rename(tmpp.c_str(), outp.c_str()) == 0);
+        if (ok) {
+            ckpt_last_step_written = at_step;
+            if (std::FILE* hb = std::fopen((config.checkpoint_path + ".hb").c_str(), "a")) {
+                std::fprintf(hb, "%llu %llu %ld %d %.9g %.9g %.9g %.6g\n",
+                             (unsigned long long)at_step,
+                             (unsigned long long)step_cap,
+                             (long)std::time(nullptr), mu_flag,
+                             phi / phi_modifier, F_magnitude, max_min_dist, mu);
+                std::fclose(hb);
+            }
+        } else {
+            std::cerr << "[ckpt] WRITE FAILED at step " << at_step << "\n";
+        }
+        return ok;
+    };
+    auto ckpt_load = [&]() {
+        std::FILE* fp = std::fopen(config.checkpoint_path.c_str(), "rb");
+        if (!fp) return;   // no blob yet: fresh run
+        bool ok = true;
+        auto R = [&](void* q, std::size_t n) { ok = ok && std::fread(q, 1, n, fp) == n; };
+        auto RV = [&](auto& vec) {
+            std::uint64_t n = 0; R(&n, 8);
+            vec.resize(static_cast<std::size_t>(n));
+            if (n) R(vec.data(), static_cast<std::size_t>(n) * sizeof(vec[0]));
+        };
+        auto RPFX = [&](auto& vec) {
+            std::uint64_t n = 0; R(&n, 8);
+            if (n > vec.size()) { ok = false; return; }
+            if (n) R(vec.data(), static_cast<std::size_t>(n) * sizeof(vec[0]));
+        };
+#define RCP_CK(v) R(&(v), sizeof(v))
+        char magic[4]; std::uint32_t ver = 0;
+        std::uint64_t N64 = 0, Nd64 = 0, st64 = 0, seed64 = 0, cap64 = 0;
+        R(magic, 4); RCP_CK(ver);
+        if (!ok || std::memcmp(magic, "RCPS", 4) != 0 || ver != 3)
+            throw std::runtime_error("[ckpt] bad magic/version in " + config.checkpoint_path);
+        RCP_CK(N64); RCP_CK(Nd64); RCP_CK(st64); RCP_CK(seed64); RCP_CK(cap64);
+        if (N64 != N || Nd64 != Ndim ||
+            seed64 != static_cast<std::uint64_t>(config.seed))
+            throw std::runtime_error("[ckpt] fingerprint mismatch (N/Ndim/seed): "
+                                     + config.checkpoint_path);
+        // step_cap is a SESSION parameter, not physics: a max_steps-capped run and
+        // its uncapped continuation legitimately differ here (fail-soft + resume).
+        if (cap64 != step_cap)
+            std::cerr << "[ckpt] note: step_cap differs (saved " << cap64
+                      << ", now " << step_cap << ") - session parameter, continuing\n";
+        double insp[16]; R(insp, sizeof(insp)); (void)insp;
+        RCP_CK(t); RCP_CK(alpha); RCP_CK(mu); RCP_CK(kappa); RCP_CK(m_kappa);
+        RCP_CK(v_kappa); RCP_CK(v_update_kappa); RCP_CK(m_hat_kappa); RCP_CK(v_hat_kappa);
+        RCP_CK(phi); RCP_CK(coeff); RCP_CK(current_volume); RCP_CK(box_volume);
+        RCP_CK(Dmin); RCP_CK(F_magnitude); RCP_CK(max_min_dist); RCP_CK(F_ema);
+        RCP_CK(shell_gr_ema); RCP_CK(shell_kappa_prev); RCP_CK(g_rcp_shell_scale_dyn);
+        RCP_CK(mu_change); RCP_CK(LastAlphaUpdate); RCP_CK(mu_flag);
+        RCP_CK(mu_decay_active); RCP_CK(mu_decay_target); RCP_CK(mu_decay_next_tick_step);
+        RCP_CK(alpha_rung1_frozen); RCP_CK(phi_max.first); RCP_CK(phi_max.second);
+        RCP_CK(osc_phase); RCP_CK(osc_mu_0); RCP_CK(osc_mu_minus1); RCP_CK(osc_start_step);
+        RCP_CK(osc_period); RCP_CK(osc_t_relax); RCP_CK(osc_final_start_step);
+        RCP_CK(osc_consec_conv);
+        RCP_CK(steps); RCP_CK(hist_filled);
+        RCP_CK(swap_next_step); RCP_CK(swap_cur_interval); RCP_CK(swap_need_relayout);
+        RCP_CK(swap_relayouts); RCP_CK(swap_total_accepted);
+        RCP_CK(cascade_released); RCP_CK(runtime_fix_diameter); RCP_CK(target_phi_locked);
+        RCP_CK(accumulated_has_refresh); RCP_CK(update_flag);
+        RCP_CK(d0_cache.first); RCP_CK(d0_cache.second);
+        RCP_CK(D0_min_cached); RCP_CK(S_D0_cached); RCP_CK(D0_max_cached);
+        RCP_CK(agg_max_neighbors); RCP_CK(agg_min_neighbors);
+        std::uint64_t saved_epoch = 0;
+        static_assert(sizeof(g_rcp_perm_epoch) == 8, "epoch width");
+        RCP_CK(saved_epoch); RCP_CK(pp_window_steps);
+        RCP_CK(g_dstat_max_idx); RCP_CK(g_dstat_min_idx); RCP_CK(g_dstat_med_idx);
+        RCP_CK(g_dstat_N); RCP_CK(g_dstat_D0); RCP_CK(g_dstat_Dmid);
+        RCP_CK(g_dstat_valid); RCP_CK(g_dstat_epoch);
+        RV(box); RV(x); RV(x_last); RV(D); RV(D0); RV(D_last);
+        RV(m_flat); RV(v_flat);
+        std::uint8_t has_aux = 0; RCP_CK(has_aux);
+        if (has_aux) { RV(v_update_flat); RV(m_hat_flat); RV(v_hat_flat); }
+        std::uint8_t has_verlet = 0; RCP_CK(has_verlet);
+        if (has_verlet)
+            for (auto* nv : {&v_max, &a, &v_verlet, &a_old})
+                for (auto& row : *nv) RV(row);
+        RV(fixed_flags); RV(theta_anchor); RV(refresh); RV(accumulated_refresh);
+        RV(particle_origin); RV(swap_D0_layout); RV(swap_log_buf); RV(spike_log_buf);
+        std::uint8_t has_pp = 0; RCP_CK(has_pp);
+        if (has_pp) { RV(pp_F_sq_sum); RV(pp_F_sign_flips); RV(pp_pos_min_run);
+                      RV(pp_pos_max_run); RV(pp_contact_sum); RV(pp_F_sign_prev);
+                      RV(pp_signflip_resets); }
+        std::uint8_t has_b6a = 0; RCP_CK(has_b6a);
+        if (has_b6a) RV(b6a_x_prev_step);
+        RPFX(phi_history); RPFX(F_history); RPFX(U_history);
+        RPFX(max_overlap_history); RPFX(mu_hist); RPFX(alpha_hist);
+        RPFX(mu_flag_hist);
+        RV(pair_offsets); RV(max_neighbors_per_particle);
+        std::uint64_t pcap = 0; RCP_CK(pcap);
+        if (ok) {
+            pairs_data.reset(pcap, pair_offsets.data(), N);
+            for (std::size_t i = 0; i < N; ++i) {
+                std::uint32_t cnt = 0; R(&cnt, 4);
+                pairs_data[pair_offsets[i]] = cnt;
+                if (cnt) R(&pairs_data[pair_offsets[i] + 1],
+                           static_cast<std::size_t>(cnt) * 4);
+            }
+        }
+        std::uint8_t has_pd0 = 0; RCP_CK(has_pd0);
+        if (has_pd0) RV(packed_d0_mirror);
+        ok = ok && swap_engine.load_state(fp);
+        char tail[4]; R(tail, 4);
+        if (!ok || std::memcmp(tail, "RCPE", 4) != 0)
+            throw std::runtime_error("[ckpt] truncated/corrupt checkpoint: "
+                                     + config.checkpoint_path);
+        std::fclose(fp);
+#undef RCP_CK
+        // post-restore: the epoch AND the D-stat cache are restored EXACTLY -
+        // the cache is path-dependent (stale hits are part of the unbroken
+        // trajectory), so bitwise resume must reproduce its staleness [B3].
+        g_rcp_perm_epoch = saved_epoch;
+        ++g_pairs_version;   // force the force-loop's pairs_flat mirror to resync
+        start_step = static_cast<std::size_t>(st64);
+        ckpt_resumed_from = start_step;
+        ckpt_last_step_written = start_step;
+        std::cerr << "[ckpt] resumed from step " << start_step
+                  << " (" << config.checkpoint_path << ")"
+                  << " swap_log=" << swap_log_buf.size() / 8
+                  << " next_sweep=" << swap_next_step
+                  << " interval=" << swap_cur_interval
+                  << " hist=" << hist_filled << "\n";
+        if (start_step + 1 > max_steps)
+            throw std::runtime_error("[ckpt] checkpoint at/after max_steps; nothing to do");
+    };
+    if (ckpt_on) ckpt_load();
+
+    // [101] terminal-reopen state (NOT checkpointed: a resume gets a fresh
+    // reopen budget; documented semantics, keeps the v3 blob layout intact).
+    long geo_reopens_done = 0;
+    long geo_trades_at_reopen = -1;
+    bool geo_force_step = false;
+    // H12c [162]: mode-3 bneck (variant B) engages at the CONVERGED terminal via the reopen
+    // hook (geo_reopens_done>0), using the shrink-to-just-touching pass. No rung-1 / skip-decay
+    // machinery (variant A [160] reverted: it under-densified, bneck is not a densifier [161]).
+    // The reopen "relax" is a small mu-KICK [163]: turn mu up to a small value -> slight
+    // overlap (~1e-4) -> cages shift a bit -> different just-touching pairs -> a few new swaps
+    // open; ADAM continues with its existing history/lr. mu_rung1 captures the rung-1 mu so the
+    // kick is a small fraction of it (calibrated to keep overlaps tiny, no rearrangement).
+    double mu_rung1 = 0.0;
+    // [207] local quench after an injection: while step <= inj_freeze_until, every particle NOT in
+    // inj_free_mask has its position and Adam moments restored after the update (only the exchange
+    // participants move; kappa and the controller are untouched). Off unless swap_inject_freeze > 0.
+    std::vector<std::uint8_t> inj_free_mask;
+    std::size_t inj_freeze_until = 0;
+    std::vector<double> frz_x, frz_m, frz_v;
+    double frz_kappa = 0.0, frz_mk = 0.0, frz_vk = 0.0;
+    // trial bookkeeping for accept/revert: the injected pairs, the participants' pre-exchange x/m/v, U0
+    std::vector<std::pair<std::uint32_t, std::uint32_t>> inj_pairs_saved;
+    std::vector<std::uint32_t> inj_participants;
+    std::vector<double> inj_pre_x, inj_pre_m, inj_pre_v, inj_pre_D0;
+    std::vector<std::uint64_t> inj_pre_sc;
+    std::uint64_t inj_pre_geo = 0, inj_pre_cyc = 0, inj_pre_tot = 0;
+    double inj_U0 = 0.0;
+    // identity-keyed copies: the spatial reorder permutes every per-particle array, so index-based
+    // bookkeeping does not survive a relayout; particle_origin[k] is the stable identity.
+    std::vector<std::uint8_t> inj_free_origin;                         // by origin id
+    std::vector<std::uint32_t> inj_part_origin;                        // participants' origin ids (participant order)
+    std::vector<std::pair<std::uint32_t, std::uint32_t>> inj_pairs_origin;
+    std::vector<std::uint32_t> inj_idx_of_origin;                      // scratch inverse map
+    auto inj_remap_mask = [&]() {                                       // current index mask from origins
+        for (std::size_t k = 0; k < N; ++k) inj_free_mask[k] = inj_free_origin[particle_origin[k]];
+    };
+    long inj_trials = 0, inj_reverts = 0;
+    double fh_kappa_ref = kappa;   // [226] fix_height: kappa at the last box-height update
+
     for (std::size_t step = start_step + 1; step <= max_steps; ++step) {
         if ((step == 1 || step == 50 || step == 500) &&
                 std::getenv("RCP_DEBUG_LAYOUT")) {
@@ -5526,7 +6496,7 @@ std::pair<PackingResult, PackingTrace> run_packing_observed(
         // same flat window before the system can respond. Per-step cost
         // when active = one phi-range scan over 250 doubles + a compare;
         // the existing transition gates already do this on every step.
-        if (mu_decay_active && step >= mu_decay_next_tick_step && step > 250) {
+        if (!mu_pinned && mu_decay_active && step >= mu_decay_next_tick_step && step > 250) {   // [219] suspended under mu_pin
             // Reuse phi_history (already maintained for transition gates).
             // Note: decay block runs at TOP of step, before phi_history[step-1]
             // is written this iteration. Use [step-250, step-1) to avoid the
@@ -5552,7 +6522,7 @@ std::pair<PackingResult, PackingTrace> run_packing_observed(
         // took), set period = osc_period_factor * t_basin, and start the
         // oscillation at step = current step. Note mu_flag is set to -1 so
         // rung -1 logic (Method B, alpha caps, etc.) applies during osc.
-        if (osc_enabled && osc_phase == OscPhase::INACTIVE &&
+        if (!mu_pinned && osc_enabled && osc_phase == OscPhase::INACTIVE &&   // [219] suspended under mu_pin
             mu_flag == 0 && !mu_decay_active && mu_change > 0 &&
             step > mu_change) {
             // mu_change was set at the 1->0 trigger step (= t_basin).
@@ -5579,7 +6549,7 @@ std::pair<PackingResult, PackingTrace> run_packing_observed(
         //   while mu is descending from a peak. mu_ref exponentially
         //   decays from mu_0 (rung 0 floor) to mu_-1 (rung -1 floor) with
         //   timescale t_relax (the measured 1->0 decay duration).
-        if (osc_enabled && osc_phase == OscPhase::ACTIVE) {
+        if (!mu_pinned && osc_enabled && osc_phase == OscPhase::ACTIVE) {   // [219] suspended under mu_pin
             const double t_into = static_cast<double>(step - osc_start_step);
             const double cycle_progress =
                 t_into / static_cast<double>(osc_period);
@@ -5649,9 +6619,44 @@ std::pair<PackingResult, PackingTrace> run_packing_observed(
                 mu_decay_next_tick_step = step + mu_decay_cooldown;
             }
         }
-        if (osc_enabled && osc_phase == OscPhase::DONE) {
-            steps = step;
-            break;
+        if (!mu_pinned && osc_enabled && osc_phase == OscPhase::DONE) {   // [219] under mu_pin the run continues to max_steps
+            // [101] terminal reopen (opt-in, geo only): force a geo pass and
+            // re-enter FINAL_DESCENT with a fresh convergence budget. No
+            // schedule constant changes; mu stays where the descent left it.
+            // Stops when the budget is spent or the last reopen traded nothing.
+            // H12 [148]: in terminal bottleneck mode (mode 1) the reopen pass is
+            // geo_bottleneck_pass, so the sterile-stop must watch the bottleneck trade
+            // counter, not geo's. Mode 2 (H12b [152]) fires bneck during the rung, not at
+            // reopen, so its reopen loop watches geo trades normally.
+            const long reopen_trades = (config.swap_geo_bottleneck == 1 ||
+                                        config.swap_geo_bottleneck == 3)
+                ? static_cast<long>(swap_engine.geo_bottleneck_trades_)
+                : static_cast<long>(swap_engine.geo_trades_);
+            const bool reopen_armed =
+                config.swap_geo != 0 && config.swap > 0.0 &&
+                config.swap_geo_reopen > 0 &&
+                geo_reopens_done < config.swap_geo_reopen &&
+                !(geo_reopens_done > 0 && reopen_trades == geo_trades_at_reopen);
+            if (reopen_armed) {
+                ++geo_reopens_done;
+                geo_trades_at_reopen = reopen_trades;
+                geo_force_step = true;
+                osc_phase = OscPhase::FINAL_DESCENT;
+                osc_consec_conv = 0;
+                osc_final_start_step = step;
+                mu_decay_next_tick_step = step + mu_decay_cooldown;
+                // H12c [163] VARIANT B relax: at each reopen, turn mu up to a SMALL value
+                // (a small fraction of the rung-1 mu) so a slight overlap (~1e-4) reopens the
+                // cages a bit -> different just-touching pairs -> a few new bneck swaps. ADAM
+                // keeps its history/lr. Kept tiny to avoid position rearrangement (user).
+                if (config.swap_geo_bottleneck == 3 && mu_rung1 > 0.0) {
+                    mu = mu_rung1 * rcp_bneck_kick_frac();
+                    mu_decay_active = false;    // hold the small kick; don't immediately decay it
+                }
+            } else {
+                steps = step;
+                break;
+            }
         }
 
         // [Cycle 19 cleanup]: per-step SEARCH and old cosine modulation
@@ -5660,6 +6665,139 @@ std::pair<PackingResult, PackingTrace> run_packing_observed(
         // Cycle 10: periodic spatial reorder. Skips when REORDER_INTERVAL=0.
         if (REORDER_INTERVAL > 0 && step > 1 && (step % REORDER_INTERVAL == 0)) {
             reorder_particles_now();
+        } else if (swap_need_relayout) {
+            // SWAP capacity guard: a swapped particle outgrew the diameter its pair
+            // row was provisioned for; recompute the layout (full rebuild) now.
+            reorder_particles_now();
+            ++swap_relayouts;
+        }
+        swap_need_relayout = false;
+
+
+        // [219] DISTRIBUTION MORPH update - placed before D = D0*kappa so the new D0 takes effect this step.
+        if (morph_on && static_cast<long>(step) >= config.morph_start && morph_lambda < 1.0 &&
+            (static_cast<long>(step) - config.morph_start) % std::max<long>(1, config.morph_interval) == 0) {
+            const std::size_t nD = D0.size();
+            if (!morph_armed) {
+                if (config.morph_target.size() != nD)
+                    throw std::runtime_error("morph_target must have exactly N entries");
+                morph_q_start.assign(D0.begin(), D0.end());
+                std::sort(morph_q_start.begin(), morph_q_start.end());
+                morph_q_target = config.morph_target;
+                std::sort(morph_q_target.begin(), morph_q_target.end());
+                double v0 = 0.0, v1 = 0.0;
+                for (std::size_t i = 0; i < nD; ++i) {
+                    v0 += morph_q_start[i] * morph_q_start[i] * morph_q_start[i];
+                    v1 += morph_q_target[i] * morph_q_target[i] * morph_q_target[i];
+                }
+                if (!(v1 > 0.0) || morph_q_target.front() <= 0.0)
+                    throw std::runtime_error("morph_target entries must be positive");
+                const double sv = std::cbrt(v0 / v1);
+                for (double& q : morph_q_target) q *= sv;          // volume-matched target table
+                {   // a target equal to the start (to 1e-12 relative) is snapped to it exactly: a null morph is a no-op
+                    double dmax = 0.0;
+                    for (std::size_t i = 0; i < nD; ++i)
+                        dmax = std::max(dmax, std::fabs(morph_q_target[i] / morph_q_start[i] - 1.0));
+                    if (dmax < 1e-12) morph_q_target = morph_q_start;
+                }
+                morph_vol0 = v0;
+                // band reference = max overlap at arming, floored in absolute units so a low-mu start does not
+                // turn the band into an unreachably tight tolerance
+                morph_ref_maxov = std::max(max_min_dist, std::max(config.morph_band_floor, 1e-7));
+                morph_order.resize(nD);
+                if (swap_D0_layout.size() != nD) swap_D0_layout = D0;   // capacity-guard baseline
+                morph_kappa0 = kappa;
+                morph_armed = true;
+            }
+            const double maxov_now = max_min_dist;
+            // hold on either lag signal: overlaps above the band, or the global scale deflated below its arming value
+            const bool held = maxov_now > config.morph_band * morph_ref_maxov ||
+                              (config.morph_kappa_drop > 0.0 && kappa < morph_kappa0 * (1.0 - config.morph_kappa_drop));
+            // the baseline follows kappa slowly: a quasi-static decline (the target's own phi may be lower) passes,
+            // a burst (kappa falling faster than the baseline can follow) trips the guard
+            morph_kappa0 += (kappa - morph_kappa0) / static_cast<double>(std::max<long>(1, config.morph_kappa_tau));
+            if (held) {
+                // a trip means the last growth was too fast: shrink, and lower the CEILING to the last rate that ran
+                // hold-free for a full growth window (AIMD with memory -> converges to the largest sustainable rate)
+                const double rmin = std::max(config.morph_rate_min, 1e-9);
+                morph_rate = std::max(morph_rate * config.morph_shrink, rmin);
+                morph_rate_ceiling = std::max(rmin, (morph_last_safe > 0.0) ? std::min(morph_rate_ceiling, morph_last_safe)
+                                                                            : std::min(morph_rate_ceiling, morph_rate));
+                morph_ok_streak = 0;
+                ++morph_holds;
+                if (++morph_hold_streak > std::max<long>(1, config.morph_max_hold_streak)) {
+                    morph_stalled = true;          // kappa-lag stall: overlaps do not recover; stop and report
+                    steps = step;
+                    break;
+                }
+            } else {
+                morph_hold_streak = 0;
+                morph_lambda = std::min(1.0, morph_lambda + morph_rate);
+                // grow only with a margin below the band, never above the ceiling
+                if (maxov_now < config.morph_margin * config.morph_band * morph_ref_maxov) {
+                    if (++morph_ok_streak >= std::max<long>(1, config.morph_grow_after)) {
+                        morph_last_safe = morph_rate;                       // this rate ran a full window hold-free
+                        morph_rate = std::min(morph_rate_ceiling, morph_rate * config.morph_grow);
+                        morph_ok_streak = 0;
+                    }
+                } else {
+                    morph_ok_streak = 0;
+                }
+                // rank-keyed apply: the particle of ascending rank r receives interpolated quantile r. The order is
+                // rebuilt only when the permutation epoch moved (spatial reorder or diameter trades); the morph
+                // itself preserves ranks, so at interval 1 this costs O(N), not a sort per step.
+                if (morph_order_epoch != g_rcp_perm_epoch || morph_order.size() != nD) {
+                    morph_order.resize(nD);
+                    for (std::size_t i = 0; i < nD; ++i) morph_order[i] = static_cast<std::uint32_t>(i);
+                    std::stable_sort(morph_order.begin(), morph_order.end(),
+                                     [&](std::uint32_t a, std::uint32_t b) { return D0[a] < D0[b]; });
+                    morph_order_epoch = g_rcp_perm_epoch;
+                }
+                double v = 0.0;
+                bool changed = false;
+                for (std::size_t r = 0; r < nD; ++r) {
+                    // a + lambda*(b-a): exact identity when b == a (null morph), exact target at lambda == 1
+                    const double q = (morph_lambda >= 1.0) ? morph_q_target[r]
+                        : morph_q_start[r] + morph_lambda * (morph_q_target[r] - morph_q_start[r]);
+                    if (q != D0[morph_order[r]]) { D0[morph_order[r]] = q; changed = true; }
+                    v += q * q * q;
+                }
+                const double sv = std::cbrt(morph_vol0 / v);        // volume-preserving renormalisation
+                if (sv != 1.0) { for (std::size_t i = 0; i < nD; ++i) D0[i] *= sv; changed = true; }
+                if (changed) {   // a no-op update (null morph) must leave every derived state untouched
+                    d0_cache = recompute_d0_cache();
+                    D0_min_cached = d0_cache.first;
+                    S_D0_cached = d0_cache.second;
+                    D0_max_cached = recompute_d0_max();
+                    ++g_rcp_perm_epoch;
+                    morph_order_epoch = g_rcp_perm_epoch;   // ranks unchanged by the morph itself: keep the cached order
+                    for (std::size_t i = 0; i < nD; ++i)
+                        if (D0[i] > swap_D0_layout[i] * config.swap_relayout_ratio) { swap_need_relayout = true; break; }
+                }
+                ++morph_updates;
+            }
+            double vol_now = 0.0;
+            for (std::size_t i = 0; i < nD; ++i) vol_now += D0[i] * D0[i] * D0[i];
+            morph_log_buf.push_back(static_cast<double>(step));
+            morph_log_buf.push_back(morph_lambda);
+            morph_log_buf.push_back(morph_rate);
+            morph_log_buf.push_back(maxov_now);
+            morph_log_buf.push_back(held ? 1.0 : 0.0);
+            morph_log_buf.push_back(vol_now);                  // sum D0^3 after the update (volume-preservation check)
+        }
+        // [219] settled read-out: once the target is reached, end the run when max overlap is back in band and
+        // phi is flat over the settle window (the from-scratch terminal itself moves ~1e-3 per 500 steps in its
+        // oscillation phase, so the tolerance is a user choice; 0 = run to max_steps).
+        if (morph_on && morph_armed && morph_lambda >= 1.0 && config.morph_settle_flat > 0.0 &&
+            static_cast<long>(step) > config.morph_settle_window + 2 &&
+            max_min_dist <= config.morph_band * morph_ref_maxov) {
+            const std::size_t w = static_cast<std::size_t>(std::max<long>(2, config.morph_settle_window));
+            auto lo = phi_history.begin() + (step - 1 - w), hi = phi_history.begin() + (step - 1);
+            auto mm = std::minmax_element(lo, hi);
+            if (*mm.second - *mm.first < config.morph_settle_flat) {
+                steps = step;
+                break;
+            }
         }
 
         g_t_bk_alpha.begin();
@@ -5768,15 +6906,19 @@ std::pair<PackingResult, PackingTrace> run_packing_observed(
             current_volume = coeff * S_D0_cached * kappa_to_Ndim;
         }
 
-        box_volume = std::accumulate(box.begin(), box.end(), 1.0, std::multiplies<double>());
-
-        if (fix_height && !runtime_fix_diameter) {
-            box[Ndim - 1] = box[Ndim - 1] * kappa;
+        if (fix_height && !runtime_fix_diameter && kappa != fh_kappa_ref) {
+            // [226] the height follows the particle scale: H = H_start x kappa. Scale by the CHANGE of kappa since
+            // the last update (scaling by kappa itself every step compounded to kappa^steps and overflowed).
+            const double r = kappa / fh_kappa_ref;
+            box[Ndim - 1] = box[Ndim - 1] * r;
             for (std::size_t i = 0; i < N; ++i)
             {
-                x[i * Ndim + (Ndim - 1)] = x[i * Ndim + (Ndim - 1)] * kappa;
+                x[i * Ndim + (Ndim - 1)] = x[i * Ndim + (Ndim - 1)] * r;
             }
+            fh_kappa_ref = kappa;
         }
+
+        box_volume = std::accumulate(box.begin(), box.end(), 1.0, std::multiplies<double>());
 
         phi = current_volume / box_volume;
 
@@ -5790,8 +6932,14 @@ std::pair<PackingResult, PackingTrace> run_packing_observed(
                     Ndim,
                     fix_height);
                 D = std::move(target_scaled.first);
+                if (fix_height) {   // [226] the height follows the diameters' rescale at the lock
+                    box[Ndim - 1] *= target_scaled.second;
+                    for (std::size_t i = 0; i < N; ++i) x[i * Ndim + (Ndim - 1)] *= target_scaled.second;
+                    box_volume = std::accumulate(box.begin(), box.end(), 1.0, std::multiplies<double>());
+                }
                 D0 = D;
                 kappa = 1.0;
+                fh_kappa_ref = 1.0;
                 mu = 0.0;
                 runtime_fix_diameter = true;
                 target_phi_locked = true;
@@ -5899,18 +7047,28 @@ std::pair<PackingResult, PackingTrace> run_packing_observed(
             // run the full rung-1 budget. (Costs wall time on fast-converging
             // cases; revisit later.) Original OR-condition preserved here:
             // if (delta_XX < 5e-6 || step - phi_max.second > 3500 || (step > static_cast<int>(rung1_deadline))) {
-            if (step > static_cast<int>(rung1_deadline)) {
+            const std::size_t mu_hold_shift =
+                (config.mu_hold_shift_deadline && config.mu_hold_steps > 0 &&
+                 config.mu_hold_start >= 0 &&
+                 static_cast<std::size_t>(config.mu_hold_start) <= rung1_deadline)
+                ? static_cast<std::size_t>(config.mu_hold_steps) : 0;
+            if (!mu_pinned && step > static_cast<int>(rung1_deadline + mu_hold_shift)) {   // [219] suspended under mu_pin
                 // Cycle 19 Step 2: arm adaptive feedback mu decay.
                 // mu / 10 (= mu_1 / 10): empirically the winning ratio.
                 // Keeps mu_1 → mu_0 a decade decay, so t_relax measured
                 // here is consistent with the decade decay used in the
                 // oscillation reference exp(-t/t_relax).
+                // [160->162] VARIANT A (skip-decay bneck-convergence) REVERTED: it
+                // under-densified (bneck is a permutation, not a densifier [161]). The full
+                // normal convergence runs for ALL modes; mode-3 bneck now engages at the
+                // CONVERGED terminal via the reopen hook below (variant B, user [latest]).
                 mu_decay_target = mu / 10.0;
                 mu_decay_active = true;
                 mu_decay_next_tick_step = step + mu_decay_cooldown;
                 alpha /= 2.0;
                 mu_flag = 0;
                 mu_change = step;
+                if (config.swap_geo_bottleneck == 3 && mu_rung1 <= 0.0) mu_rung1 = mu;   // H12c [163]: capture rung-1 mu for the reopen kick (mode 3 only)
                 // Cascade (additive, has_fixed-guarded): release the frozen-
                 // diameter scaffold at the FIRST rung-1->0 trigger so every class
                 // is now free to densify / shrink-to-contact together (the McGeary
@@ -5942,7 +7100,7 @@ std::pair<PackingResult, PackingTrace> run_packing_observed(
         // completed; osc handles the rung-0 → rung-1 transition via the
         // exponentially-decaying reference (mu_ref). Suppress the legacy
         // 0->-1 trigger and oscillation start block intercepts instead.
-        if (!osc_enabled && step > 500 && mu_flag == 0 && !mu_decay_active &&
+        if (!mu_pinned && !osc_enabled && step > 500 && mu_flag == 0 && !mu_decay_active &&   // [219]
             step > mu_change + mu_decay_min_dwell) {
             std::vector<double> XX(phi_history.begin() + step - 250, phi_history.begin() + step - 1);
             double delta_XX = *std::max_element(XX.begin(), XX.end()) - *std::min_element(XX.begin(), XX.end());
@@ -6211,11 +7369,28 @@ std::pair<PackingResult, PackingTrace> run_packing_observed(
         g_t_bookkeep.end();
         g_t_forces.begin();
         // Cycle 21M: rung-1 mu boost (no-op at B=1; mu itself untouched).
-        const double mu_eff = (mu_flag == 1 && rcp_mu1_boost() > 1.0)
+        const bool mu_hold_now = config.mu_hold_steps > 0 && config.mu_hold_start >= 0 &&
+            static_cast<long>(step) >= config.mu_hold_start &&
+            static_cast<long>(step) < config.mu_hold_start + config.mu_hold_steps;
+        if (mu_hold_now && config.swap_mu_ctrl && config.mu_ctrl_interval > 0 &&
+            (static_cast<long>(step) - config.mu_hold_start) % config.mu_ctrl_interval == 0) {
+            std::size_t nz = 0;
+            for (std::size_t q = 0; q < N; ++q) nz += (z[q] >= 1);
+            const double v = static_cast<double>(nz) / static_cast<double>(N);
+            const double err = config.mu_ctrl_v_target - v;
+            if (std::fabs(err) > config.mu_ctrl_deadband)
+                mu_ctrl_mult *= std::exp(config.mu_ctrl_eta * err);
+            mu_ctrl_mult = std::min(config.mu_ctrl_max_mult, std::max(config.mu_ctrl_min_mult, mu_ctrl_mult));
+        }
+        const double mu_hold_mult_now = config.swap_mu_ctrl ? mu_ctrl_mult : config.mu_hold_mult;
+        const double mu_eff = mu_pinned ? config.mu_pin :             // [219] absolute mu pin
+            mu_hold_now ? mu_hold_mult_now * mu1_ref :
+            (mu_flag == 1 && rcp_mu1_boost() > 1.0)
             ? mu * (1.0 + (rcp_mu1_boost() - 1.0) *
                           std::exp(-static_cast<double>(step) /
                                    rcp_mu1_boost_tau()))
             : mu;
+        if (mu_hold_now) ++mu_hold_applied;
         // Cascade: per-particle kappa-radius (fixed -> 0, excluded from dkappa) and
         // the active-only diameter sum for the pressure term. Built only when
         // has_fixed; otherwise pass nullptr/-1 -> get_forces_nd_3 byte-identical.
@@ -6229,12 +7404,245 @@ std::pair<PackingResult, PackingTrace> run_packing_observed(
             }
             rk_ptr = rk_flat_cascade.data();
         }
+        // SWAP: squared pair separations are stashed by the force loop (only when
+        // swap is on) so the sweep below needs no second pass over the pairs.
+        // SWAP: on a sweep step, the force loop collects the near pairs the sweep
+        // needs (one compare per pair, no second pass over the pair lists).
+        const bool swap_step_now =
+            swap_on && !config.swap_sweeps_off &&
+            !runtime_fix_diameter && step >= swap_next_step &&
+            (swap_params.stop < 0 || static_cast<long>(step) <= swap_params.stop) &&
+            (swap_params.phase == 0 ||
+             (mu_flag == 1 && (swap_params.phase & 1)) ||
+             (mu_flag == 0 && (swap_params.phase & 2)) ||
+             (mu_flag == -1 && (swap_params.phase & 4)));
+        // rescue channel: collect near-pair edges (for exact dE) only every
+        // rescue_interval-th sweep step, so the collection cost is paid rarely
+        // [207] while a trial quench is active the regular swap passes are suspended: only the
+        // injected exchange is under test, and a revert must land restored positions on the
+        // pre-exchange diameters (four geo passes in a 20-step quench had re-traded ~all participants).
+        const bool trial_quench_active = (step <= inj_freeze_until + 1) && !inj_free_mask.empty();   // +1: through the decision step
+        const bool rescue_step_now =
+            swap_step_now && !trial_quench_active &&
+            (swap_params.rescue > 0.0 || swap_params.cycle3 > 0.0) &&
+            config.swap_exact == 0 &&
+            (swap_params.rescue_interval <= 1 ||
+             step % static_cast<std::size_t>(swap_params.rescue_interval) == 0);
+        const bool geo_step_now =
+            config.swap_geo != 0 && config.swap > 0.0 && !trial_quench_active &&
+            !quench_on &&                      // [225] a quench runs at frozen diameters: no permutation passes
+            (geo_force_step ||                 // [101] reopen-forced pass, bypasses window/cadence
+             (static_cast<long>(step) >= config.swap_geo_start &&
+              (config.swap_geo_stop < 0 || static_cast<long>(step) < config.swap_geo_stop) &&
+              ((static_cast<long>(step) - config.swap_geo_start) % std::max<long>(1, config.swap_geo_k) == 0)));
+        const bool is_reopen_pass = geo_force_step;   // [172] capture BEFORE reset (used at the reopen geo_pass for nonsep==2)
+        if (geo_step_now) geo_force_step = false;
+        const bool sweep_step_now = swap_step_now && !trial_quench_active && !(geo_step_now && config.swap_geo == 1);
+        if (quench_on && !(swap_step_now || geo_step_now)) { swap_sink.want_edges = false; swap_sink.want_gsum = true; }   // [221]
+        if (swap_step_now || geo_step_now) {
+            swap_sink.want_edges = (config.swap_exact != 0) || rescue_step_now || geo_step_now ||
+                                   (config.swap_event_log_geom != 0 && config.swap_event_log_stride > 0);
+            swap_sink.want_gsum = (config.swap_exact == 0);
+            if (swap_sink.want_edges) swap_sink.margin = swap_engine.edge_margin(D, D0);
+            if ((config.swap_event_log_geom != 0 && config.swap_event_log_stride > 0) || geo_step_now) {
+                // ME0-iv: the geometry shell is r < 1.1 (R_i + R_k); the geo pass uses
+                // the 1.5x shell -> cover r - (R_i+R_k) <= 0.5 D_max on geo steps
+                double dmax = 0.0;
+                for (std::size_t q = 0; q < N; ++q) if (D[q] > dmax) dmax = D[q];
+                swap_sink.margin = std::max(swap_sink.margin, (geo_step_now ? 0.50 : 0.10) * dmax);
+            }
+        }
         get_forces_nd_3(pairs_data.data(), pair_offsets.data(), x.data(), N, Ndim, D, box, walls, F, U, min_dist, max_min_dist, Lc, Fmean, mu_eff, dkappa, z,
                         // Cycle 21k: packed-D0 + the kappa the last D-update used
                         // (D[j] == D0[j]*kappa bit-for-bit at this point).
                         packed_d0_on ? packed_d0_mirror.data() : nullptr, kappa,
-                        rk_ptr, sumD_active);
+                        rk_ptr, sumD_active, (swap_step_now || geo_step_now || quench_on) ? &swap_sink : nullptr);
         g_t_forces.end();
+
+        // ---- diameter-SWAP sweep (additive; skipped entirely when swap == 0) ------
+        // Runs right after the force evaluation: x, D and the pair lists are the
+        // ones the forces were just computed with, and swap_pair_d2 holds their
+        // exact squared separations. Accepted swaps exchange D0/D of two particles
+        // at fixed positions; the position update below still uses the forces of
+        // the pre-swap diameters (one-step lag, as with any Adam step), and the next
+        // step's D-update / refresh check see the exchanged D0. Neighbour-list
+        // validity: growth of a swapped particle is charged to its refresh budget
+        // through the running-min D_last (growth_half), exactly like kappa growth,
+        // so no forced refresh is needed for small |dD|. The kd-tree D-stat index
+        // cache is invalidated (perm epoch) because an exchange leaves the D[0] and
+        // D[N/2] sentinels intact while moving the max/min/median indices.
+        swap_engine.current_step_ = step;
+        if (swap_step_now || geo_step_now) {
+            g_t_swap.begin();
+            swap_touched.clear();
+            SwapSweepStats sst;
+            if (sweep_step_now) sst = swap_engine.sweep(N, D, D0, swap_sink, z, swap_touched);
+            // H7 HANDOFF [127]: when capk is on with a handoff step, geo runs ONLY
+            // before it and cage runs ONLY after it -> no competing every-step passes
+            // (fixes the [126] thrash). capk_start==0 keeps the old behavior (both).
+            const bool capk_on = (config.swap_geo_capk != 0);
+            const long capk_start = config.swap_geo_capk_start;
+            const bool cage_on = (config.swap_geo_cage != 0);       // H8 [131]
+            const long cage_start = config.swap_geo_cage_start;
+            // geo yields once EITHER handoff (capk or cage) has fired: c_min-geo seeds
+            // the state for the first M steps, then the gated pass mops up the residual.
+            const bool geo_yielded =
+                (capk_on && capk_start > 0 && static_cast<long>(step) >= capk_start) ||
+                (cage_on && cage_start > 0 && static_cast<long>(step) >= cage_start);
+            if (geo_step_now && !geo_yielded) {
+                // H12 [148]/[162]: at a reopen (= the CONVERGED terminal, OSC-DONE) the forced
+                // pass is bottleneck-relief; normal c_min-geo runs during initial compression.
+                // mode 1 = un-shrunk bneck (infidelic [155]); mode 3 = shrink-to-just-touching
+                // bneck (variant B, engages at the converged terminal 0.8806, user [latest];
+                // at worst 0 swaps -> phi unchanged). Mode 2 leaves geo_pass here (superseded).
+                if ((config.swap_geo_bottleneck == 1 || config.swap_geo_bottleneck == 3)
+                    && geo_reopens_done > 0)
+                    swap_engine.geo_bottleneck_pass(N, D, D0, swap_sink, swap_touched);
+                else {
+                    swap_engine.geo_reopen_active_ = is_reopen_pass;   // [172] H19: coupled rescore only at reopen when geo_nonsep==2
+                    swap_engine.geo_pass(N, D, D0, swap_sink, swap_touched);
+                    swap_engine.geo_reopen_active_ = false;
+                }
+            }
+            if (geo_step_now && config.swap_geo_cycle != 0 && !geo_yielded)  // H2 [117]: 3-cycles
+                swap_engine.geo_cycle_pass(N, D, D0, swap_sink, swap_touched);
+            if (geo_step_now && config.swap_geo_cycle4 != 0 && !geo_yielded) // H34 [194]: 4-cycles
+                swap_engine.geo_cycle4_pass(N, D, D0, swap_sink, swap_touched);
+            // H12b [152]: mode 2 = bottleneck-relief ADDITIVELY during the mu_1 rung
+            // (mu_flag==1), under residual overlap/compression above jamming ("the signal
+            // is the overlap"). geo_start already gates to the dense post-onset regime;
+            // the rung-1 ADAM dynamics provide the gentle relax between passes.
+            // NOTE [155]: mode 2 evaluates at the CURRENT (overlapping) scale and does NOT
+            // shrink -> starved accommodation gate -> 0 trades (infidelic). Superseded by 3.
+            if (geo_step_now && config.swap_geo_bottleneck == 2 && mu_flag == 1 && !geo_yielded)
+                swap_engine.geo_bottleneck_pass(N, D, D0, swap_sink, swap_touched);
+            // H12c [162] VARIANT B: mode-3 bneck engages at the CONVERGED terminal (not
+            // during the run) via the reopen hook (geo_force_step), where geo_reopens_done>0.
+            // Handled in the forced-pass branch above (config.swap_geo_bottleneck 1||3 ->
+            // geo_bottleneck_pass). At worst it makes 0 swaps and phi is unchanged; it can
+            // only keep or improve phi, never lose density.
+            if (geo_step_now && capk_on &&
+                (capk_start <= 0 || static_cast<long>(step) >= capk_start))  // H7 cage (post-handoff)
+                swap_engine.geo_capk_pass(N, D, D0, swap_sink, swap_touched);
+            if (geo_step_now && cage_on &&
+                (cage_start <= 0 || static_cast<long>(step) >= cage_start))  // H8 overlap-energy (post-handoff)
+                swap_engine.geo_cage_pass(N, D, D0, swap_sink, swap_touched,
+                                          x.data(), box.data(), static_cast<int>(Ndim));  // x/box used only if geo_cage_move [133]
+            if (!swap_touched.empty()) {
+                ++g_rcp_perm_epoch;
+                for (std::uint32_t k : swap_touched) {
+                    if (config.swap_refresh) theta_anchor[k] = 0.0;   // optional forced refresh
+                    if (D0[k] > swap_D0_layout[k] * config.swap_relayout_ratio) swap_need_relayout = true;
+                    if (swap_params.adam >= 1) {
+                        for (std::size_t d = 0; d < Ndim; ++d) m_flat[k * Ndim + d] = 0.0;
+                    }
+                    if (swap_params.adam >= 2) {
+                        for (std::size_t d = 0; d < Ndim; ++d) v_flat[k * Ndim + d] = 0.0;
+                    }
+                }
+                swap_total_accepted += sst.accepted;
+            }
+            // Adaptive back-off: an idle sweep (accepted <= idle_frac * N -- relative,
+            // so that a handful of stragglers at large N do not keep every step
+            // sweeping) doubles the interval (up to interval*backoff); a productive
+            // sweep resets it. Cost follows activity.
+            const bool sweep_idle = config.swap_ctrl
+                ? sst.starved
+                : (static_cast<double>(sst.accepted) <=
+                   config.swap_idle_frac * static_cast<double>(N));
+            if (!sweep_step_now) {
+                // geo-only step: leave the sweep cadence and its log untouched
+            } else
+            if (sweep_idle && config.swap_backoff > 1) {
+                const std::size_t cap = static_cast<std::size_t>(swap_params.interval) *
+                                        static_cast<std::size_t>(config.swap_backoff);
+                swap_cur_interval = std::min(cap, swap_cur_interval * 2);
+            } else {
+                swap_cur_interval = static_cast<std::size_t>(swap_params.interval);
+            }
+            if (sweep_step_now) swap_next_step = step + swap_cur_interval;
+            if (sweep_step_now) {
+            swap_log_buf.push_back(static_cast<double>(step));
+            swap_log_buf.push_back(static_cast<double>(mu_flag));
+            swap_log_buf.push_back(static_cast<double>(sst.candidates));
+            swap_log_buf.push_back(static_cast<double>(sst.accepted));
+            swap_log_buf.push_back(sst.dE_sum);
+            swap_log_buf.push_back(phi / phi_modifier);
+            swap_log_buf.push_back(static_cast<double>(sst.contacts));
+            // slot 8: mean contact energy (exact mode) or the controller's window
+            swap_log_buf.push_back(config.swap_ctrl ? sst.w_used : sst.e_scale);
+            }
+            g_t_swap.end();
+        }
+        // ---- surgical injections (ME0-ii [log 054]) ---------------------------
+        if (swap_on && !config.swap_inject.empty()) {
+            static thread_local std::vector<std::uint32_t> inj_touched;
+            inj_touched.clear();
+            std::size_t n_inj = 0;
+            static thread_local std::vector<double> inj_D0_before;            // [207] pre-injection D0 (for the revert check)
+            if (config.swap_inject_freeze > 0) inj_D0_before = D0;
+            for (std::size_t q = 0; q + 2 < config.swap_inject.size(); q += 3) {
+                if (static_cast<std::size_t>(config.swap_inject[q]) != step) continue;
+                if (swap_engine.inject(N, D, D0, inj_touched,
+                        static_cast<std::uint32_t>(config.swap_inject[q + 1]),
+                        static_cast<std::uint32_t>(config.swap_inject[q + 2])))
+                    ++n_inj;
+            }
+            if (!inj_touched.empty()) {
+                ++g_rcp_perm_epoch;
+                // [206] injection-only Adam reset (a neighbourhood exchange invalidates the moments of
+                // its participants; ordinary swaps keep swap_adam). -1 = follow swap_adam (legacy).
+                const int inj_adam = config.swap_inject_adam >= 0 ? config.swap_inject_adam : swap_params.adam;
+                for (std::uint32_t k : inj_touched) {
+                    if (config.swap_refresh) theta_anchor[k] = 0.0;
+                    if (D0[k] > swap_D0_layout[k] * config.swap_relayout_ratio)
+                        swap_need_relayout = true;
+                    if (inj_adam >= 1)
+                        for (std::size_t d = 0; d < Ndim; ++d) m_flat[k * Ndim + d] = 0.0;
+                    if (inj_adam >= 2)
+                        for (std::size_t d = 0; d < Ndim; ++d) v_flat[k * Ndim + d] = 0.0;
+                }
+                swap_total_accepted += n_inj;
+                if (config.swap_inject_freeze > 0 && n_inj > 0) {          // [207] arm the local quench
+                    inj_free_mask.assign(N, 0);
+                    for (std::uint32_t k : inj_touched) inj_free_mask[k] = 1;
+                    // user [207]: the participants alone cannot force-balance against a rigid wall -
+                    // free their neighbour shell(s) too (pair lists = neighbours within the cutoff).
+                    for (int sh = 0; sh < config.swap_inject_freeze_shell; ++sh) {
+                        std::vector<std::uint8_t> next = inj_free_mask;
+                        for (std::size_t k = 0; k < N; ++k) {
+                            if (!inj_free_mask[k]) continue;
+                            const std::uint32_t cnt = pairs_data[pair_offsets[k]];
+                            for (std::uint32_t q = 1; q <= cnt; ++q) next[pairs_data[pair_offsets[k] + q]] = 1;
+                        }
+                        inj_free_mask.swap(next);
+                    }
+                    inj_freeze_until = step + static_cast<std::size_t>(config.swap_inject_freeze);
+                    // trial state: the pairs of THIS step (for a revert) and the participants' pre-exchange
+                    // positions/moments (the injection changed diameters only, so x/m/v here are pre-state);
+                    // U was computed by this step's force pass BEFORE the injection -> U0.
+                    inj_pairs_saved.clear(); inj_participants.clear();
+                    for (std::size_t q = 0; q + 2 < config.swap_inject.size(); q += 3)
+                        if (static_cast<std::size_t>(config.swap_inject[q]) == step)
+                            inj_pairs_saved.emplace_back(static_cast<std::uint32_t>(config.swap_inject[q + 1]),
+                                                         static_cast<std::uint32_t>(config.swap_inject[q + 2]));
+                    for (std::size_t k = 0; k < N; ++k) if (inj_free_mask[k]) inj_participants.push_back(static_cast<std::uint32_t>(k));
+                    inj_pre_x.clear(); inj_pre_m.clear(); inj_pre_v.clear(); inj_pre_D0.clear();
+                    for (std::uint32_t k : inj_participants) inj_pre_D0.push_back(inj_D0_before[k]);
+                    inj_pre_sc.clear(); for (std::uint32_t k : inj_participants) inj_pre_sc.push_back(swap_engine.swap_count(k));
+                    inj_pre_geo = swap_engine.geo_trades_; inj_pre_cyc = swap_engine.geo_cycle_trades_; inj_pre_tot = swap_total_accepted;
+                    inj_free_origin.assign(N, 0);
+                    for (std::size_t k = 0; k < N; ++k) if (inj_free_mask[k]) inj_free_origin[particle_origin[k]] = 1;
+                    inj_part_origin.clear(); for (std::uint32_t k : inj_participants) inj_part_origin.push_back(static_cast<std::uint32_t>(particle_origin[k]));
+                    inj_pairs_origin.clear(); for (const auto& pr : inj_pairs_saved) inj_pairs_origin.emplace_back(static_cast<std::uint32_t>(particle_origin[pr.first]), static_cast<std::uint32_t>(particle_origin[pr.second]));
+                    for (std::uint32_t k : inj_participants)
+                        for (std::size_t d = 0; d < Ndim; ++d) {
+                            inj_pre_x.push_back(x[k * Ndim + d]); inj_pre_m.push_back(m_flat[k * Ndim + d]); inj_pre_v.push_back(v_flat[k * Ndim + d]);
+                        }
+                    inj_U0 = U; ++inj_trials;
+                }
+            }
+        }
         // Cycle 20: missed-pair sentinel — validates the candidate lists the
         // forces above just consumed. Off unless RCP_SENTINEL is set.
         if (rcp_sentinel_every() > 0 &&
@@ -6258,6 +7666,34 @@ std::pair<PackingResult, PackingTrace> run_packing_observed(
         mu_hist[step - 1] = mu;
         alpha_hist[step - 1] = alpha;
         mu_flag_hist[step - 1] = static_cast<std::int8_t>(mu_flag);
+        // Lightweight multi-axis progress log (opt-in via RCP_PROGRESS_STRIDE>0,
+        // parsed once). stderr only, no effect on physics/history -> swap=0 stays
+        // byte-identical when off. Lets a watcher tail step/phi/overlap/trades to
+        // tell legitimate slow convergence from wasted churn [user 2026-09-09].
+        static const long g_prog_stride = [](){
+            const char* s = std::getenv("RCP_PROGRESS_STRIDE");
+            return (s && s[0]) ? std::atol(s) : 0L;
+        }();
+        if (g_prog_stride > 0 &&
+            (step % static_cast<std::size_t>(g_prog_stride) == 0 || step == 1)) {
+            std::cerr << "[prog] step=" << step
+                      << " phi=" << (phi / phi_modifier)
+                      << " maxov=" << max_min_dist
+                      << " muflag=" << mu_flag
+                      << " geo=" << swap_engine.geo_trades_
+                      << " cyc=" << swap_engine.geo_cycle_trades_
+                      << " cyc4=" << swap_engine.geo_cycle4_trades_
+                      << " capk=" << swap_engine.geo_capk_trades_
+                      << " cage=" << swap_engine.geo_cage_trades_
+                      << " bneck=" << swap_engine.geo_bottleneck_trades_
+                      << "\n";
+        }
+        if (config.record_visibility && step - 1 < zpos_hist.size()) {
+            std::size_t nz = 0;
+            for (std::size_t q = 0; q < N; ++q) nz += (z[q] >= 1);
+            zpos_hist[step - 1] = static_cast<float>(nz) / static_cast<float>(N);
+            mueff_hist[step - 1] = static_cast<float>(mu_eff);
+        }
         // Cycle 18 Phase A: spike detection. Wait 200 steps for EMA warmup,
         // then trigger on F > ratio * EMA. Log event details.
         if (spike_log_enabled) {
@@ -6342,6 +7778,43 @@ std::pair<PackingResult, PackingTrace> run_packing_observed(
                 if (pp_enabled) pp_signflip_resets[k] += local_resets;
             }
         }
+        // [207] end of a quench: this step's force pass saw the quenched configuration -> decide.
+        if (!inj_free_mask.empty()) inj_remap_mask();                                      // [207] survive reorders
+        if (!inj_free_mask.empty() && step == inj_freeze_until + 1 && config.swap_inject_accept) {
+            const bool keep = U <= inj_U0 * (1.0 + config.swap_inject_tol);
+            std::cerr << "[inj] step " << step << " trial: U0=" << inj_U0 << " U=" << U
+                      << (keep ? " ACCEPT" : " REVERT") << "\n";
+            if (!keep) {
+                ++inj_reverts;
+                static thread_local std::vector<std::uint32_t> rv_touched; rv_touched.clear();
+                inj_idx_of_origin.assign(N, 0);
+                for (std::size_t k = 0; k < N; ++k) inj_idx_of_origin[particle_origin[k]] = static_cast<std::uint32_t>(k);
+                for (const auto& pr : inj_pairs_origin)
+                    swap_engine.inject(N, D, D0, rv_touched, inj_idx_of_origin[pr.first], inj_idx_of_origin[pr.second]);
+                std::size_t q = 0, n_d0_mismatch = 0, n_traded = 0; double rmin = 1e300, rmax = -1e300;
+                for (std::size_t pi = 0; pi < inj_part_origin.size(); ++pi) {
+                    const std::uint32_t k = inj_idx_of_origin[inj_part_origin[pi]];
+                    if (swap_engine.swap_count(k) != inj_pre_sc[pi]) ++n_traded;
+                    const double ratio = D0[k] / inj_pre_D0[pi];
+                    rmin = std::min(rmin, ratio); rmax = std::max(rmax, ratio);
+                    if (std::fabs(ratio - 1.0) > 1e-12) ++n_d0_mismatch;
+                    for (std::size_t d = 0; d < Ndim; ++d, ++q) {
+                        x[k * Ndim + d] = inj_pre_x[q]; m_flat[k * Ndim + d] = inj_pre_m[q]; v_flat[k * Ndim + d] = inj_pre_v[q];
+                    }
+                }
+                std::cerr << "[inj]   revert check: participants=" << inj_participants.size()
+                          << " D0 mismatches after swap-back=" << n_d0_mismatch
+                          << " traded-since-arming=" << n_traded
+                          << " dgeo=" << (swap_engine.geo_trades_ - inj_pre_geo) << " dcyc=" << (swap_engine.geo_cycle_trades_ - inj_pre_cyc)
+                          << " dtotal=" << (swap_total_accepted - inj_pre_tot)
+                          << " ratio range [" << rmin << ", " << rmax << "]\n";
+                ++g_rcp_perm_epoch;
+                swap_need_relayout = true;
+            }
+            inj_free_mask.clear();
+        }
+        const bool inj_quench = (step <= inj_freeze_until) && !inj_free_mask.empty();   // [207]
+        if (inj_quench) { frz_x = x; frz_m = m_flat; frz_v = v_flat; frz_kappa = kappa; frz_mk = m_kappa; frz_vk = v_kappa; }
         g_t_adam.begin();
         if (rcp_fused_adam() && method != "Verlet") {
             // Cycle 21c: particle ADAM is fused into the position pass
@@ -6402,11 +7875,216 @@ std::pair<PackingResult, PackingTrace> run_packing_observed(
         }
         g_t_bk_phistory.end();
 
-        if (!runtime_fix_diameter) {
-            kappa = kappa - alpha * m_hat_kappa / (std::sqrt(v_hat_kappa) + epsilon);
+        if (!runtime_fix_diameter && !quench_on) {   // [221] kappa frozen during a quench
+            // [219] while a morph is advancing, damp the global-scale response so positions absorb the transient
+            // imbalance of the reference-size shift (morph_kappa_damp = 1 -> original step, bit for bit)
+            const double kd = (morph_on && morph_armed && morph_lambda < 1.0) ? config.morph_kappa_damp : 1.0;
+            kappa = kappa - kd * alpha * m_hat_kappa / (std::sqrt(v_hat_kappa) + epsilon);   // kd == 1.0 is exact
         }
         g_t_bookkeep.end();
         g_t_position.begin();
+        if (quench_on) {   // [221] FIRE quench: adaptive inertial descent on the true energy, unit or z-scaled masses
+            const std::size_t nd = N * Ndim;
+            if (q_iter == 0) {
+                // arm: the held mask refers to the slot order the caller sees (the resumed blob). It must be built HERE,
+                // after the resume, because the initialiser spatially reorders the fresh arrays before the checkpoint
+                // state overwrites them ([222]: a mask built at declaration ended up permuted against the particles).
+                // quench_held holds ORIGIN ids (indices into the arrays the caller handed in; for a checkpoint chain,
+                // the first run's order): particle_origin[k] is the stable identity that survives every spatial
+                // reorder and every resume, so the mask is built through it and then permuted with the slots.
+                std::fill(q_held.begin(), q_held.end(), 0);
+                if (!config.quench_held.empty()) {
+                    std::vector<char> want(N, 0);
+                    for (double hi : config.quench_held) { const long k = static_cast<long>(hi); if (k >= 0 && k < static_cast<long>(N)) want[k] = 1; }
+                    for (std::size_t k = 0; k < N; ++k) q_held[k] = want[particle_origin[k]];
+                }
+                q_any_held = std::any_of(q_held.begin(), q_held.end(), [](char h) { return h != 0; });
+                if (config.quench_kappa_mult != 1.0 && config.quench_kappa_mult > 0.0) kappa *= config.quench_kappa_mult;   // takes effect at the next D = D0*kappa
+            }
+            // [225] wall contacts (planar walls at 0 and L in each dimension with walls[d] == 1; a curved container on
+            // the first -walls[0] dimensions): the force kernel's mirror-image law gives |f| = 2 (r - gap distance).
+            // They count toward the contact number and the contact-force sum exactly as a pair contact does.
+            const bool q_walls = std::any_of(walls.begin(), walls.end(), [](std::int8_t w) { return w != 0; });
+            if (q_walls) {
+                q_wall_s.assign(N, 0.0); q_wall_n.assign(N, 0);
+                const std::size_t t_curved = walls[0] < 0 ? static_cast<std::size_t>(-walls[0]) : 0;
+                for (std::size_t i = 0; i < N; ++i) {
+                    const double r = D[i] / 2.0;
+                    for (std::size_t d = 0; d < Ndim; ++d) {
+                        if (walls[d] != 1) continue;
+                        for (int side = 0; side < 2; ++side) {
+                            const double gap = std::abs(box[d] * side - x[i * Ndim + d]);
+                            if (gap < r) { q_wall_s[i] += 2.0 * (r - gap); ++q_wall_n[i]; }
+                        }
+                    }
+                    if (t_curved > 0) {
+                        const double R = box[0] / 2.0; double dc2 = 0.0;
+                        for (std::size_t m = 0; m < t_curved && m < Ndim; ++m) { const double u = x[i * Ndim + m] - R; dc2 += u * u; }
+                        const double gap = R - std::sqrt(dc2);   // the kernel's test; its force uses |gap|
+                        if (gap < r) { q_wall_s[i] += 2.0 * std::abs(r - std::abs(gap)); ++q_wall_n[i]; }
+                    }
+                }
+            }
+            // contact-force sum S_i (K = 1: overlap sum = force sum) and contact number, walls included
+            auto qS = [&](std::size_t i) { return q_walls ? swap_sink.gsum[i] + q_wall_s[i] : swap_sink.gsum[i]; };
+            auto qZ = [&](std::size_t i) { return q_walls ? static_cast<long>(z[i]) + q_wall_n[i] : static_cast<long>(z[i]); };
+            const long q_zmin = static_cast<long>(Ndim) + 1;   // a particle needs Ndim + 1 contacts to be caged (4 in 3D)
+            // residuals on the backbone from F and the per-particle contact-force sums
+            // load-bearing backbone: z >= Ndim + 1 AND contact-force sum >= 1e-2 x (mean contact force x 4): below that
+            // the ratio |F_i|/S_i is limited by position rounding (K*1e-16 / S_i), not by balance ([222])
+            double f2 = 0.0, ssum = 0.0; long zsum = 0;
+            for (std::size_t d = 0; d < Ndim; ++d) q_held_force[d] = 0.0;
+            for (std::size_t i = 0; i < N; ++i) {
+                if (q_held[i]) { for (std::size_t d = 0; d < Ndim; ++d) q_held_force[d] += F[i * Ndim + d]; continue; }
+                const double S = qS(i);
+                if (S > 0.0) { ssum += S; zsum += qZ(i); }
+            }
+            const double fmean = zsum > 0 ? ssum / static_cast<double>(zsum) : 1.0;
+            const double s_floor = 1e-2 * fmean * 4.0;
+            double rmax = 0.0; std::size_t nback = 0;
+            for (std::size_t i = 0; i < N; ++i) {
+                if (q_held[i]) continue;
+                const double S = qS(i);
+                if (qZ(i) >= q_zmin && S >= s_floor) {
+                    double fn2 = 0.0; for (std::size_t d = 0; d < Ndim; ++d) fn2 += F[i * Ndim + d] * F[i * Ndim + d];
+                    ++nback; f2 += fn2; const double r = std::sqrt(fn2) / S; if (r > rmax) rmax = r;
+                }
+            }
+            q_res = rmax; q_gres = (fmean > 0.0 && nback > 0) ? std::sqrt(f2 / static_cast<double>(std::max<std::size_t>(nback, 1))) / fmean : 0.0;
+            if (q_iter % std::max<long>(1, config.quench_report_every) == 0) {
+                q_log.push_back(static_cast<double>(q_iter)); q_log.push_back(q_res); q_log.push_back(q_gres);
+                q_log.push_back(U); q_log.push_back(static_cast<double>(nback)); q_log.push_back(q_dt);
+            }
+            // a kappa multiplier takes effect at the NEXT D = D0*kappa: never declare convergence before one iteration
+            const bool q_armed = (q_iter >= 1) || (config.quench_kappa_mult == 1.0);
+            // [225] stopping rules, first match wins: converged (needs a non-empty backbone - an empty one is vacuous),
+            // non-finite, unjammed (no overlap at all, or an empty backbone for 50 consecutive iterations), iteration
+            // cap, stall (best residual not reduced by stall_factor within stall_window iterations), step collapse
+            // (FIRE dt below dt_min while a backbone exists: FIRE finds no step it can follow downhill)
+            if (q_armed && nback > 0 && q_res <= config.quench_tol) q_status = 1;
+            else if (!std::isfinite(q_res) || !std::isfinite(U) || !std::isfinite(q_gres)) q_status = 6;
+            else if (q_armed && nback == 0 && (U == 0.0 || ++q_unjam_streak >= 50)) q_status = 4;
+            else if (q_iter >= config.quench_max_iter) q_status = 2;
+            if (nback > 0) q_unjam_streak = 0;
+            if (q_status == 0 && q_armed && nback > 0) {
+                if (q_stall_ref < 0.0 || q_res <= config.quench_stall_factor * q_stall_ref) { q_stall_ref = q_res; q_stall_ref_iter = q_iter; }
+                else if (config.quench_stall_window > 0 && q_iter - q_stall_ref_iter >= config.quench_stall_window) q_status = 3;
+                if (q_status == 0 && config.quench_dt_min > 0.0 && q_dt < config.quench_dt_min) q_status = 5;
+            }
+            if (q_status != 0) {
+                q_converged = (q_status == 1); steps = step; g_t_position.end(); break;
+            }
+            // [223] two-level classification by load: heavy = caged (z >= Ndim + 1) AND load >= light_frac x typical; refreshed
+            // every class_every iterations (not every step: a flickering set would perturb FIRE's power sum)
+            if (config.quench_two_level && (q_iter % std::max<int>(1, config.quench_class_every) == 0)) {
+                const double s_light = config.quench_light_frac * fmean * 4.0;
+                for (std::size_t i = 0; i < N; ++i) q_light[i] = (q_held[i] || qZ(i) < q_zmin || qS(i) < s_light) ? 1 : 0;
+            } else if (!config.quench_two_level) { std::fill(q_light.begin(), q_light.end(), 0); }
+            // masses
+            if (config.quench_mass_scaled && (q_iter % 200 == 0 || q_minv.size() != N)) {
+                q_minv.assign(N, 1.0); std::vector<double> zz; zz.reserve(N);
+                for (std::size_t i = 0; i < N; ++i) if (qZ(i) > 0) zz.push_back(static_cast<double>(qZ(i)));
+                double med = 1.0; if (!zz.empty()) { std::nth_element(zz.begin(), zz.begin() + zz.size() / 2, zz.end()); med = zz[zz.size() / 2]; }
+                for (std::size_t i = 0; i < N; ++i) q_minv[i] = med / std::max(1.0, static_cast<double>(qZ(i)));
+            }
+            // FIRE: P = F.v ; mixing ; adaptive dt / alpha ; semi-implicit Euler ; held and translation handling
+            double P = 0.0, vnorm2 = 0.0, fnorm2 = 0.0;
+            for (std::size_t i = 0; i < N; ++i) {
+                if (q_held[i] || q_light[i] || qS(i) <= 0.0) continue;
+                const double mi = config.quench_mass_scaled ? q_minv[i] : 1.0;
+                for (std::size_t d = 0; d < Ndim; ++d) { const double a = F[i * Ndim + d] * mi; P += a * q_v[i * Ndim + d]; fnorm2 += a * a; vnorm2 += q_v[i * Ndim + d] * q_v[i * Ndim + d]; }
+            }
+            const bool q_warm = q_iter < config.quench_warm_steps;   // [224] warm phase: no resets, isokinetic rescale below
+            if (P > 0.0 || q_warm) { if (++q_npos > 5) { q_dt = std::min(q_dt * 1.1, config.quench_dt_max); q_alpha *= 0.99; } }
+            else { q_npos = 0; q_dt *= 0.5; q_alpha = config.quench_alpha0;
+                   for (std::size_t k = 0; k < nd; ++k) { x[k] -= 0.5 * q_dt * q_v[k]; q_v[k] = 0.0; } vnorm2 = 0.0; }
+            if (config.quench_mix_mode >= 2) {
+                // per-particle reset [222]: a particle moving against its own force stops (half-step back), independent of the rest
+                for (std::size_t i = 0; i < N; ++i) {
+                    if (q_held[i] || q_light[i] || qS(i) <= 0.0) continue;
+                    double Pi = 0.0; for (std::size_t d = 0; d < Ndim; ++d) Pi += F[i * Ndim + d] * q_v[i * Ndim + d];
+                    if (Pi < 0.0) {
+                        if (config.quench_mix_mode == 3) { for (std::size_t d = 0; d < Ndim; ++d) q_v[i * Ndim + d] *= 0.5; }   // [224] soft per-particle damping: local dissipation without the discontinuity of a reset
+                        else for (std::size_t d = 0; d < Ndim; ++d) { x[i * Ndim + d] -= 0.5 * q_dt * q_v[i * Ndim + d]; q_v[i * Ndim + d] = 0.0; }
+                    }
+                }
+            }
+            const double fn = std::sqrt(fnorm2);
+            // pass 1: v <- v + dt a (held / force-free particles carry no velocity); accumulate |v| after the update
+            double vnew2 = 0.0; std::size_t nact = 0;
+            for (std::size_t i = 0; i < N; ++i) {
+                if (q_held[i] || q_light[i] || qS(i) <= 0.0) { for (std::size_t d = 0; d < Ndim; ++d) q_v[i * Ndim + d] = 0.0; continue; }
+                const double mi = config.quench_mass_scaled ? q_minv[i] : 1.0; ++nact;
+                for (std::size_t d = 0; d < Ndim; ++d) { const double vv = q_v[i * Ndim + d] + q_dt * F[i * Ndim + d] * mi; q_v[i * Ndim + d] = vv; vnew2 += vv * vv; }
+            }
+            const double vn = std::sqrt(vnew2);
+            // pass 2: FIRE mixing v <- (1-alpha) v + alpha |v| F/|F|, then the translation mean
+            // [228] one entry per dimension (was double[3]: out of bounds for Ndim >= 4 -> collective drift)
+            std::vector<double> vmean(Ndim, 0.0);
+            for (std::size_t i = 0; i < N; ++i) {
+                if (q_held[i] || q_light[i] || qS(i) <= 0.0) continue;
+                const double mi = config.quench_mass_scaled ? q_minv[i] : 1.0;
+                double vn_i = vn, fn_i = fn;
+                if (config.quench_mix_mode >= 1) {   // per-particle norms [222]: no global velocity scale is imposed on a lightly loaded particle
+                    double a2 = 0.0, b2 = 0.0;
+                    for (std::size_t d = 0; d < Ndim; ++d) { const double a = F[i * Ndim + d] * mi; a2 += a * a; b2 += q_v[i * Ndim + d] * q_v[i * Ndim + d]; }
+                    fn_i = std::sqrt(a2); vn_i = std::sqrt(b2);
+                }
+                for (std::size_t d = 0; d < Ndim; ++d) {
+                    double vv = q_v[i * Ndim + d];
+                    if (fn_i > 0.0) vv = (1.0 - q_alpha) * vv + q_alpha * vn_i * (F[i * Ndim + d] * mi) / fn_i;
+                    q_v[i * Ndim + d] = vv; vmean[d] += vv;
+                }
+            }
+            for (std::size_t d = 0; d < Ndim; ++d) vmean[d] = nact ? vmean[d] / static_cast<double>(nact) : 0.0;
+            if (config.quench_freeze_damp > 0.0) {
+                // [224] activity-gated dissipation: EMA of |v| per particle; particles far below the median activity are
+                // damped each step, active clusters untouched
+                if (q_act.size() != N) q_act.assign(N, 0.0);
+                std::vector<double> tmp; tmp.reserve(N);
+                for (std::size_t i = 0; i < N; ++i) {
+                    double v2 = 0.0; for (std::size_t d = 0; d < Ndim; ++d) v2 += q_v[i * Ndim + d] * q_v[i * Ndim + d];
+                    q_act[i] = 0.99 * q_act[i] + 0.01 * std::sqrt(v2);
+                    if (!(q_held[i] || q_light[i] || qS(i) <= 0.0)) tmp.push_back(q_act[i]);
+                }
+                if (q_iter % 200 == 0 && !tmp.empty()) { std::nth_element(tmp.begin(), tmp.begin() + tmp.size() / 2, tmp.end()); q_act_med = tmp[tmp.size() / 2]; }
+                if (q_act_med > 0.0 && q_iter > 400) {
+                    const double thr = config.quench_freeze_frac * q_act_med, keep = 1.0 - config.quench_freeze_damp;
+                    for (std::size_t i = 0; i < N; ++i) if (q_act[i] < thr) for (std::size_t d = 0; d < Ndim; ++d) q_v[i * Ndim + d] *= keep;
+                }
+            }
+            if (q_warm && nact > 0 && fmean > 0.0) {
+                // [224] isokinetic thermostat: mean speed such that a particle moves quench_warm_amp mean overlaps per step
+                double v2 = 0.0;
+                for (std::size_t i = 0; i < N; ++i) { if (q_held[i] || q_light[i] || qS(i) <= 0.0) continue; for (std::size_t d = 0; d < Ndim; ++d) v2 += q_v[i * Ndim + d] * q_v[i * Ndim + d]; }
+                const double vrms = std::sqrt(v2 / static_cast<double>(nact)); const double vt = config.quench_warm_amp * fmean / std::max(q_dt, 1e-300);
+                if (vrms > 0.0) { const double sc = vt / vrms; for (std::size_t k = 0; k < nd; ++k) q_v[k] *= sc; for (std::size_t d = 0; d < Ndim; ++d) vmean[d] *= sc; }
+            }
+            for (std::size_t i = 0; i < N; ++i) {
+                if (q_held[i]) continue;
+                if (q_light[i]) {
+                    // [223] light particle: overdamped local step against the (frozen this step) heavy set; F/(K z) is the exact
+                    // opening displacement for one contact and an under-relaxed Jacobi step for a cage; no velocity, no FIRE state
+                    const double zi = static_cast<double>(qZ(i));
+                    if (zi <= 0.0 || qS(i) <= 0.0) continue;
+                    const double fac = config.quench_light_omega / zi;   // K = 1 in this kernel (overlap sum = contact-force sum)
+                    for (std::size_t d = 0; d < Ndim; ++d) {
+                        double xv = x[i * Ndim + d] + fac * F[i * Ndim + d]; const double L = box[d];
+                        if (xv >= L) xv -= L; else if (xv < 0.0) xv += L; x[i * Ndim + d] = xv;
+                    }
+                    continue;
+                }
+                for (std::size_t d = 0; d < Ndim; ++d) {
+                    // [225] the uniform translation is a zero mode only along periodic directions and only when nothing
+                    // is held: walls and held particles exert a physical net force, and removing the response to it
+                    // leaves every free particle a common residual force (FIRE then stalls with its step collapsed)
+                    if (qS(i) > 0.0 && walls[d] == 0 && !q_any_held) q_v[i * Ndim + d] -= vmean[d];
+                    double xv = x[i * Ndim + d] + q_dt * q_v[i * Ndim + d]; const double L = box[d];
+                    if (xv >= L) xv -= L; else if (xv < 0.0) xv += L; x[i * Ndim + d] = xv;
+                }
+            }
+            ++q_iter;
+        } else {
         if (rcp_fused_adam() && method != "Verlet") {
             // Cycle 21c: fused particle-ADAM + position update + PBC wrap.
             // Per-element math is verbatim adam_update (m/v EMA + bias
@@ -6571,7 +8249,19 @@ std::pair<PackingResult, PackingTrace> run_packing_observed(
             }
         }
         }  // end non-fused path
+        }  // end quench/adam branch [221]
         g_t_position.end();
+        if (inj_quench) {                                                                // [207] hold everyone else
+            for (std::size_t k = 0; k < N; ++k) {
+                if (inj_free_mask[k]) continue;
+                for (std::size_t d = 0; d < Ndim; ++d) {
+                    x[k * Ndim + d] = frz_x[k * Ndim + d];
+                    m_flat[k * Ndim + d] = frz_m[k * Ndim + d];
+                    v_flat[k * Ndim + d] = frz_v[k * Ndim + d];
+                }
+            }
+            kappa = frz_kappa; m_kappa = frz_mk; v_kappa = frz_vk;                      // kappa held (size ratios and the energy comparison intact)
+        }
         g_t_bookkeep.begin();
 
         U_history[step - 1] = U;
@@ -6583,6 +8273,19 @@ std::pair<PackingResult, PackingTrace> run_packing_observed(
             capture_positions && trajectory_interval > 0 && (step % trajectory_interval == 0);
         if (should_report || should_capture) {
             record_observation(step, should_capture);
+        }
+
+        // checkpoint v3: wall-timer write at end-of-step [log 043]
+        if (ckpt_on) {
+            const auto ckpt_now = std::chrono::steady_clock::now();
+            const bool every_now = config.checkpoint_every_steps > 0 &&
+                (step % static_cast<std::size_t>(config.checkpoint_every_steps) == 0);
+            if (std::chrono::duration<double>(ckpt_now - ckpt_wall_last).count()
+                    >= config.checkpoint_interval_s ||
+                config.checkpoint_interval_s < 0 || every_now) {
+                ckpt_write(step);
+                ckpt_wall_last = std::chrono::steady_clock::now();
+            }
         }
 
         if (step % 5000 == 0) {
@@ -6667,6 +8370,15 @@ std::pair<PackingResult, PackingTrace> run_packing_observed(
         double total_wall = std::chrono::duration<double>(
             profile_wall_end - profile_wall_start).count();
         print_timing_summary(total_wall, steps);
+        if (rcp_profile_prints() && swap_on && swap_engine.n_sweeps_ > 0) {
+            std::cerr << "  swap: sweeps=" << swap_engine.n_sweeps_
+                      << " build=" << swap_engine.t_build_ << "s cand=" << swap_engine.t_cand_
+                      << "s edges/sweep=" << (double)swap_engine.n_edges_total_ / swap_engine.n_sweeps_
+                      << " cand/sweep=" << (double)swap_engine.n_cand_total_ / swap_engine.n_sweeps_
+                      << " eval/sweep=" << (double)swap_engine.n_eval_total_ / swap_engine.n_sweeps_
+                      << " accepted=" << swap_total_accepted
+                      << " relayouts=" << swap_relayouts << "\n";
+        }
         rcp_cycle_probe_dump();
         rcp_shadow_dump();
         rcp_sentinel_dump();
@@ -6674,6 +8386,11 @@ std::pair<PackingResult, PackingTrace> run_packing_observed(
 
     PackingResult result;
     // Cycle 14: convert flat x back to nested for the result API.
+    // checkpoint v3: final write on loop exit (capped runs leave a resumable
+    // blob). MUST precede ALL result assembly - several state arrays (D, box,
+    // particle_origin, swap_log_buf) are std::move'd into the result below.
+    if (ckpt_on && steps > ckpt_last_step_written) ckpt_write(steps);
+
     result.positions.assign(N, std::vector<double>(Ndim, 0.0));
     for (std::size_t i = 0; i < N; ++i)
         for (std::size_t d = 0; d < Ndim; ++d)
@@ -6701,6 +8418,31 @@ std::pair<PackingResult, PackingTrace> run_packing_observed(
     result.mu_history = std::move(mu_hist);
     result.alpha_history = std::move(alpha_hist);
     result.mu_flag_history = std::move(mu_flag_hist);
+    if (config.record_visibility) {
+        zpos_hist.resize(hist_filled); mueff_hist.resize(hist_filled);
+        result.zpos_history = std::move(zpos_hist);
+        result.mu_eff_history = std::move(mueff_hist);
+    }
+    result.mu_hold_applied = mu_hold_applied;
+    result.mu_ctrl_final_mult = mu_ctrl_mult;
+    result.morph_log = std::move(morph_log_buf);       // [219]
+    result.morph_lambda = morph_lambda;
+    result.morph_updates = morph_updates;
+    result.morph_holds = morph_holds;
+    result.morph_stalled = morph_stalled ? 1 : 0;
+    result.morph_rate_ceiling = morph_rate_ceiling;
+    result.quench_residual = q_res; result.quench_global_residual = q_gres; result.quench_iters = q_iter;
+    result.quench_converged = q_converged ? 1 : 0; result.quench_log = std::move(q_log); result.quench_held_force = q_held_force;
+    if (quench_on && q_status == 0) q_status = 2;   // [225] the step loop ended before any stopping rule: report it as the cap
+    result.quench_status = q_status;
+    result.swap_geo_trades = static_cast<long>(swap_engine.geo_trades_);
+    result.swap_geo_passes = static_cast<long>(swap_engine.geo_passes_);
+    result.swap_geo_reopens = geo_reopens_done;
+    result.swap_geo_cycle_trades = static_cast<long>(swap_engine.geo_cycle_trades_);
+    result.swap_geo_cycle4_trades = static_cast<long>(swap_engine.geo_cycle4_trades_);   // [194]
+    result.swap_geo_capk_trades = static_cast<long>(swap_engine.geo_capk_trades_);
+    result.swap_geo_cage_trades = static_cast<long>(swap_engine.geo_cage_trades_);
+    result.swap_geo_bottleneck_trades = static_cast<long>(swap_engine.geo_bottleneck_trades_);
     result.energy_history = std::move(U_history);
     // Cycle 18: per-particle troublemaker stats from the LAST window.
     // pos_range_max is computed from pos_min/max arrays.
@@ -6722,15 +8464,41 @@ std::pair<PackingResult, PackingTrace> run_packing_observed(
         result.pp_window_steps = pp_window_steps;
     }
     // Cycle 18 Phase A: spike log goes through whether pp is enabled or not.
+    // SWAP diagnostics: the never-written reorder_log slot carries the per-sweep
+    // event log (8 doubles per sweep) and, when the spike log is otherwise unused,
+    // spike_log carries per-particle accepted-swap counts (N doubles). Both empty
+    // when swap == 0, exactly as before.
+    if (swap_on) {
+        reorder_log_buf = std::move(swap_log_buf);
+        if (!spike_log_enabled) {
+            spike_log_buf.assign(N, 0.0);
+            for (std::size_t k = 0; k < N; ++k) spike_log_buf[k] = static_cast<double>(swap_engine.swap_count(k));
+        }
+    }
     result.spike_log = std::move(spike_log_buf);
     result.reorder_log = std::move(reorder_log_buf);
+    result.swap_relayouts = swap_relayouts;
+    result.swap_rescue_candidates = static_cast<std::size_t>(swap_engine.rescue_cand_total_);
+    result.swap_rescue_accepted = static_cast<std::size_t>(swap_engine.rescue_acc_total_);
+    result.swap_rescue_false_rej = static_cast<std::size_t>(swap_engine.rescue_frej_total_);
+    result.swap_rescue_false_acc = static_cast<std::size_t>(swap_engine.rescue_facc_total_);
+    result.swap_cycle3_candidates = static_cast<std::size_t>(swap_engine.cycle3_cand_total_);
+    result.swap_cycle3_accepted = static_cast<std::size_t>(swap_engine.cycle3_acc_total_);
+    result.swap_cycle3_blocked = static_cast<std::size_t>(swap_engine.cycle3_blocked_total_);
+    result.swap_events = swap_engine.event_buf_;
+    result.swap_event_width = static_cast<int>(swap_engine.event_width());
+    (void)swap_total_accepted;
     // Report the number of COMPLETED packing iterations, which equals the
     // filled length of every per-step history series. The loop-entry counter
     // `steps` also counts a terminating check-only iteration (convergence hits
     // OscPhase::DONE and breaks before that iteration writes history), so it can
     // read one higher than the histories. Using hist_filled keeps the public
     // contract internally consistent: result.steps == len(phi/force/energy_history).
+    result.resumed_from_step = ckpt_resumed_from;
+    result.checkpoint_last_step = ckpt_last_step_written;
     result.steps = hist_filled;
+    result.capped = (config.max_steps > 0 &&
+                     hist_filled >= static_cast<std::size_t>(config.max_steps));
     result.phi = phi;
     result.max_min_dist = max_min_dist;
     result.force_magnitude = F_magnitude;

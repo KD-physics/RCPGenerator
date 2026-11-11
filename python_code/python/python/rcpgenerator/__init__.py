@@ -8,10 +8,12 @@ from ._rcpgenerator import (
 )
 from .render import animate_packing_2d, render_packing
 from ._wrapper import Packing
+from .examples import example
 
 __all__ = [
     "Packing",
     "animate_packing_2d",
+    "example",
     "get_num_threads",
     "initialize_particles",
     "render_packing",

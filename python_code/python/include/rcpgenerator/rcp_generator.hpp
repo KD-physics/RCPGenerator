@@ -15,6 +15,8 @@
 
 namespace rcpgenerator {
 
+struct SwapEdgeSink;   // rcpgenerator/diameter_permute.hpp
+
 struct PackingConfig {
     std::vector<double> box;
     // Legacy packer behavior: empty walls defaults to Ndim zeros before first use.
@@ -22,6 +24,164 @@ struct PackingConfig {
     std::uint32_t neighbor_max = 0;
     std::uint32_t seed = 0;
     bool fix_height = false;
+    // Diameter-SWAP (additive). swap == 0 -> the packing loop is byte-identical to
+    // the pristine build; every field below is inert unless swap > 0. Reachable from
+    // Packing.pack() because it travels in PackingConfig, not PackingRunOptions.
+    double swap = 0.0;             // strength: candidate pairs per particle per sweep
+    int    swap_interval = 1;      // steps between sweeps
+    int    swap_mode = 5;          // 5 directed, relative-D window (default) | 4 directed rank window | 1 rank window | 3 systematic | 0 random | 2 neighbour
+    int    swap_rank_window = 8;   // mode 1 partner rank offset in [1, window]
+    double swap_size_tol = 0.2;    // modes 0/2: |dD| <= tol * <D>
+    double swap_eps = 0.0;         // accept if dE < -eps * (mean contact energy)
+    long   swap_start = 0;         // first step sweeps may run
+    long   swap_stop = -1;         // last step (-1: none)
+    int    swap_phase = 0;         // bitmask over mu_flag: 1 rung1, 2 rung0, 4 rung-1; 0 all
+    int    swap_adam = 0;          // 0 keep, 1 zero m, 2 zero m and v for swapped particles
+    int    swap_inject_adam = -1;  // [206] Adam reset for swap_inject participants ONLY; -1 = follow swap_adam
+    int    swap_inject_freeze = 0; // [207] local quench: for K steps after an injection only the participants move
+                                   //       (positions AND Adam moments of everyone else are held; kappa held too)
+    int    swap_inject_accept = 0; // [207] 1 = at the end of the quench keep the exchange only if U <= U0*(1+tol),
+                                   //       else REVERT (diameters swapped back, participants' x/m/v restored)
+    double swap_inject_tol = 0.0;  // [207] tolerance for the acceptance test
+    int    swap_inject_freeze_shell = 1; // [207] free set = participants + this many neighbour shells (0 = participants only)
+    int    swap_max_per_particle = 4;  // cap on accepted swaps per particle per sweep
+    int    swap_refresh = 0;       // 1: force a neighbour refresh of swapped particles (not needed for small |dD|)
+    int    swap_backoff = 64;      // max multiplier of swap_interval after empty sweeps (1 = fixed interval)
+    int    swap_exact = 0;         // 0: O(1) proxy from per-particle (g, z) (default); 1: exact dE over near-pair lists
+    double swap_window_rel = 0.016; // mode 5: partner within |D_j/D_i - 1| <= this (scale-free window)
+    double swap_relayout_ratio = 1.3; // if a swapped particle's D0 grew past this ratio since the last
+                                      // pair-layout, recompute layout (spatial reorder) next step
+    int    swap_rank_space = 1;    // 1: rank-space (streaming) proxy sweep; 0: random particle draws
+    double swap_idle_frac = 1e-2;  // a sweep accepting <= idle_frac*N exchanges counts as idle (back-off)
+    // (a, R) outcome controller (opt-in; overrides fixed strength/window semantics)
+    int    swap_ctrl = 0;          // 1: quota-based draws + adaptive window
+    double swap_a = 0.3;           // target accepted exchanges per particle per sweep
+    double swap_R = 0.20;          // target acceptance fraction
+    double swap_eta = 0.2;         // window feedback gain
+    double swap_wmin = 5e-4;       // window floor
+    double swap_wmax = 0.10;       // window ceiling (initial window)
+    double swap_smax = 32.0;       // draw cap per particle per sweep
+    double swap_floor_budget = 1.0; // ctrl at window floor: draw budget x (a/R) pp; 0 = legacy cap-burn
+    double swap_rescue = 0.0;      // rescue channel: exact-dE candidates pp per rescue pass (0 = off)
+    double swap_rescue_w = 0.05;   // rescue partner window |Dj/Di - 1| <= w
+    int    swap_rescue_interval = 4; // steps between rescue passes
+    double swap_cycle3 = 0.0;      // 3-cycle trio candidates pp per rescue pass (0 = off)
+    // ---- session survivability [log 043] -------------------------------------------
+    std::string checkpoint_path;   // non-empty: periodic bitwise state checkpoints to
+                                   // this file (atomic tmp+rename), AND resume from it
+                                   // at pack() start if it exists (header-validated)
+    double checkpoint_interval_s = 1800.0; // wall seconds between checkpoint writes
+    long   max_steps = 0;          // >0: hard step cap (fail-soft; result.capped set).
+                                   // 0 = schedule default.
+    // ---- mechanics instrumentation (ME0 [log 054]; all default off) ---------------
+    long   swap_event_log_stride = 0;   // per-trade event log sampling (0 = off)
+    long   swap_event_log_cap = 1000000; // max logged events
+    int    swap_event_log_geom = 0;      // ME0-iv: +cage/fact fields (row width 12)
+    long   checkpoint_every_steps = 0;   // >0: archival write every k steps (path.STEP)
+    // ---- mu-hold actuator (MECHANICS stage 2b [log 071]; labeled variant, default off) ----
+    long   mu_hold_start = -1;           // first step of the hold (-1 = off)
+    long   mu_hold_steps = 0;            // hold length in steps (0 = off)
+    double mu_hold_mult = 1.0;           // mu_eff = mult * mu_1 (initial rung-1 mu) during the hold
+    int    mu_hold_shift_deadline = 1;   // 1: a hold that starts in rung 1 delays the deadline by its length
+    int    record_visibility = 0;        // 1: per-step visibility P(z>=1) and mu_eff histories
+    // ---- visibility controller prototype (stage 2b Part 5 [log 073]; labeled, default off) ----
+    // Rides on the mu_hold window: within [mu_hold_start, +mu_hold_steps) the
+    // multiplier is adapted every mu_ctrl_interval steps to hold v = P(z>=1) at
+    // mu_ctrl_v_target (deadband), clamped to [mu_ctrl_min_mult, mu_ctrl_max_mult].
+    int    swap_mu_ctrl = 0;
+    double mu_ctrl_v_target = 0.30;
+    double mu_ctrl_deadband = 0.05;
+    double mu_ctrl_eta = 0.5;            // mult <- mult * exp(eta * (target - v)) outside the deadband
+    long   mu_ctrl_interval = 50;
+    double mu_ctrl_min_mult = 0.1;
+    double mu_ctrl_max_mult = 1.0;
+    // ---- stage 3 [log 082]: geometric sort step (labeled, default off) ----
+    int    swap_geo = 0;                 // 1 replace sweep on geo steps; 2 hybrid (both)
+    double swap_geo_T = 0.0;
+    double swap_geo_T_end = -1.0;        // [135] H9 anneal floor T (<0 = fixed swap_geo_T)
+    double swap_geo_T_decay = 1.0;       // [135] H9 per-pass T multiplier (<1 anneals)
+    double swap_geo_w = 0.05;
+    long   swap_geo_B = 2000;
+    long   swap_geo_k = 200;
+    long   swap_geo_start = 0;
+    long   swap_geo_stop = -1;
+    long   swap_geo_reopen = 0;    // [101] max convergence reopens: at OSC DONE, force a
+                                   // geo pass and re-enter FINAL_DESCENT (same constants,
+                                   // fresh budget); stops early once a reopen trades nothing
+    int    swap_geo_cycle = 0;     // [117] H2: apply 3-cycles after each geo pass (k-opt escape)
+    int    swap_geo_cycle_cap = 12;// per-rank partner scan cap for the cycle search
+    int    swap_geo_cycle4 = 0;    // [194] H34: 4-cycle pass after the 3-cycle pass (k-opt rung 4)
+    int    swap_geo_cycle4_cap = 6;// per-rank partner scan cap for the quadruple search
+    int    swap_geo_capk = 0;      // [121/122] H7: cage-capacity sort; K smallest per-nbr caps (0=off)
+    int    swap_geo_capmode = 3;   // 1=K-th smallest, 2=mean-of-K, 3=tiered c_min-else-cage
+    int    swap_geo_bottleneck = 0;// [146/148/152] H12: bottleneck-relief. 0=off; 1=terminal (reopen-loop final squeeze); 2=H12b under-overlap at the mu_1 rung (mu_flag==1, additive)
+    int    swap_geo_cage = 0;      // [129/130/131] H8: true-cage overlap-energy pairwise move (0=off,1=on)
+    int    swap_geo_cage_move = 0; // [133] DIAGNOSTIC: also move swapped particle to its cage centre (0=off; position move, OUTSIDE C5 - insight only)
+    int    swap_geo_nonsep = 0;    // [172] H19: non-separable comparator rescore of geo candidates (0=off,1=on; C5-clean, diameters-only)
+    double swap_geo_ctarget = 0.5; // [172] H19: concave clearance cap in units of mean radius
+    int    swap_geo_nsk = 4;       // [172] H19: top-K multiplier over geo_B for the non-separable rescore set
+    long   swap_geo_nonsep_start = 0;   // [190] H26: coupled rescore (nonsep==1) fires only for step >= start
+    long   swap_geo_nonsep_stop = -1;   // [190] H26: ... and step < stop (-1 = open)
+    long   swap_geo_cage_start = 0;// [131] H8 HANDOFF: step at which geo yields to the cage pass (0=both)
+    long   swap_geo_capk_start = 0;// [127] H7 HANDOFF: step at which geo yields to cage. Before this
+                                   // step geo_pass runs (c_min sort during compression); from this
+                                   // step geo_pass is OFF and capk_pass runs ALONE on the geo cadence
+                                   // (cage polish of the near-jammed residual). 0 = capk from geo_start
+                                   // (the old competing-pass behavior). Avoids the geo<->cage thrash [126].
+    int    swap_sweeps_off = 0;    // 1: suppress normal sweeps (surgical mode)
+    std::vector<double> swap_inject;    // flattened (step, i, j) injection triples
+    // ---- [219] DISTRIBUTION MORPH (labeled, default off): evolve the base-diameter multiset D0 along the
+    // rank-preserving quantile interpolation (1-lambda)*Q_start + lambda*Q_target, renormalised each update
+    // so sum(D0^3) is constant; a feedback controller advances lambda while max overlap stays in band. ----
+    std::vector<double> morph_target;   // N target relative diameters (any order; sorted internally); empty = off
+    long   morph_start = 0;             // first step at which the morph may update (absolute step)
+    long   morph_interval = 10;         // steps between updates (1 = continuous, rank order cached by epoch; 10 measured better at equal rate [220])
+    double morph_kappa_damp = 1.0;      // multiplier on kappa's Adam step while the morph is advancing (lambda < 1):
+                                        //   < 1 lets positions, not the global scale, absorb the transient imbalance
+    double morph_band_floor = 5e-4;     // the band reference is max(max overlap at arming, this floor) - absolute overlap units
+    double morph_margin = 0.5;          // the increment may grow only while max overlap < margin * band * reference
+    long   morph_max_hold_streak = 2000;// consecutive held updates that declare a kappa-lag STALL: morphing stops, run ends
+    double morph_kappa_drop = 1e-3;     // deflation guard: hold while kappa < baseline * (1 - this) - the kappa-lag signal itself
+    long   morph_kappa_tau = 100;       // updates over which the baseline tracks kappa (a quasi-static drift passes; a burst trips)
+    double morph_rate0 = 1e-3;          // initial lambda increment per update
+    double morph_band = 2.0;            // hold when max overlap > band * reference (measured at morph_start)
+    double morph_grow = 1.25;           // increment growth factor after morph_grow_after in-band updates
+    double morph_shrink = 0.7;          // increment shrink factor on a hold (0.5 ratcheted stiff states to the floor [220])
+    double morph_rate_min = 1e-5;       // floor of the increment: below it a hold only waits (costs steps, not progress)
+    long   morph_grow_after = 5;        // consecutive in-band updates before growing the increment
+    double morph_rate_max = 3e-5;       // cap on the lambda increment: the rate at which the S 4->3 read-out is rate-independent
+                                        //   ([220] plateau); feedback alone settles at 3-5e-4 and reads 0.005 low
+    double morph_settle_flat = 0.0;     // >0: after lambda reaches 1, END the run once max overlap is in band and the
+                                        //     phi range over morph_settle_window steps is below this value (settled read-out)
+    long   morph_settle_window = 1000;  // window (steps) for the settle test
+    // ---- [219] mu pin (labeled, default off): mu fed to the forces is held at this absolute value and the
+    // schedule's rung/decay/oscillation transitions are suspended (the run continues to max_steps). ----
+    double mu_pin = 0.0;                // <= 0 = off
+    // ---- [221] QUENCH to force balance (labeled, default off): FIRE position updates replace Adam, kappa frozen,
+    // schedule suspended; ends at the per-particle residual tolerance on the load-bearing backbone (z >= Ndim + 1,
+    // wall contacts counted) or at a give-up trigger. ----
+    int    quench_mode = 0;             // 0 off, 1 FIRE
+    double quench_tol = 1e-10;          // max over backbone of |F_i| / sum_j |f_ij|
+    long   quench_max_iter = 200000;    // iteration cap (steps)
+    double quench_dt0 = 0.05, quench_dt_max = 0.5, quench_alpha0 = 0.1;
+    int    quench_mass_scaled = 0;      // 1: acceleration = F / m_i with m_i = z_i / median(z) (preconditioned FIRE)
+    long   quench_report_every = 500;   // quench_log stride
+    int quench_two_level = 0;           // [223] 1: FIRE over the heavy set only; light particles (below quench_light_frac of the typical load,
+                                        //       rattlers included) relax by an overdamped local step x += omega F/(K z) against the frozen heavy set
+    double quench_light_frac = 0.3;     // load fraction (of 4 x mean contact force) below which a particle is "light"
+    double quench_light_omega = 1.0;    // relaxation factor of the light step
+    double quench_freeze_damp = 0.0;    // [224] activity-gated dissipation: velocity damping factor per step on quiet particles (0 = off)
+    double quench_freeze_frac = 0.1;    // [224] quiet = EMA speed below this fraction of the median
+    long quench_warm_steps = 0;         // [224] controlled warm phase: iterations with velocities rescaled and no P<0 resets (0 = off)
+    double quench_warm_amp = 0.1;       // [224] warm-phase mean displacement per step, in mean overlaps
+    int quench_class_every = 100;       // iterations between heavy/light reclassifications
+    int quench_mix_mode = 0;            // FIRE mixing: 0 global norms (Bitzek), 1 per-particle norms, 2 per-particle norms + per-particle P<0 reset [222]
+    double quench_kappa_mult = 1.0;     // kappa <- kappa * mult at the first quench iteration (quench at a chosen pressure)
+    std::vector<double> quench_held;    // indices of held particles (masked out; their net force is reported)
+    // [225] give-up triggers (each 0 = off; the result reports which one ended the quench in quench_status)
+    long   quench_stall_window = 0;     // stop as "stalled" when the best residual has not fallen by quench_stall_factor
+    double quench_stall_factor = 0.5;   //   within this many iterations
+    double quench_dt_min = 0.0;         // stop as "step collapse" when FIRE's time step falls below this
 };
 
 struct PackingInput {
@@ -46,6 +206,18 @@ struct PackingResult {
     std::vector<double> mu_history;           // chemical-potential rung value
     std::vector<double> alpha_history;        // current learning rate
     std::vector<std::int8_t> mu_flag_history; // -1, 0, 1 (rung index)
+    std::vector<float> zpos_history;          // record_visibility: fraction of particles with z >= 1
+    std::vector<float> mu_eff_history;        // record_visibility: mu fed to forces (hold-aware)
+    long mu_hold_applied = 0;                 // steps on which the hold overrode mu
+    double mu_ctrl_final_mult = 0.0;          // controller multiplier at the end of the window
+    long swap_geo_trades = 0;                 // accepted geometric-pass exchanges
+    long swap_geo_passes = 0;
+    long swap_geo_reopens = 0;                // [101] convergence reopens actually taken
+    long swap_geo_cycle_trades = 0;           // [117] accepted 3-cycle rotations
+    long swap_geo_cycle4_trades = 0;          // [194] accepted 4-cycle rotations
+    long swap_geo_capk_trades = 0;            // [121/122] accepted cage-capacity swaps
+    long swap_geo_cage_trades = 0;            // [129/130/131] accepted overlap-energy pairwise swaps
+    long swap_geo_bottleneck_trades = 0;      // [146/148] accepted bottleneck-relief swaps
     std::size_t steps = 0;
     double phi = 0.0;
     double max_min_dist = 0.0;
@@ -56,6 +228,22 @@ struct PackingResult {
     // apples-to-apples basis (oracle.positions[particle_origin[k]] should
     // ~equal candidate.positions[k] within FP noise).
     std::vector<std::size_t> particle_origin;
+    // [219] distribution morph diagnostics: 6 doubles per update [step, lambda, increment, max_overlap, held, sum D0^3]
+    std::vector<double> morph_log;
+    double morph_lambda = 0.0;                // final morph fraction (1.0 = target reached)
+    long   morph_updates = 0;                 // updates applied (lambda advanced)
+    long   morph_holds = 0;                   // updates held (out of band)
+    long   morph_stalled = 0;                 // 1 if the run ended on a kappa-lag stall (hold streak > morph_max_hold_streak)
+    double morph_rate_ceiling = 0.0;          // final ceiling of the increment (lowered on every band trip)
+    // [221] quench diagnostics
+    double quench_residual = 0.0;             // final max backbone residual
+    double quench_global_residual = 0.0;      // final RMS net force / mean contact force
+    long   quench_iters = 0;
+    int    quench_converged = 0;
+    int    quench_status = 0;                 // [225] 0 not run, 1 converged, 2 max_iter, 3 stalled, 4 unjammed,
+                                              //       5 step collapse, 6 non-finite force or energy
+    std::vector<double> quench_log;           // 6 per report: iter, residual, global, U, n_backbone, dt
+    std::vector<double> quench_held_force;    // Ndim doubles: net contact force on the held set at exit
     // Cycle 18: per-particle aggregate stats over the LAST window of the
     // run (window length controlled by RCP_PP_WINDOW env var, default 5000
     // steps). Used to identify "troublemakers" — particles whose force
@@ -79,6 +267,22 @@ struct PackingResult {
     // (reorder finds previously-missed pairs). Format per event (5 doubles):
     //   [step, mu_flag, total_pairs_before, total_pairs_after, F_at_step]
     std::vector<double> reorder_log;
+    // Diameter-SWAP: number of extra spatial reorders triggered by the capacity
+    // guard (0 when swap == 0).
+    std::size_t swap_relayouts = 0;
+    // rescue channel totals (proxy-vs-exact cross-table; [log 034])
+    std::size_t swap_rescue_candidates = 0;
+    std::size_t swap_rescue_accepted = 0;
+    std::size_t swap_rescue_false_rej = 0;
+    std::size_t swap_rescue_false_acc = 0;
+    std::size_t swap_cycle3_candidates = 0;
+    std::size_t swap_cycle3_accepted = 0;
+    std::size_t swap_cycle3_blocked = 0;   // accepted cycles with all pair swaps uphill
+    bool capped = false;                   // run ended at the max_steps cap (fail-soft)
+    std::size_t resumed_from_step = 0;     // 0 = fresh run; else checkpoint resume point
+    std::size_t checkpoint_last_step = 0;  // step of the last successful checkpoint write
+    std::vector<double> swap_events;
+    int swap_event_width = 8;          // doubles per event row       // per-trade event log (8 doubles/event)
 };
 
 struct PackingObservation {
@@ -232,7 +436,14 @@ void get_forces_nd_3(
     // sum. Defaults nullptr/-1 -> standard path, byte-identical (masked dkappa terms
     // reduce exactly to the originals).
     const double* rk_data = nullptr,
-    double sumD_active = -1.0);
+    double sumD_active = -1.0,
+    // Diameter-SWAP (additive): when non-null, (a) if sink->want_edges, every
+    // candidate pair with d2 < ((Di+Dj)/2 + sink->margin)^2 is appended to
+    // sink->per_thread[tid] as (i, j, d2); (b) if sink->want_gsum, the absolute
+    // overlap of every accepted contact is accumulated per particle into
+    // sink->gsum. nullptr (the default, and always when swap == 0) -> nothing,
+    // byte-identical.
+    struct SwapEdgeSink* swap_sink = nullptr);
 
 // Cycle 5a: m, v, v_update, m_hat, v_hat moved to flat double* layout.
 // They are addressed as [k * Ndim + d] for particle k, dimension d. The

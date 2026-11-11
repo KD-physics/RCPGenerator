@@ -4,7 +4,7 @@ build-backend = "scikit_build_core.build"
 
 [project]
 name = "rcpgenerator"
-version = "1.0.0"
+version = "1.1.0"
 description = "Fast random close packing generator for polydisperse spheres in N dimensions (OpenMP + SIMD C++ core with a Python API)"
 readme = "README.md"
 authors = [
@@ -44,7 +44,8 @@ Documentation = "https://github.com/KD-physics/RCPGenerator/blob/main/python_cod
 "Getting Started" = "https://github.com/KD-physics/RCPGenerator/blob/main/getting_started.ipynb"
 Examples = "https://github.com/KD-physics/RCPGenerator/tree/main/python_code/python/examples"
 Issues = "https://github.com/KD-physics/RCPGenerator/issues"
-Viewer = "https://kd-physics.github.io/RCPGenerator/webapp/index.html"
+"Packing App" = "https://kd-physics.github.io/RCPGenerator/webapp/index.html"
+"Packing Visualizer" = "https://kd-physics.github.io/RCPGenerator/python_code/python/webapp/app/index.html"
 
 [tool.scikit-build]
 cmake.source-dir = "."
@@ -54,7 +55,7 @@ build.verbose = true
 build = "cp310-* cp311-* cp312-* cp313-* cp314-*"
 skip = "*-musllinux_*"
 build-verbosity = 1
-test-command = "python {project}/tests/wheel_smoke.py"
+test-command = "python {project}/tests/wheel_smoke.py && python -W error::RuntimeWarning {project}/tests/wheel_smoke_features.py"
 test-requires = ["numpy"]
 
 [tool.cibuildwheel.linux]

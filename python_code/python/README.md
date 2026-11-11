@@ -14,7 +14,8 @@ analysis, searches, job scheduling, persistence, and viewer-bundle export.
 Project resources: [repository](https://github.com/KD-physics/RCPGenerator) ·
 [Getting Started notebook](https://github.com/KD-physics/RCPGenerator/blob/main/getting_started.ipynb) ·
 [examples](https://github.com/KD-physics/RCPGenerator/tree/main/python_code/python/examples) ·
-[hosted packing viewer](https://kd-physics.github.io/RCPGenerator/webapp/index.html) ·
+[interactive packing app](https://kd-physics.github.io/RCPGenerator/webapp/index.html) ·
+[large-packing visualizer](https://kd-physics.github.io/RCPGenerator/python_code/python/webapp/app/index.html) ·
 [issue tracker](https://github.com/KD-physics/RCPGenerator/issues)
 
 ## Installation
@@ -23,7 +24,7 @@ Project resources: [repository](https://github.com/KD-physics/RCPGenerator) ·
 pip install rcpgenerator
 ```
 
-Version 1.0.0 wheels are built and tested for CPython 3.10–3.14 on:
+Version 1.1.0 wheels are built and tested for CPython 3.10–3.14 on:
 
 - Windows x86-64
 - Linux x86-64
@@ -81,6 +82,35 @@ spherical, and staged-packing-fraction cases. The
 [Getting Started notebook](https://github.com/KD-physics/RCPGenerator/blob/main/getting_started.ipynb)
 is the easiest entry point for adapting a worked case.
 
+## Built-in examples
+
+`rcpgenerator.example()` lists short, complete snippets by topic: 2D, 3D and higher-dimensional packings, every
+boundary and container type, arbitrary size distributions, diameter permutation, the quench,
+contact forces, plotting, saving, the web viewer, and Voronoi analysis. `example("name")` prints
+one, ready to copy, paste and modify:
+
+```python
+import rcpgenerator
+
+rcpgenerator.example()                    # the catalogue
+rcpgenerator.example("capped_cylinder")   # one snippet
+```
+
+```text
+Boundary Conditions Examples
+  - 'walls_one_axis': hard walls along z
+  - 'walls_all_axes': closed hard-wall box
+  - 'channel_2d': 2D channel, walls in y
+  - 'disk': 2D circular container
+  - 'cylinder': periodic-axis cylinder
+  - 'capped_cylinder': cylinder with end walls
+  - 'tall_box': height in particle diameters
+  - 'sphere': spherical 3D container
+...
+```
+
+Every snippet runs as printed at a small particle count; the test suite executes each one.
+
 ## Public API at a glance
 
 The `rcpgenerator` package exports exactly these public names:
@@ -94,6 +124,7 @@ The `rcpgenerator` package exports exactly these public names:
 | `get_num_threads()` | Return the current OpenMP thread count. |
 | `render_packing(packing, ...)` | Render a 2D or 3D packing. |
 | `animate_packing_2d(packing, ...)` | Animate a previously captured 2D trajectory. |
+| `example(name=None)` | List the built-in snippets, or print one to copy. See [Built-in examples](#built-in-examples). |
 
 Use `Packing` unless you specifically need the dictionary interface.
 
@@ -126,6 +157,10 @@ packing = rcpgenerator.Packing(
 | `neighbor_max` | nonnegative `int`, `0` | Base used to preallocate each particle's neighbor row; `0` selects the dimension-specific automatic value. See [Neighbor capacity and memory](#neighbor-capacity-and-memory). |
 | `seed` | nonnegative `int`, `0` | Deterministic seed used for diameter generation, initial placement, and packing internals. Zero is a valid deterministic seed. |
 | `verbose` | `bool`, `False` | Default progress-printing choice used by `pack()` when its `verbose` argument is omitted. |
+| `diameter_permute` | `bool`, `False` | Turn on diameter permutation (which particle carries which diameter is re-assigned during compression). `False` reproduces the original algorithm bit for bit. See [Diameter permutation](#diameter-permutation). |
+| `permute_budget` | `float` in (0, 0.5], `0.25` | Exchanges per permutation pass as a fraction of N. Smaller = less uplift. |
+| `permute_interval` | `int` ≥ 1, `5` | Steps between permutation passes. Longer = fewer passes and less uplift. |
+| `permute_start` | `int`, `4000` | Step at which permutation begins. Later = less uplift. |
 
 Unknown constructor keywords raise `TypeError`. Because construction calls
 `initialize()` immediately, callers must provide valid `N`, `Ndim`, `box`, and
@@ -193,7 +228,10 @@ container's diameter:
 | `Ndim=3`, `walls=[-3, -1, -1]` | Spherical 3D container. |
 
 The core normalizes the subordinate curved entries, so the examples commonly
-use forms such as `[-2, 0]`, `[-2, 0, 1]`, or `[-3, 0, 0]`. Explicit forms are
+use forms such as `[-2, 0]`, `[-2, 0, 1]`, or `[-3, 0, 0]`. A `walls` list with the
+wrong length, a value other than `0` or `1`, or a negative entry anywhere but first
+raises `ValueError` naming the valid forms (a curved container must be the first
+entry; `rcpgenerator.example()` shows each container). Explicit forms are
 shown above to make the geometry clear. Curved-container `Packing.phi_final`
 and `Packing.phi_history` are reported relative to the actual circle, cylinder,
 or sphere volume rather than its rectangular bounding box.
@@ -281,6 +319,9 @@ packing.relax(n_steps=5000, target_phi=0.82)
 packing.update_phi(0.84)
 packing.relax(n_steps=1000, fix_diameter=True)
 ```
+
+To bring a finished packing to mechanical force balance, see
+[Quench to force balance](#quench-to-force-balance) (`packing.quench()`).
 
 ## Results and diagnostics
 
@@ -388,6 +429,183 @@ State flags are available as read-only properties:
 - `needs_initialize`: configuration changes require regeneration;
 - `needs_pack`: the realized state has no current packing result.
 
+## Diameter permutation
+
+`diameter_permute=True` enables an optional move that permutes *which particle carries
+which diameter* while the packing is being compressed. Positions are never moved by the
+permutation and the multiset of relative diameters is preserved exactly (only the
+assignment changes), so the requested distribution is what the final packing carries.
+All continuous motion still comes from the packing algorithm, which is otherwise
+unchanged. `diameter_permute=False` (the default) runs the original algorithm bit for bit.
+
+```python
+packing = rcpgenerator.Packing(..., diameter_permute=True)      # validated default recipe
+packing = rcpgenerator.Packing(..., diameter_permute=True,
+                               permute_budget=0.01)              # a gentler setting
+result = packing.pack()
+packing.permute_counts     # accepted exchanges per particle
+packing.permute_passes     # passes run
+packing.permute_exchanges  # accepted exchanges, pairwise + 3-cycle
+```
+
+**What it does.** From step `permute_start` on, every `permute_interval` steps, a pass
+ranks the particles by size, scores each particle's *capacity* (the size its local cage
+could hold) against the diameter it carries, and exchanges diameters between particles
+within a 5 % rank window when the exchange lowers the overlap energy; 3-cycles
+(A→B→C→A) are then tried to escape the pairwise local optimum. Each pass visits every
+particle once, greedily, and stops after `permute_budget · N` exchanges (the 3-cycle
+search has the same cap). Under-loaded particles grow and over-loaded ones shed size, so
+the small particles fill the voids the large ones leave and the packing jams denser. It
+works in two and three dimensions, in periodic boxes, with hard walls in any subset of
+directions, and in curved containers.
+
+**Knobs.**
+
+| Argument | Default | Meaning |
+| --- | --- | --- |
+| `diameter_permute` | `False` | Turn the permutation on. Off is the original algorithm. |
+| `permute_budget` | `0.25` | Cap on exchanges per pass as a fraction of N, in (0, 0.5]. The main dial: smaller = less uplift, on a smooth logarithmic scale (table below). |
+| `permute_interval` | `5` | Steps between passes. Longer = fewer passes, less work, less uplift. |
+| `permute_start` | `4000` | Step at which permutation begins. Later = less uplift; rarely worth changing. |
+
+The defaults are the setting that reached the highest packing fractions in validation
+(3-D power-law distributions with number density ∝ D^−3.45; φ is the packing fraction at
+the end of the run with the residual overlap removed):
+
+| size ratio S (N) | off | on (default) | gain |
+| --- | --- | --- | --- |
+| 40 (25 000) | 0.819 | 0.866 | +0.047 |
+| 80 (242 481) | 0.849 | 0.903 | +0.054 |
+| 100 (413 696) | 0.855 | 0.911 | +0.056 |
+
+The budget dials smoothly from the original algorithm to the full gain (S = 40,
+N = 25 000, one seed):
+
+| `permute_budget` | off | 4×10⁻⁵ (1/N) | 10⁻⁴ | 10⁻³ | 10⁻² | 3×10⁻² | 0.1 | 0.25 |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| φ | 0.819 | 0.821 | 0.822 | 0.840 | 0.859 | 0.863 | 0.866 | 0.866 |
+
+The cap binds on every pass up to about 3 % of N and stops binding near 10 %, where the
+gain saturates. The pass interval is the other rate knob, and wall time follows the
+number of passes (same case):
+
+| `permute_interval` | 1 | 2 | 5 (default) | 10 | 20 | 50 |
+| --- | --- | --- | --- | --- | --- | --- |
+| φ | 0.869 | 0.869 | 0.866 | 0.865 | 0.862 | 0.859 |
+| wall time vs default | 3.3× | 1.8× | 1× | 0.7× | 0.57× | 0.48× |
+
+`permute_start` moves the other way: 0.866 at 4000, 0.865 at 8000, 0.851 at 12000. The
+permutation is deterministic for a given `seed` at one thread.
+
+**Cost.** A pass costs a sort and O(N) capacity scores. At S = 80 to 100 a run with
+permutation on takes roughly 3–4× the wall time of the run with it off, most of it in the
+3-cycle search; `permute_budget=0.1` keeps nearly all of the gain at lower cost.
+
+**What it cannot do.** Permutation reassigns diameters; it does not move particles. The
+arrangement of the largest particles is set while the packing is still mobile and is not
+improved by later exchanges, which is why the gain saturates about 0.04 below the density
+an ideal largest-first (Apollonian-type) construction of the same size distribution
+reaches at S = 80 to 100.
+
+**Diagnostics.** After `pack()`, `packing.permute_counts` holds the accepted exchanges each
+particle took part in (in the current particle order), `permute_passes` the number of
+passes and `permute_exchanges` the total accepted exchanges. With permutation on, the raw
+result's `spike_log` carries these per-particle counts. The recipe is assembled from
+internal fields with a legacy `swap_` prefix; they are not part of the public API, and the
+knobs above are the supported controls.
+
+## Quench to force balance
+
+`packing.quench()` takes the packing's current state, with or without diameter
+permutation, and drives it to mechanical force balance at fixed diameters: every
+particle's contact forces cancel. It is a FIRE minimisation (Bitzek et al., Phys. Rev.
+Lett. 97, 170201, 2006) of the overlap energy; the diameters are frozen, the growth
+schedule is suspended and no permutation runs.
+
+```python
+packing.pack()
+start = packing.copy()                  # optional: keep the packed state
+packing.quench()                        # compress 0.3 %, then balance to a residual of 1e-10
+print(packing.quench_status)            # "converged", or why it stopped
+print(packing.quench_message)
+
+# tighten in stages: a quick first pass, then continue from where it stopped
+packing = start.copy()
+packing.quench(tol=1e-4)
+packing.quench(tol=1e-10, resume=True)
+```
+
+**The small compression.** A packing run stops at the edge of jamming. At exactly its own
+diameters the particles barely touch, a quench relaxes the remaining overlaps away, and
+nothing is left to balance. `kappa_mult` multiplies every diameter once before the quench
+(default 1.003, i.e. 0.3 % larger; 1.01 in 4D and above, where broad size distributions need
+the larger compression to converge reliably), which gives a load-bearing contact network with small
+overlaps. The quenched packing is therefore slightly compressed: in 3D its packing
+fraction is about 0.9 % above the run's. `resume=True` continues from the previous
+quench's state without rescaling again; combining it with `kappa_mult` is an error.
+
+**Convergence measure.** Each particle's residual is |Σ f| / Σ |f| over its contacts (wall
+contacts included): dimensionless and scale-free. `quench_residual` is the maximum over
+the load-bearing particles (Ndim + 1 or more contacts and at least 1 % of the typical
+contact load; below that, the ratio is limited by floating-point rounding, not by
+balance). `quench_global_residual` is the RMS net force over the mean contact force.
+`quench_log` holds, every `report_every` iterations, `[iteration, max residual, global
+residual, energy, load-bearing count, time step]`.
+
+**How it ends.** The quench stops as soon as one of these holds and reports which:
+
+| `quench_status` | Meaning | What to try |
+| --- | --- | --- |
+| `"converged"` | Max residual ≤ `tol`. | — |
+| `"max_iter"` | Iteration cap reached while still improving. | `quench(resume=True)` |
+| `"stalled"` | The best residual has not halved within `stall_window` iterations. | `quench(resume=True)` to keep trying, or quench the packed state with a larger `kappa_mult`. Below about 1e-8 the stop is the floating-point floor (roughly 6e-14 divided by the mean relative overlap), and the state is balanced as far as it can be. |
+| `"unjammed"` | No load-bearing particles remain: the diameters are too small for the structure to carry load. | A larger `kappa_mult`. |
+| `"step_collapse"` | FIRE's time step collapsed: it found no step it could follow downhill (typical of loose, under-compressed states). | A larger `kappa_mult`. |
+| `"non_finite"` | A non-finite force or energy appeared. | Report it; do not use the state. |
+
+Every status other than `"converged"` raises a `RuntimeWarning`, and `quench_message`
+explains the outcome and the likely cause. Whatever the outcome, the packing keeps the
+state the quench stopped in, and particle `i` keeps index `i` (positions, diameters,
+`particle_origin` and `permute_counts` stay aligned).
+
+**Where it works.** On 3-D power-law packings with the default settings the quench converges
+to 1e-10 for size ratios up to about 10 (N = 4000: 40 000–56 000 iterations, about 1 ms per
+iteration per 4000 particles at one thread). In 2D, with hard walls in one, two or three
+directions, and in disk, cylinder and sphere containers it converged in every case tested
+(N = 500, size ratio 5). The iteration count grows with N, and steeply for compressions
+close to the jamming point. Above a size ratio of about 20 the method usually cannot
+balance the packing as it is: most particles are rattlers, the load is carried through
+small particles with only two or three contacts, and the quench converges only after a
+substantial compression (S = 25 converges with `kappa_mult=1.01`; at S = 40 even the
+smallest compression that can be balanced, about 2.5 % in diameter, raises the packing
+fraction from 0.79 to 0.85). That is a compressed packing, not force balance of the
+original; at the default setting the quench gives up with a message rather than run on. Gradient,
+quasi-Newton, Newton and active-set minimisers were also tried on these states and none
+finished faster than FIRE: the last stage of convergence is a sequence of contact changes,
+which only the dynamics resolve efficiently.
+
+**Holding particles.** `held` lists indices into `positions` of particles that must not
+move. Their contacts still act on the others, and `quench_held_force` is the total force
+on all held particles. A shear step is: displace a slab of particles, hold it and a second
+slab, quench, and sum the contact forces the free particles exert on the displaced slab
+(a contact's force is its overlap along the line of centres; `examples/example_3d_quench.py`
+does this); the stress is that force over the slab's area. Keep the two slabs half a box
+apart so that they do not touch through a periodic boundary. On the validation cases, three steps of 10⁻⁵ L gave
+forces in the ratio 1 : 2.00 : 2.99, equal and opposite on the two slabs to five digits.
+
+**Settings.**
+
+| Argument | Default | Meaning |
+| --- | --- | --- |
+| `tol` | `1e-10` | Stop when the max residual is at or below this. |
+| `max_iter` | `200000` | Iteration cap for this call. |
+| `kappa_mult` | `1.003` (2D/3D), `1.01` (4D+) | One-time rescaling of all diameters before the quench. Not applied with `resume=True`. |
+| `resume` | `False` | Continue from the previous quench's state (no rescaling). |
+| `held` | `None` | Indices of particles that must not move. |
+| `stall_window` | `max(20000, 20·N)` | Give up when the best residual has not halved in this many iterations; `0` disables. |
+| `verbose` | packing's `verbose` | Print the outcome. |
+| `mass_scaled`, `dt0`, `dt_max`, `alpha0`, `mix_mode`, `report_every` | `True`, `0.05`, `0.5`, `0.03`, `1`, `500` | Advanced FIRE settings; the defaults are the measured best. `mix_mode=0` uses global velocity mixing as in the original FIRE, `1` per-particle mixing. |
+
 ## Neighbor capacity and memory
 
 The pair list uses a preallocated row for each particle. `neighbor_max` is the
@@ -400,9 +618,17 @@ ceil((d / 3) * (50 * (D_i / D_min) ** (1 + d / 6) + base))
 ```
 
 slots for particle `i`, capped at `N`. With `neighbor_max=0`, the automatic
-base is currently dimension-specific (300 in 2D, 750 in 3D, and 5500 in 4D and
-higher). A larger particle-size ratio can therefore increase memory use
-substantially even when the automatic setting succeeds.
+base is dimension-specific (300 in 2D, 750 in 3D). A larger particle-size ratio
+can therefore increase memory use substantially even when the automatic setting
+succeeds.
+
+In 4D and higher with `neighbor_max=0`, each particle instead gets four times the
+number of neighbours expected inside its search shell in a jammed packing, plus
+100 (about 250 slots per particle in 4D, 400 in 5D, 700 in 6D for equal sizes;
+larger particles get proportionally more). The number of neighbours roughly
+doubles with each added dimension, so this keeps memory proportional to what the
+packing needs: about 3 GB for two million particles in 5D. Passing `neighbor_max`
+explicitly restores the formula above in any dimension.
 
 If capacity is exhausted, the core raises a `RuntimeError` similar to:
 
@@ -540,17 +766,43 @@ provided by `Packing.relax()` and `Packing.pack()`, not by public
 | `--Ndim must be >=2` | Set `Ndim` to 2 or higher. |
 | `--box length mismatch` | Supply exactly `Ndim` box lengths. |
 | `--walls expects Ndim entries` | Supply exactly `Ndim` wall entries to the packing run. |
+| `ValueError: walls=...` | The boundary specification is malformed; the message lists the valid forms, and `rcpgenerator.example()` has a snippet for each boundary type. |
+| `UserWarning: periodic box is small for the largest particle` | A periodic box length is under about 2 largest diameters (2.1 in 2D/3D; in 4D and above more, up to about 3 for equal sizes, as the message states), so particles could interact through more than one periodic copy, which the forces do not account for. Common with few particles in 4D and above, or with broad size distributions. Use more particles, or hard walls (`walls` entry `1`) on that axis. |
 | `custom distribution needs N entries` | Provide exactly one custom diameter per particle. |
 | Initial placement exceeds its attempt limit | The requested initial `phi`, size ratio, or confined geometry is too difficult for non-overlapping random placement. Lower initial `phi` or revise the geometry/distribution. |
 | `exceeded its neighbor capacity` | Increase `neighbor_max` or reduce the particle-size ratio; see [Neighbor capacity and memory](#neighbor-capacity-and-memory). |
 | No trajectory recorded | Call `pack(capture_trajectory=True, ...)` before animation. |
 | Unsupported rendering dimension | Built-in rendering is limited to 2D and 3D, although the packing core supports higher dimensions. |
+| `RuntimeWarning: quench() did not converge` | Read `packing.quench_message`; the [quench status table](#quench-to-force-balance) lists the causes and remedies. The packing keeps the state the quench stopped in. |
 
 Use the exact lowercase distribution names documented above. An unsupported
 distribution name is not a recoverable Python validation path in the current
 initializer and should be avoided.
 
-## Interactive packing viewer
+## Interactive packing app
+
+🧪 [Open the interactive packing app](https://kd-physics.github.io/RCPGenerator/webapp/index.html)
+
+The hosted app is a self-contained 2D packing experiment. Choose the particle
+count, initial packing fraction, and diameter distribution, generate a periodic
+initial state, and run or stop its browser-based ADAM relaxation. The μ and
+learning-rate sliders can be adjusted while it runs to explore how those
+controls affect overlaps, energy, packing fraction, and the evolving
+configuration. Positions and diameters can be downloaded as CSV.
+
+This educational app is separate from the maintained `rcpgenerator` Python
+package and compiled engine.
+
+## Large-packing visualizer
+
+🔍 [Open the large-packing visualizer](https://kd-physics.github.io/RCPGenerator/python_code/python/webapp/app/index.html)
+
+The separate visualizer loads packings produced by `rcpgenerator`. It provides
+map-like pan and zoom from the full system down to individual particles while
+keeping the rendering crisp. It displays 2D packings directly and 3D packings
+through an adjustable cross-sectional slice, with periodic wrapping, hard and
+curved boundaries, color and analysis layers, field-of-view statistics, and
+PNG export.
 
 `rcptools.bridge.write_bundle` creates a viewer bundle containing
 `manifest.json`, `pos.f32`, and `dia.f32`:
@@ -567,10 +819,10 @@ write_bundle(
 )
 ```
 
-Open the [hosted packing viewer](https://kd-physics.github.io/RCPGenerator/webapp/index.html)
-and select the generated bundle folder. Solid boundaries represent hard walls
-and dashed boundaries represent periodic boundaries; the viewer can inspect 2D
-packings directly and 3D packings by cross-section.
+Open the visualizer and select the generated bundle folder or ZIP file. Solid
+boundaries represent hard walls and dashed boundaries represent periodic
+boundaries. Repository tools can also create a self-contained HTML file with
+the packing data embedded for offline inspection.
 
 The viewer application itself is not included in the Python wheel. Its
 development files and `launch.py` helper are repository-only and live in the
@@ -606,7 +858,8 @@ condition as an earlier convergence termination.
 
 Inspect the returned histories and diagnostics and apply validation appropriate
 to the intended scientific use. The package does not label every returned state
-as perfectly force-balanced or mechanically stable. Built-in visual rendering
+as perfectly force-balanced or mechanically stable; `Packing.quench()` brings a
+state to force balance where that is reachable and reports when it is not. Built-in visual rendering
 is limited to 2D and 3D, while the numerical core supports higher dimensions.
 
 ## Building from source
