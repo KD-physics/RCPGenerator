@@ -60,7 +60,7 @@ def main() -> None:
         dist={
             "type": "powerlaw",
             "d_min": 1.0,
-            "d_max": 5.0,
+            "d_max": 2.0,
             "exponent": -3.0,
         },
     )

@@ -217,6 +217,14 @@ For ordinary rectangular boxes, each `walls` entry controls one axis:
 Mixed boundaries are supported, for example `walls=[0, 0, 1]` for periodic
 `x` and `y` with hard walls in `z`.
 
+Only periodic axes wrap. Particles never interact through a hard wall or a curved
+container boundary. In 1.0.0 pair distances were also wrapped across walls, so two
+particles touching opposite walls at nearly the same position could push on each other
+through them: a few such contacts per walled packing, and after a quench those particles
+were out of balance by tens of percent of their contact load when distances were measured
+in a straight line. Walled packings made with 1.0.0 can therefore differ slightly from the
+same seed now. Periodic packings are unchanged.
+
 A negative first entry selects one curved hard boundary over the first `t`
 dimensions, where `t = -walls[0]`. The first box length is the curved
 container's diameter:
@@ -570,10 +578,16 @@ state the quench stopped in, and particle `i` keeps index `i` (positions, diamet
 
 **Where it works.** On 3-D power-law packings with the default settings the quench converges
 to 1e-10 for size ratios up to about 10 (N = 4000: 40 000–56 000 iterations, about 1 ms per
-iteration per 4000 particles at one thread). In 2D, with hard walls in one, two or three
-directions, and in disk, cylinder and sphere containers it converged in every case tested
-(N = 500, size ratio 5). The iteration count grows with N, and steeply for compressions
-close to the jamming point. Above a size ratio of about 20 the method usually cannot
+iteration per 4000 particles at one thread). It also converges in 2D, with hard walls in
+one, two or three directions, and in disk, cylinder and sphere containers (N = 500, size
+ratio 5). The iteration count grows with N, and steeply for compressions close to the
+jamming point. A small fraction of runs stop early as `"stalled"` while still converging,
+and `quench(resume=True)` usually finishes them. Each new seed or machine is a different
+realisation and can land either way. With N = 500 and size ratio 5 this happened for 2 of
+40 seeds in 3D periodic boxes at the default compression, and for 2 of 660 runs across all
+2D/3D geometries at `kappa_mult=1.01`. In 4D with hard walls and size ratio 5 it is about 1
+call in 6 (33 of 40 seeds converged in one call; 30 of 30 at size ratio 2).
+Above a size ratio of about 20 the method usually cannot
 balance the packing as it is: most particles are rattlers, the load is carried through
 small particles with only two or three contacts, and the quench converges only after a
 substantial compression (S = 25 converges with `kappa_mult=1.01`; at S = 40 even the

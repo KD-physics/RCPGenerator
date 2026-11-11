@@ -1268,7 +1268,7 @@ void get_pairs_nd_3(
     // pipelined). Same pattern that Cycle 9 introduced in forces.loop;
     // never propagated to get_pairs until now.
     double gp_inv_box[8] = {0.0};
-    for (std::size_t d = 0; d < Ndim; ++d) gp_inv_box[d] = 1.0 / box[d];
+    for (std::size_t d = 0; d < Ndim; ++d) gp_inv_box[d] = walls[d] == 0 ? 1.0 / box[d] : 0.0;  // [235] minimum image only along periodic dimensions: 0 along a wall -> no wrap
 
     // Cycle 25: build (j, x[j*Ndim+0]) packed array for cell-walk.
     // Measured per-x-load cost in this code was ~2.4 cyc per cand; cell-walk
@@ -1579,7 +1579,7 @@ static void rcp_sentinel_check(
     g_pairs_version = saved_pairs_version;
 
     double inv_box[8] = {0.0};
-    for (std::size_t d = 0; d < Ndim; ++d) inv_box[d] = 1.0 / box[d];
+    for (std::size_t d = 0; d < Ndim; ++d) inv_box[d] = walls[d] == 0 ? 1.0 / box[d] : 0.0;  // [235] minimum image only along periodic dimensions: 0 along a wall -> no wrap
 
     std::uint64_t overlaps = 0, missed = 0;
     double worst = 0.0;
@@ -2891,7 +2891,7 @@ void get_pairs_kdtree(
     // Precompute inv_box for the MIC math — same as get_pairs_nd_3 so that
     // borderline pairs (d ≈ r_c) classify identically.
     double inv_box_kd[KD_MAX_NDIM] = {0.0};
-    for (std::size_t d = 0; d < Ndim; ++d) inv_box_kd[d] = 1.0 / box[d];
+    for (std::size_t d = 0; d < Ndim; ++d) inv_box_kd[d] = walls[d] == 0 ? 1.0 / box[d] : 0.0;  // [235] minimum image only along periodic dimensions: 0 along a wall -> no wrap
 
     // ----- Per-particle locks for cross-writes (mirror sort+walk) -----------
     static std::vector<omp_lock_t> j_locks_kd;
@@ -3805,7 +3805,7 @@ void get_pairs_kdtree_nd(
     double t = std::min(std::max(median * 1.02, Dmin * 2.25), Dmax) * 0.5;
     t *= g_rcp_shell_scale_dyn;   // Cycle 21k adaptive shell
     std::vector<double> inv_box(Ndim);
-    for (std::size_t d = 0; d < Ndim; ++d) inv_box[d] = 1.0 / box[d];
+    for (std::size_t d = 0; d < Ndim; ++d) inv_box[d] = walls[d] == 0 ? 1.0 / box[d] : 0.0;  // [235] minimum image only along periodic dimensions: 0 along a wall -> no wrap
     // The tree proposes a superset: its Euclidean, double-precision test gets a small margin
     // over the exact test (float rounding of Dj/2, image-shift rounding).
     const double margin = 1e-6 * Dmax;
@@ -4208,7 +4208,7 @@ void get_forces_nd_3(
     // floor(delta * inv_box + 0.5) * box instead of floor(delta / box + 0.5)
     // * box. Replaces a division per pair-dim with a multiplication.
     double inv_box[8] = {0.0};
-    for (std::size_t d = 0; d < Ndim; ++d) inv_box[d] = 1.0 / box_data[d];
+    for (std::size_t d = 0; d < Ndim; ++d) inv_box[d] = walls[d] == 0 ? 1.0 / box_data[d] : 0.0;  // [235] minimum image only along periodic dimensions: 0 along a wall -> no wrap
 
     g_t_forces_loop.begin();
     const bool probe = rcp_cycle_probe_enabled();
