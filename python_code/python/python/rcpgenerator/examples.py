@@ -110,6 +110,163 @@ packing.quench()              # above 3D the default compression is kappa_mult=1
 print(packing.quench_status, packing.quench_iters)
 '''),
     ]),
+    ("Ellipsoid Examples", [
+        ("ellipses_2d", "2D ellipses, periodic", '''\
+import rcpgenerator
+# aspect_ratios: the other Ndim-1 axes in units of D, in DECREASING order, each <= 1; D is the LONGEST axis
+packing = rcpgenerator.Packing(N=300, Ndim=2, phi=0.1, box=[1.0, 1.0], walls=[0, 0],
+                               aspect_ratios=[0.5], seed=1)     # axes D and 0.5 D: 2:1 ellipses
+packing.pack()
+print("phi at contact =", packing.phi_contact)   # after the exact shrink to zero overlap: the value to report
+print("raw phi        =", packing.phi_final)     # end of the run, slightly overlapping, as for spheres
+packing.show_packing()
+'''),
+        ("ellipsoids_3d", "3D ellipsoids, three axes", '''\
+import rcpgenerator
+# 3D takes two ratios: [0.8, 0.6] has axes D, 0.8 D, 0.6 D; prolate is [0.5, 0.5], oblate is [1, 0.5]
+packing = rcpgenerator.Packing(N=300, Ndim=3, phi=0.05, box=[1.0, 1.0, 1.0], walls=[0, 0, 0],
+                               aspect_ratios=[0.8, 0.6], seed=1,
+                               dist={"type": "lognormal", "mu": 0.0, "sigma": 0.2})   # distribution of D
+packing.pack()
+print("phi at contact =", packing.phi_contact)   # packing.show_packing() draws it (3D rendering is slow)
+'''),
+        ("ellipsoid_shapes", "a shape per particle", '''\
+import rcpgenerator
+N = 300
+shapes = [[0.9]] * (N // 2) + [[0.4]] * (N - N // 2)   # one row per particle; row i -> the i-th LARGEST particle
+packing = rcpgenerator.Packing(N=N, Ndim=2, phi=0.1, box=[1.0, 1.0], walls=[0, 0], aspect_ratios=shapes,
+                               dist={"type": "lognormal", "mu": 0.0, "sigma": 0.25}, seed=3)
+packing.pack()        # afterwards aspect_ratios[k] is the shape of particle k, in the order of diameters[k]
+print("phi at contact =", packing.phi_contact, " particle 0:", packing.diameters[0], packing.aspect_ratios[0])
+packing.show_packing()
+'''),
+        ("ellipsoid_orientations", "orientations in and out", '''\
+import numpy as np, rcpgenerator
+N, a = 300, np.radians(30.0)
+R = [[np.cos(a), -np.sin(a)], [np.sin(a), np.cos(a)]]      # a rotation matrix; its columns are the body axes
+packing = rcpgenerator.Packing(N=N, Ndim=2, phi=0.1, box=[1.0, 1.0], walls=[0, 0], aspect_ratios=[0.5], seed=1,
+                               orientations=[R] * N)       # optional: leave it out and random ones are generated
+packing.pack()                                             # orientations evolve together with the positions
+long_axis = np.asarray(packing.orientations)[:, :, 0]      # (N, 2): unit vector along each particle's longest axis
+angle = np.degrees(np.arctan2(long_axis[:, 1], long_axis[:, 0])) % 180.0
+print("phi at contact =", packing.phi_contact, " first angles (degrees):", angle[:3].round(1))
+'''),
+        ("ellipsoid_permute", "permutation with ellipsoids", '''\
+import rcpgenerator
+dist = {"type": "powerlaw", "d_min": 1.0, "d_max": 5.0, "exponent": -3.0}
+for on in (False, True):   # an exchange trades diameter AND shape between two particles; orientations stay in place
+    packing = rcpgenerator.Packing(N=400, Ndim=2, phi=0.1, box=[1.0, 1.0], walls=[0, 0], dist=dist, seed=1,
+                                   aspect_ratios=[0.8], diameter_permute=on)   # ell_permute_orient=1: they travel too
+    packing.pack()
+    print(f"permute {'on ' if on else 'off'}  phi at contact = {packing.phi_contact:.4f}  exchanges = {packing.permute_exchanges}")
+'''),
+        ("ellipsoid_quench", "quench, and the retry", '''\
+import warnings, rcpgenerator
+packing = rcpgenerator.Packing(N=300, Ndim=2, phi=0.1, box=[1.0, 1.0], walls=[0, 0], aspect_ratios=[0.5], seed=1)
+packing.pack()
+packed = packing.copy()                   # keep the packed state: a quench changes the packing in place
+with warnings.catch_warnings():
+    warnings.simplefilter("ignore", RuntimeWarning)
+    packing.quench()                      # force AND torque balance; defaults here: kappa_mult=1.01, dt_max=0.2
+    if packing.quench_status != "converged":     # retry the PACKED state: lower dt_max, or kappa_mult=1.02
+        packing = packed.copy()
+        packing.quench(dt_max=0.1)
+print(packing.quench_status, packing.quench_residual, packing.quench_iters)
+'''),
+    ]),
+    ("Rod Examples", [
+        ("rods_capped_2d", "2D rods, round ends", '''\
+import rcpgenerator
+# rod_length and rod_radius are in units of each particle's D. With rod_radius=0.5, D is the rod's thickness.
+packing = rcpgenerator.Packing(N=300, Ndim=2, phi=0.1, box=[1.0, 1.0], walls=[0, 0], seed=1,
+                               rod_length=2.0,      # straight section: 2 thicknesses (3 from tip to tip)
+                               rod_radius=0.5,
+                               rod_capped=True)     # a half-disc on each end (2D: a stadium)
+packing.pack()
+print("phi at contact =", packing.phi_contact)
+packing.show_packing()
+'''),
+        ("rods_flat_2d", "2D rectangles, hard walls", '''\
+import rcpgenerator
+# rod_capped=False: flat ends. rod_length is then the FULL length: these are 2 x 1 rectangles
+packing = rcpgenerator.Packing(N=300, Ndim=2, phi=0.1, box=[1.0, 1.0], walls=[0, 1],   # periodic in x, walls in y
+                               rod_length=2.0, rod_radius=0.5, rod_capped=False, seed=2)
+packing.pack()
+print("phi at contact =", packing.phi_contact)
+packing.show_packing()
+'''),
+        ("rods_3d", "3D rods, both kinds", '''\
+import rcpgenerator
+for capped in (True, False):   # True: spherocylinders; False: flat-ended cylinders (2D and 3D only, slower in 3D)
+    packing = rcpgenerator.Packing(N=250, Ndim=3, phi=0.05, box=[1.0, 1.0, 1.0], walls=[0, 0, 0],
+                                   rod_length=1.5, rod_radius=0.5, rod_capped=capped, seed=1)
+    packing.pack()
+    print("capped " if capped else "flat   ", "phi at contact =", packing.phi_contact)
+'''),
+        ("rod_lengths", "two rod lengths mixed", '''\
+import rcpgenerator
+N = 300
+lengths = [0.5] * (N // 2) + [3.0] * (N - N // 2)   # one entry per particle; entry i -> the i-th LARGEST particle
+packing = rcpgenerator.Packing(N=N, Ndim=2, phi=0.1, box=[1.0, 1.0], walls=[0, 0], seed=1,
+                               rod_length=lengths, rod_radius=0.5, rod_capped=True)   # rod_radius may be a list too
+packing.pack()        # afterwards rod_length[k] belongs to particle k, in the order of diameters[k]
+print("phi at contact =", packing.phi_contact, " particle 0 has length", packing.rod_length[0])
+packing.show_packing()
+'''),
+        ("rod_quench", "quench, and the retry", '''\
+import warnings, rcpgenerator
+packing = rcpgenerator.Packing(N=300, Ndim=2, phi=0.1, box=[1.0, 1.0], walls=[0, 0], seed=1,
+                               rod_length=2.0, rod_radius=0.5, rod_capped=True)
+packing.pack()
+packed = packing.copy()                   # keep the packed state: a quench changes the packing in place
+with warnings.catch_warnings():
+    warnings.simplefilter("ignore", RuntimeWarning)
+    packing.quench()                      # 2D and 3D; balances slightly rounded rods (rod_round=0.01)
+    if packing.quench_status != "converged":     # retry the PACKED state: lower dt_max, or kappa_mult=1.02
+        packing = packed.copy()
+        packing.quench(dt_max=0.1)
+print(packing.quench_status, packing.quench_residual, packing.quench_iters)
+'''),
+        ("shapes_in_containers", "ellipsoids, rods in containers", '''\
+import rcpgenerator
+# the same walls values as for spheres: [-2, 0] disk, [-2, 0, 0] cylinder, [-3, 0, 0] sphere
+cases = {"ellipsoids in a sphere": dict(Ndim=3, walls=[-3, 0, 0], aspect_ratios=[1.0, 0.5]),
+         "rectangles in a disk": dict(Ndim=2, walls=[-2, 0], rod_length=2.0, rod_radius=0.5, rod_capped=False),
+         "capped rods in a cylinder": dict(Ndim=3, walls=[-2, 0, 0], rod_length=1.0, rod_radius=0.5, rod_capped=True)}
+for name, kw in cases.items():
+    packing = rcpgenerator.Packing(N=200, box=[1.0] * kw["Ndim"], seed=1, **kw)
+    packing.pack()
+    print(f"{name}: phi at contact = {packing.phi_contact:.4f}")   # against the container's volume
+packing.show_packing()
+'''),
+        ("rods_fix_height", "slab a few rods tall", '''\
+import rcpgenerator
+packing = rcpgenerator.Packing(N=200, Ndim=3, box=[1.0, 1.0, 3.0], walls=[0, 0, 1], fix_height=True,
+                               rod_length=1.0, rod_radius=0.5, rod_capped=True, seed=1)
+packing.pack()               # the height stays 3 x the largest rod's full extent (tip to tip)
+extent = max(packing.diameters) * (packing.rod_length + 2 * packing.rod_radius)
+print("height / rod extent =", packing.box[-1] / extent, " phi =", packing.phi_contact)
+'''),
+        ("rod_movie", "movie of rods packing", '''\
+import rcpgenerator
+packing = rcpgenerator.Packing(N=120, Ndim=2, phi=0.1, box=[1.0, 1.0], walls=[0, 0], seed=4,
+                               rod_length=2.0, rod_radius=0.5, rod_capped=True)   # ellipses work the same way
+packing.pack(capture_trajectory=True, trajectory_spacing="log", trajectory_per_decade=12)   # frames even in log(step)
+print(len(packing.trajectory_steps), "frames;", len(packing.trajectory_orientations[0]), "orientations in each")
+packing.animate_2d(path="rods.gif", show=False)   # each rod at its recorded position, size and orientation
+'''),
+        ("shapes_in_viewer", "ellipsoids, rods in viewer", '''\
+import rcpgenerator
+from rcptools.bridge import write_bundle
+kw = dict(N=300, Ndim=3, phi=0.05, box=[1.0, 1.0, 1.0], walls=[0, 0, 0], seed=1)
+e = rcpgenerator.Packing(aspect_ratios=[0.8, 0.6], **kw); e.pack()
+write_bundle("my_ellipsoids", e.positions, e.diameters, e.box, walls=e.walls,
+             aspect_ratios=e.aspect_ratios, orientations=e.orientations)      # one shape for all particles only
+r = rcpgenerator.Packing(rod_length=1.5, rod_radius=0.5, rod_capped=True, **kw); r.pack()
+write_bundle("my_rods", r.positions, r.diameters, r.box, walls=r.walls, rod_length=r.rod_length,
+             rod_radius=r.rod_radius, rod_capped=r.rod_capped, orientations=r.orientations)
+'''),
+    ]),
     ("Boundary Conditions Examples", [
         ("walls_one_axis", "hard walls along z", '''\
 import rcpgenerator

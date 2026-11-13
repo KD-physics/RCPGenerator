@@ -3,7 +3,8 @@
 `rcpgenerator` generates dense packings of polydisperse particles with a
 Python interface backed by a compiled C++/OpenMP engine. It supports disks,
 spheres, and higher-dimensional hyperspheres in periodic boxes, hard-wall
-boxes, and curved containers. The stateful `Packing` class covers the usual
+boxes, and curved containers, and it packs ellipsoids and rods in the same boxes
+and containers (see [Ellipsoids and rods](#ellipsoids-and-rods)). The stateful `Packing` class covers the usual
 workflow from initialization through relaxation, inspection, persistence, and
 visualization. Public dictionary-based functions are also available for callers
 that need direct access to the compiled layer.
@@ -24,19 +25,18 @@ Project resources: [repository](https://github.com/KD-physics/RCPGenerator) ·
 pip install rcpgenerator
 ```
 
-Version 1.1.0 wheels are built and tested for CPython 3.10–3.14 on:
+The version 1.2.0 wheel workflow builds and tests CPython 3.10–3.14 on:
 
 - Windows x86-64
 - Linux x86-64
 - macOS 15 or later on Apple Silicon
 - macOS 14 or later on Intel
 
-GitHub Actions has verified wheel building, dependency repair, clean
-installation, and installed-package smoke tests for every listed Python version
-and platform. Wheels have also been installed and run manually on Windows
-x86-64, macOS Apple Silicon, and Linux x86-64. The macOS Intel wheels are
-verified through GitHub Actions; no manual test on a physical Intel Mac is
-currently claimed.
+GitHub Actions verifies wheel building, dependency repair, clean installation,
+and installed-package smoke tests for every listed Python version and platform.
+Previous wheel builds have also been installed and run manually on Windows
+x86-64, macOS Apple Silicon, and Linux x86-64. macOS Intel is verified through
+GitHub Actions; no manual test on a physical Intel Mac is claimed.
 
 Installing a compatible wheel does not require Git, CMake, Visual Studio,
 Xcode, a local C++ compiler, or a separately configured OpenMP installation.
@@ -84,8 +84,9 @@ is the easiest entry point for adapting a worked case.
 
 ## Built-in examples
 
-`rcpgenerator.example()` lists short, complete snippets by topic: 2D, 3D and higher-dimensional packings, every
-boundary and container type, arbitrary size distributions, diameter permutation, the quench,
+`rcpgenerator.example()` lists short, complete snippets by topic: 2D, 3D and higher-dimensional packings,
+ellipsoids (one shape or a shape per particle, orientations, permutation, quench), rods (round and flat ends,
+mixed lengths, quench, a movie, the viewer), every boundary and container type, arbitrary size distributions, diameter permutation, the quench,
 contact forces, plotting, saving, the web viewer, and Voronoi analysis. `example("name")` prints
 one, ready to copy, paste and modify:
 
@@ -122,11 +123,14 @@ The `rcpgenerator` package exports exactly these public names:
 | `run_packing(input, config)` | Low-level dictionary API for a standard packing run. |
 | `set_num_threads(n)` | Set the OpenMP thread count; `n` must be at least 1. |
 | `get_num_threads()` | Return the current OpenMP thread count. |
-| `render_packing(packing, ...)` | Render a 2D or 3D packing. |
-| `animate_packing_2d(packing, ...)` | Animate a previously captured 2D trajectory. |
+| `render_packing(packing, ...)` | Render a 2D or 3D packing of spheres, ellipsoids, or rods. |
+| `animate_packing_2d(packing, ...)` | Animate a previously captured 2D trajectory (discs, ellipses, or rods). |
 | `example(name=None)` | List the built-in snippets, or print one to copy. See [Built-in examples](#built-in-examples). |
 
-Use `Packing` unless you specifically need the dictionary interface.
+Use `Packing` unless you specifically need the dictionary interface. Ellipsoids and rods add no
+new names: they are selected by `Packing` keywords (`aspect_ratios`, or `rod_length` and `rod_radius`),
+and their results are `Packing` attributes (`orientations`, `phi_contact`, `shrink_factor`) and the method
+`shrink_to_contact()`. See [Ellipsoids and rods](#ellipsoids-and-rods).
 
 ## `Packing` configuration
 
@@ -161,6 +165,13 @@ packing = rcpgenerator.Packing(
 | `permute_budget` | `float` in (0, 0.5], `0.25` | Exchanges per permutation pass as a fraction of N. Smaller = less uplift. |
 | `permute_interval` | `int` ≥ 1, `5` | Steps between permutation passes. Longer = fewer passes and less uplift. |
 | `permute_start` | `int`, `4000` | Step at which permutation begins. Later = less uplift. |
+| `aspect_ratios` | list of `Ndim - 1` `float`, or `N` such lists; default none | Pack ellipsoids. `D` is the longest axis and axis `k` has length `D × ratio_k`; the ratios are written in decreasing order, each at most 1. One list for all particles, or one per particle. See [Ellipsoids](#ellipsoids). |
+| `orientations` | `N` rotation matrices (`Ndim × Ndim`); default generated | Starting orientations for ellipsoids or rods, one per particle; columns are the body axes. Omit to have random ones generated. Not accepted without a shape. |
+| `rod_length` | `float` or list of `N`; default none | Pack rods. Length of the straight section in units of `D` (capped rods), or the full length (flat-ended rods). Requires `rod_radius`. See [Rods](#rods). |
+| `rod_radius` | `float` or list of `N`; default none | Rod radius in units of `D`; `0.5` makes `D` the rod's thickness. Requires `rod_length`. |
+| `rod_capped` | `bool`, `True` | `True`: a half-sphere on each end. `False`: flat ends (2D and 3D only). One value for the packing. |
+| `ell_permute_orient` | `int`, `0` | With `diameter_permute=True` and ellipsoids or rods: `0` exchanges diameter and shape and leaves orientations in place; `1` makes the orientation travel with the particle. See [Permutation with ellipsoids and rods](#permutation-with-ellipsoids-and-rods). |
+| `ell_iters`, `ell_track_tol` | `int`, `5`; `float`, `1e-6` | Advanced controls of the ellipsoid contact solve during a run: at most `ell_iters + 1` evaluations per pair per step, and the tolerance at which a pair's solution carried over from the previous step is accepted after one evaluation (also used for 3D flat-ended rods). `phi_contact` is always computed from a converged solve. |
 
 Unknown constructor keywords raise `TypeError`. Because construction calls
 `initialize()` immediately, callers must provide valid `N`, `Ndim`, `box`, and
@@ -266,9 +277,10 @@ configuration. It returns a dictionary with:
 - `diameter_scale_factor`: common scale applied to generated diameters;
 - `phi_modifier`: curved-container volume fraction, or `1.0` for an ordinary box.
 
-Assigning `phi`, `N`, `Ndim`, `box`, `walls`, `fix_height`, or `dist` marks the
+Assigning `phi`, `N`, `Ndim`, `box`, `walls`, `fix_height`, `dist`, `aspect_ratios`,
+`rod_length`, `rod_radius`, or `rod_capped` marks the
 object for reinitialization. The next `pack()` calls `initialize()`
-automatically. Assigning `seed`, `neighbor_max`, `positions`, or `diameters`
+automatically. Assigning `seed`, `neighbor_max`, `positions`, `diameters`, or `orientations`
 marks only the packing result stale.
 
 ### `Packing.pack()`
@@ -292,6 +304,10 @@ result = packing.pack(
 `pack()` returns the raw result dictionary and also updates the corresponding
 `Packing` attributes. Trajectory capture consumes additional memory roughly in
 proportion to the number of samples times `N * Ndim`.
+
+A run stops when both the largest pair overlap and the net force on the particles are small (or
+at the step cap). Results can differ slightly from versions 1.0.0 and 1.1.0: in rare cases
+(a box too small for its largest particles, very elongated shapes) a run takes more steps.
 
 ### `Packing.relax()`
 
@@ -351,6 +367,11 @@ After `pack()` or `relax()`, the most commonly used attributes are:
 | `mu_history` | Chemical-potential value by step. |
 | `alpha_history` | Learning-rate value by step. |
 | `mu_flag_history` | Chemical-potential rung indicator (`-1`, `0`, or `1`) by step. |
+| `orientations` | Ellipsoids and rods: final rotation matrices, shape `(N, Ndim, Ndim)`, in the particle order of `positions`; columns are the body axes, column 0 the longest axis or the rod's axis. Empty for spheres. |
+| `aspect_ratios`, `rod_length`, `rod_radius` | The shape. When given per particle, the table or list in the particle order of `positions`. |
+| `phi_contact` | Ellipsoids and rods: packing fraction after the exact shrink to zero overlap; the value to report. `None` for spheres. See [Reading the result](#reading-the-result-phi_contact-and-phi_final). |
+| `shrink_factor` | Ellipsoids and rods: the common factor of that shrink; multiply every diameter by it. `None` for spheres. |
+| `shrink_to_contact()` | Method: the same shrink computed on the current state, for spheres too (periodic boxes, flat walls and curved containers). Returns `scale`, `phi`, `n_overlapping`, `pair`; does not modify the packing. |
 
 The step histories have length `steps`; they are not padded to a requested
 maximum. Check outputs using the validation appropriate to your scientific
@@ -397,7 +418,10 @@ When `capture_trajectory=True`, these attributes contain sampled values:
 - `trajectory_steps`;
 - `trajectory_positions` and `trajectory_diameters`;
 - `trajectory_phi`, `trajectory_force`, and `trajectory_energy`;
-- `trajectory_max_min_dist`.
+- `trajectory_max_min_dist`;
+- `trajectory_origin`: for each frame, the index at the start of the run of the particle in each slot (the
+  packer renumbers particles while it runs; see [Rendering and animation](#rendering-and-animation));
+- `trajectory_orientations`: ellipsoids and rods only, one `Ndim × Ndim` rotation matrix per particle per frame.
 
 They are cleared at the start of every new packing execution.
 
@@ -425,6 +449,10 @@ with open("packing.json", "w", encoding="utf-8") as stream:
 with open("packing.json", encoding="utf-8") as stream:
     restored = rcpgenerator.Packing.from_dict(json.load(stream))
 ```
+
+Sphere states saved by versions 1.0 and 1.1 load in version 1.2. Ellipsoid and
+rod states require RCPGenerator 1.2 or newer; older releases do not understand
+their shape and orientation fields.
 
 `to_dict()` preserves the principal histories and captured trajectory, but not
 every advanced raw diagnostic listed above. Save the raw result separately if
@@ -566,15 +594,78 @@ residual, energy, load-bearing count, time step]`.
 | --- | --- | --- |
 | `"converged"` | Max residual ≤ `tol`. | — |
 | `"max_iter"` | Iteration cap reached while still improving. | `quench(resume=True)` |
-| `"stalled"` | The best residual has not halved within `stall_window` iterations. | `quench(resume=True)` to keep trying, or quench the packed state with a larger `kappa_mult`. Below about 1e-8 the stop is the floating-point floor (roughly 6e-14 divided by the mean relative overlap), and the state is balanced as far as it can be. |
+| `"stalled"` | The best residual has not halved within `stall_window` iterations. | Quench the packed state again with a lower `dt_max` or a slightly larger `kappa_mult` (see below); `quench(resume=True)` only if the residual was still falling. Below about 1e-8 the stop is the floating-point floor (roughly 6e-14 divided by the mean relative overlap), and the state is balanced as far as it can be. |
 | `"unjammed"` | No load-bearing particles remain: the diameters are too small for the structure to carry load. | A larger `kappa_mult`. |
-| `"step_collapse"` | FIRE's time step collapsed: it found no step it could follow downhill (typical of loose, under-compressed states). | A larger `kappa_mult`. |
+| `"step_collapse"` | FIRE's time step collapsed: it found no step it could follow downhill (typical of loose, under-compressed states). | Quench the packed state again with a lower `dt_max`, or a larger `kappa_mult`. |
 | `"non_finite"` | A non-finite force or energy appeared. | Report it; do not use the state. |
 
 Every status other than `"converged"` raises a `RuntimeWarning`, and `quench_message`
 explains the outcome and the likely cause. Whatever the outcome, the packing keeps the
 state the quench stopped in, and particle `i` keeps index `i` (positions, diameters,
 `particle_origin` and `permute_counts` stay aligned).
+
+**If a quench stalls or fails, retry it from the packed state** with either a lower `dt_max`
+or slightly more compression (`kappa_mult`). `dt_max` is the largest time step the minimiser
+may take (default 0.5 for spheres, 0.2 for ellipsoids and rods); `kappa_mult` is the factor
+applied once to every diameter before the minimisation (default 1.003, and 1.01 for
+ellipsoids, rods and 4D and above). A quench changes the packing in place, so keep a copy of
+the packed state:
+
+```python
+import warnings
+import rcpgenerator
+packing = rcpgenerator.Packing(N=300, Ndim=2, phi=0.1, box=[1.0, 1.0], walls=[0, 0],
+                               aspect_ratios=[0.5], seed=1)
+packing.pack()
+packed = packing.copy()                # the packed state, before the first quench
+with warnings.catch_warnings():
+    warnings.simplefilter("ignore", RuntimeWarning)   # a quench that does not converge warns
+    packing.quench()
+    if packing.quench_status != "converged":
+        packing = packed.copy()
+        packing.quench(dt_max=0.1)     # or: packing.quench(kappa_mult=1.02)
+print(packing.quench_status, packing.quench_iters)
+```
+
+An example from the development runs: 400 ellipses of elongation 4 (`aspect_ratios=[0.25]`),
+whose quench at the defaults (`kappa_mult=1.01`, `dt_max=0.2`) was still at a residual of 0.4
+after 200,000 iterations.
+
+| Retry of the packed state | Outcome | Iterations |
+| --- | --- | --- |
+| `quench(dt_max=0.1)` | converged | 35,248 |
+| `quench(dt_max=0.05)` | converged | 157,347 |
+| `quench(kappa_mult=1.02)` | converged | 15,830 |
+| default settings, then `quench(resume=True)` | not converged | 200,000 more |
+
+What to take from it:
+
+- **Either remedy works.** Half the time step or 1 % more compression each brought the packing
+  to a residual of 1e-10. More compression changes the state that is balanced (the particles
+  are larger); a lower `dt_max` does not.
+- **Do not go much lower on `dt_max` than needed.** Going from 0.1 to 0.05 cost 4.5 times the
+  iterations. Halve it once, and again only if that fails.
+- **Resuming with unchanged settings does not help a quench that is stuck.** `resume=True` is
+  for a run that was still improving when it stopped (status `"max_iter"`, or `"stalled"`
+  while the residual was still falling slowly).
+- **When a lower `dt_max` does not help, more compression is the next thing to try** (second
+  example below).
+
+A second example: **flat-ended rods in 3D inside a curved container often need a retry.** A
+flat end standing on a curved wall is held by many points of its rim at once, a much stiffer
+contact than any other in the packing. In a survey of 150 flat-ended rods (`rod_length=1.5`,
+three seeds per container):
+
+| Container | Converged at the defaults | After a retry with `dt_max=0.1` | The remaining case |
+| --- | --- | --- | --- |
+| periodic box | 3 of 3 | | |
+| sphere | 1 of 3 | 3 of 3 | |
+| cylinder | 2 of 3 | 2 of 3 | `dt_max=0.05`: not converged after 200,000 iterations; `kappa_mult=1.02`: converged in 10,275 |
+
+Ellipsoids, capped rods and 2D rectangles in curved containers converged at the defaults in
+the cases tested.
+
+The defaults for ellipsoids and rods are already gentler than for spheres for this reason.
 
 **Where it works.** On 3-D power-law packings with the default settings the quench converges
 to 1e-10 for size ratios up to about 10 (N = 4000: 40 000–56 000 iterations, about 1 ms per
@@ -619,6 +710,524 @@ forces in the ratio 1 : 2.00 : 2.99, equal and opposite on the two slabs to five
 | `stall_window` | `max(20000, 20·N)` | Give up when the best residual has not halved in this many iterations; `0` disables. |
 | `verbose` | packing's `verbose` | Print the outcome. |
 | `mass_scaled`, `dt0`, `dt_max`, `alpha0`, `mix_mode`, `report_every` | `True`, `0.05`, `0.5`, `0.03`, `1`, `500` | Advanced FIRE settings; the defaults are the measured best. `mix_mode=0` uses global velocity mixing as in the original FIRE, `1` per-particle mixing. |
+
+With ellipsoids and rods the defaults of `kappa_mult` and `dt_max` are `1.01` and `0.2`, and rods take
+one more argument, `rod_round`; see [Quench](#quench-with-ellipsoids-and-rods) under Ellipsoids and rods.
+
+## Ellipsoids and rods
+
+The same algorithm packs particles that are not spheres: ellipses and ellipsoids, and rods with round
+or flat ends. Every particle then also has an orientation, which is relaxed together with its position
+while the particles grow. The shape is chosen by constructor keywords: `aspect_ratios` for ellipsoids,
+or `rod_length` and `rod_radius` for rods (one or the other, never both). Without these keywords
+the sphere code path is the one of 1.1.0; results differ from 1.1.0 only where the two repairs listed in
+`CHANGELOG.md` act (when a run stops, and the step size in curved containers).
+
+Everything else on this page still applies, with the exceptions listed under
+[What works with them and what refuses them](#what-works-with-them-and-what-refuses-them).
+`rcpgenerator.example()` has a group of snippets for each shape.
+
+### Ellipsoids
+
+```python
+import numpy as np
+import rcpgenerator
+
+packing = rcpgenerator.Packing(
+    N=300,
+    Ndim=2,
+    box=[1.0, 1.0],
+    walls=[0, 0],
+    aspect_ratios=[0.5],       # second axis = 0.5 D: 2:1 ellipses
+    seed=1,
+)
+packing.pack()
+
+print("phi at contact:", packing.phi_contact)
+orientations = np.asarray(packing.orientations)   # shape (N, Ndim, Ndim)
+print("long axis of particle 0:", orientations[0][:, 0])
+packing.render(path="ellipses.png")
+```
+
+**`aspect_ratios` and what `D` means.** `D`, the diameter drawn from `dist`, is the full length of a
+particle along its first body axis, and that axis is its **longest**. `aspect_ratios` lists the other
+`Ndim - 1` axes in units of `D`: axis `k` has length `D × ratio_k`.
+
+| `Ndim` | `aspect_ratios` | Axes | Shape |
+| --- | --- | --- | --- |
+| 2 | `[0.5]` | `D`, `0.5 D` | 2:1 ellipse |
+| 3 | `[0.5, 0.5]` | `D`, `0.5 D`, `0.5 D` | Prolate (one long axis), 2:1 |
+| 3 | `[1, 0.5]` | `D`, `D`, `0.5 D` | Oblate (one short axis), 2:1 |
+| 3 | `[0.8, 0.6]` | `D`, `0.8 D`, `0.6 D` | Three different axes |
+
+**The decreasing-order rule.** The ratios are written longest first and none exceeds 1:
+`1 ≥ ratio_2 ≥ ratio_3 ≥ … > 0`. Every shape then has exactly one way of being written. Input that
+breaks the rule raises `ValueError`; it is not reordered for you, because that would rescale `D` and
+change what the size distribution means. To convert a shape written another way, divide `D` by the
+largest ratio and list the ratios longest first: axes `D × (1, 2)` become `aspect_ratios=[0.5]` with
+`D` twice as large. The size distribution is therefore the distribution of longest-axis lengths, and a
+particle's volume is the volume of a sphere of diameter `D` times the product of its ratios.
+
+**One list, or one per particle.** A single list applies to every particle. A list of `N` lists gives
+each particle its own shape; every row obeys the order rule. Which particle gets which row depends on where the diameters
+come from:
+
+- **Diameters generated by the package** (any `dist` but `"custom"`): row `i` goes to the `i`-th
+  **largest** particle, because the generated particles are sorted by decreasing diameter before the
+  shapes are attached. A table drawn independently of size is thus a random assignment.
+- **Your own diameter list** (`dist={"type": "custom", "custom": [...]}`): row `i` belongs to entry
+  `i` of your diameter list and stays with it through the sort. This is the way to tie a shape to a
+  size.
+
+After `pack()`, `packing.aspect_ratios` is the table in
+the packing's own particle order: row `k` is the shape of the particle at `positions[k]` with
+`diameters[k]`.
+
+```python
+import rcpgenerator
+
+N = 250
+shapes = [[0.8, 0.6]] * 125 + [[0.5, 0.5]] * 125    # one row per particle
+packing = rcpgenerator.Packing(
+    N=N, Ndim=3, box=[1.0, 1.0, 1.0], walls=[0, 0, 0],
+    dist={"type": "lognormal", "mu": 0.0, "sigma": 0.2},
+    aspect_ratios=shapes,      # the 125 largest particles get [0.8, 0.6]
+    seed=1,
+)
+packing.pack()
+print("phi at contact:", packing.phi_contact)
+print("particle 0:", packing.diameters[0], packing.aspect_ratios[0])
+```
+
+**Orientations in and out.** `packing.orientations` holds one `Ndim × Ndim` rotation matrix per
+particle, in the same particle order as `positions`. The columns of a matrix are the particle's body
+axes in the box frame, so column 0 is the direction of its longest axis. The initializer generates
+random orientations, as it generates positions, and `pack()` returns the final ones. To start from
+your own, pass `orientations=` to the constructor: one matrix per particle (nested, or flat as
+`Ndim × Ndim` numbers row by row), in the order of `packing.diameters` after construction (largest
+first). Orientations without `aspect_ratios` (or the rod keywords) raise `ValueError`: supply a shape
+and orientations, or a shape alone, or neither.
+
+```python
+import numpy as np
+import rcpgenerator
+
+N, angle = 200, np.radians(30.0)
+R = [[np.cos(angle), -np.sin(angle)],
+     [np.sin(angle), np.cos(angle)]]          # columns = body axes; column 0 = long axis
+packing = rcpgenerator.Packing(
+    N=N, Ndim=2, box=[1.0, 1.0], walls=[0, 0],
+    aspect_ratios=[0.5],
+    orientations=[R] * N,                     # every ellipse starts at 30 degrees
+    seed=1,
+)
+packing.pack()                                # orientations evolve with the positions
+long_axis = np.asarray(packing.orientations)[:, :, 0]
+degrees = np.degrees(np.arctan2(long_axis[:, 1], long_axis[:, 0])) % 180.0
+print("final angles of the first three particles:", degrees[:3].round(1))
+```
+
+### Rods
+
+Two kinds of rod, chosen with `rod_capped`, one value for the whole packing:
+
+| `rod_capped` | Shape | What `rod_length` measures |
+| --- | --- | --- |
+| `True` (default) | A straight section with a half-sphere on each end (a spherocylinder; in 2D a stadium). | The **straight section only**. The rod is `rod_length + 2 × rod_radius` from tip to tip, and a capped rod of length 0 is exactly a sphere. |
+| `False` | Flat ends: a cylinder (in 2D a rectangle). 2D and 3D only. | The **full length** of the rod. It must be positive. |
+
+**How the two numbers combine with `D`.** Both `rod_length` and `rod_radius` are in units of the
+particle's `D` from the size distribution: the straight length is `D × rod_length` and the radius is
+`D × rod_radius`. With `rod_radius=0.5`, `D` is the rod's thickness and `rod_length` is its length in
+thicknesses; a capped rod with `rod_length=2` is then 3 thicknesses from tip to tip. The particles
+grow by scaling `D`, so a rod keeps its shape while it grows. Both keywords are required together, and
+there is no ordering rule.
+
+Flat-ended rods stop with larger leftover forces than other shapes; if force balance matters, use
+[`quench()`](#quench-to-force-balance) on the packed state.
+
+**Per-particle lists.** Each of `rod_length` and `rod_radius` is one number for every particle or a
+list of `N`. As for ellipsoids, entry `i` goes to the `i`-th largest particle when the package generates the
+diameters, and with entry `i` of your own diameter list when you supply one (`dist` of type
+`"custom"`); after `pack()`
+`packing.rod_length` and `packing.rod_radius` are in the packing's own particle order.
+
+**Orientations** work exactly as for ellipsoids. Only the direction of the rod's axis matters; it is
+the first body axis, column 0 of the particle's matrix.
+
+Capped rods:
+
+```python
+import rcpgenerator
+
+packing = rcpgenerator.Packing(
+    N=250, Ndim=3, box=[1.0, 1.0, 1.0], walls=[0, 0, 0],
+    rod_length=1.5,            # straight section: 1.5 thicknesses, 2.5 from tip to tip
+    rod_radius=0.5,            # radius 0.5 D, so D is the thickness
+    rod_capped=True,           # half-sphere ends
+    seed=1,
+)
+packing.pack()
+print("phi at contact:", packing.phi_contact)
+```
+
+Flat-ended rods, here 2 × 1 rectangles between hard walls:
+
+```python
+import rcpgenerator
+
+packing = rcpgenerator.Packing(
+    N=300, Ndim=2, box=[1.0, 1.0],
+    walls=[0, 1],              # periodic in x, hard walls in y
+    rod_length=2.0,            # full length: 2 thicknesses
+    rod_radius=0.5,
+    rod_capped=False,          # flat ends
+    seed=2,
+)
+packing.pack()
+print("phi at contact:", packing.phi_contact)
+packing.render(path="rectangles.png")
+```
+
+Two lengths in one packing:
+
+```python
+import rcpgenerator
+
+N = 300
+packing = rcpgenerator.Packing(
+    N=N, Ndim=2, box=[1.0, 1.0], walls=[0, 0],
+    rod_length=[0.5] * (N // 2) + [3.0] * (N - N // 2),   # one entry per particle
+    rod_radius=0.5,
+    rod_capped=True,
+    seed=1,
+)
+packing.pack()
+print("phi at contact:", packing.phi_contact)
+print("particle 0 has straight length", packing.rod_length[0], "x D")
+```
+
+### Reading the result: `phi_contact` and `phi_final`
+
+An ellipsoid or rod packing carries two packing fractions:
+
+| Attribute | Meaning |
+| --- | --- |
+| `phi_final` | The raw value at the end of the run, as for spheres. The particles still overlap slightly. |
+| `phi_contact` | The packing fraction after every particle has been shrunk by one common factor to exact contact, so that no pair and no wall overlaps. **This is the value to report.** |
+| `shrink_factor` | That common factor (at most 1). Multiply every diameter by it to obtain the non-overlapping configuration. |
+
+Both fractions use the true particle volume (ellipsoid or rod, not the bounding sphere).
+`pack()` fills `phi_contact` and `shrink_factor` for ellipsoids and rods; for spheres they stay
+`None`.
+
+`packing.shrink_to_contact()` computes the same shrink on the current state at any time, for spheres
+as well, in periodic boxes, with flat walls and in curved containers. It returns a dictionary with `scale` (the factor, with a
+safety margin of 1e-12), `phi` (the packing fraction at that scale), `n_overlapping` (contacts that
+overlapped before the shrink) and `pair` (the tightest pair). It does not modify the packing.
+
+```python
+import numpy as np
+import rcpgenerator
+
+packing = rcpgenerator.Packing(N=300, Ndim=2, box=[1.0, 1.0], walls=[0, 0],
+                               aspect_ratios=[0.5], seed=1)
+packing.pack()
+print("raw:", packing.phi_final, " at contact:", packing.phi_contact)
+contact_diameters = np.asarray(packing.diameters) * packing.shrink_factor   # no overlap left
+
+spheres = rcpgenerator.Packing(N=300, Ndim=2, box=[1.0, 1.0], walls=[0, 0], seed=1)
+spheres.pack()
+shrunk = spheres.shrink_to_contact()          # works for spheres too
+print("spheres raw:", spheres.phi_final, " at contact:", shrunk["phi"], " factor:", shrunk["scale"])
+```
+
+The shrink is exact for ellipsoids, capped rods and 2D flat-ended rods. For 3D flat-ended rods the
+factor is a lower bound, so `phi_contact` can be slightly too low but the shrunk configuration never
+overlaps.
+
+### What works with them and what refuses them
+
+Ellipsoids and rods work wherever spheres do: every boundary and container, `fix_height`, permutation,
+the quench, rendering, the viewer and animation. The few things that are not extended raise an error;
+nothing runs on the assumption that the particles are spheres. They are listed under
+[What still refuses them](#what-still-refuses-them).
+
+| Feature | Ellipsoids | Rods |
+| --- | --- | --- |
+| Periodic boxes; hard walls on any subset of axes (`walls` entries `0`, `1`) | Yes | Yes |
+| Diameter distributions (`dist`) | Yes: the distribution of `D` | Yes: the distribution of `D` |
+| Dimensions | 2 to 8 | Capped: 2 to 8. Flat-ended: 2 and 3; above, `NotImplementedError` |
+| Curved containers (negative first `walls` entry): disk, cylinder, sphere, and their higher-dimensional forms | Yes, in every dimension | Capped: every dimension. Flat-ended: 2D and 3D |
+| `fix_height=True` | Yes: the height is a multiple of the largest `D` | Yes: a multiple of the largest rod's full extent (tip to tip, or the diagonal of a flat-ended rod) |
+| `diameter_permute=True` | Yes | Yes |
+| `quench()` | Yes | 2D and 3D; above, `NotImplementedError` |
+| `copy()`, `to_dict()`, `from_dict()` | Yes: shapes and orientations are carried | Yes |
+| `render()`, `savefig()`, `show_packing()` | 2D and 3D, true axes and orientations | 2D and 3D |
+| `animate_2d()` | Yes | Yes |
+| Viewer bundle (`write_bundle`) | 2D and 3D, one shape for all particles; a per-particle table raises `NotImplementedError` | 2D and 3D, per-particle lists included |
+
+**Curved containers** use the same `walls` values as for spheres (`[-2, 0]`: a disk; `[-2, 0, 0]`: a
+cylinder, with `1` instead of the last `0` for end walls; `[-3, 0, 0]`: a sphere), and `phi_contact` is
+the particle volume over the container's own volume. A particle touches the wall where its farthest
+point from the container's axis reaches it.
+
+```python
+import rcpgenerator
+
+# oblate ellipsoids in a sphere
+packing = rcpgenerator.Packing(N=200, Ndim=3, box=[1.0, 1.0, 1.0], walls=[-3, 0, 0],
+                               aspect_ratios=[1.0, 0.5], seed=1)
+packing.pack()
+print("ellipsoids in a sphere:   phi =", round(packing.phi_contact, 4))
+
+# flat-ended rods (rectangles) in a disk
+packing = rcpgenerator.Packing(N=200, Ndim=2, box=[1.0, 1.0], walls=[-2, 0],
+                               rod_length=2.0, rod_radius=0.5, rod_capped=False, seed=1)
+packing.pack()
+print("rectangles in a disk:     phi =", round(packing.phi_contact, 4))
+
+# capped rods in a slab whose height stays 3 rods (tip to tip) tall
+packing = rcpgenerator.Packing(N=200, Ndim=3, box=[1.0, 1.0, 3.0], walls=[0, 0, 1], fix_height=True,
+                               rod_length=1.0, rod_radius=0.5, rod_capped=True, seed=1)
+packing.pack()
+print("capped rods, fix_height:  phi =", round(packing.phi_contact, 4))
+```
+
+Examples at N = 300 (one seed): 2:1 ellipses in a disk 0.871, 2 x 1 rectangles in a disk 0.870, capped
+rods in a disk 0.879; prolate ellipsoids in a cylinder 0.66, oblate ellipsoids in a sphere 0.65. As for
+spheres, the fraction in a container is lower than in a periodic box of the same N, because of the layer
+at the wall.
+
+#### What still refuses them
+
+| What | Ellipsoids | Rods | Why |
+| --- | --- | --- | --- |
+| Flat-ended rods above 3D | – | `NotImplementedError` | The contact of two flat-ended cylinders is worked out for 2D and 3D only. Capped rods work in every dimension. |
+| `quench()` of rods above 3D | works | `NotImplementedError` | Rods are balanced as slightly rounded rods, and that contact is written for 2D and 3D. |
+| More than 8 dimensions | error | error | The fixed-size arrays of the shape code (the sphere kernel has the same limit). |
+| Viewer bundle with a per-particle `aspect_ratios` table | `NotImplementedError` | lists work | The viewer draws one ellipsoid shape for all particles; `render()` draws tables. |
+| Viewer bundle above 3D | as spheres | `NotImplementedError` | The viewer shows 2D packings and slices of 3D ones. |
+| `animate_2d()` with a shape per particle and `diameter_permute=True` | `NotImplementedError` | `NotImplementedError` | Exchanges move shapes between particles and the frames do not record which shape sat where. |
+| Research inputs of the core: the distribution morph (`morph_target`), fixed particles, the internal `swap_*` settings and swap injection, the quench's two-level, activity-damping, warm-up and per-particle-reset variants | error | error | Undocumented research features that work from sphere quantities; only the public `diameter_permute` and `quench()` are extended. |
+
+Not a refusal, but a limit to know: **the quench of 3D flat-ended rods in a curved container often needs
+a retry** at the default settings (lower `dt_max`, then slightly more compression); see
+[Quench to force balance](#quench-to-force-balance).
+
+#### Permutation with ellipsoids and rods
+
+`diameter_permute=True` works with both shapes, with the same controls as for spheres
+(`permute_budget`, `permute_interval`, `permute_start`; see
+[Diameter permutation](#diameter-permutation)). An exchange trades the **diameter and the shape** of
+two particles; positions are not moved. By default the **orientations stay in place**
+(`ell_permute_orient=0`): each site keeps its orientation and receives the other particle's size and
+shape. `ell_permute_orient=1` makes the orientation travel with the particle, so that the two whole
+particles trade places. The keyword has this name for rods too.
+
+Two particles may be exchanged only when they are alike in every direction: every axis length within
+5 % for ellipsoids, straight length and radius each within 5 % for rods. Shapes further apart than
+that are never exchanged with each other, so in a mixture of two well-separated shapes each shape is
+permuted on its own. There is no 3-cycle pass for these shapes.
+
+```python
+import rcpgenerator
+
+dist = {"type": "powerlaw", "d_min": 1.0, "d_max": 5.0, "exponent": -3.0}
+for permute in (False, True):
+    packing = rcpgenerator.Packing(
+        N=300, Ndim=2, box=[1.0, 1.0], walls=[0, 0], dist=dist, seed=1,
+        aspect_ratios=[0.8],
+        diameter_permute=permute,      # add ell_permute_orient=1 to make orientations travel
+    )
+    packing.pack()
+    print(f"permute {permute}: phi at contact = {packing.phi_contact:.4f}, "
+          f"exchanges = {packing.permute_exchanges}")
+```
+
+Measured gain in `phi_contact` on power-law size distributions, permutation on against off, same
+seeds:
+
+| Shape | Orientations in place (default) | Orientations travel (`ell_permute_orient=1`) |
+| --- | --- | --- |
+| Ellipses and ellipsoids | +0.007 to +0.025 (2D), +0.007 to +0.018 (3D) | 0.000 to +0.002 for `aspect_ratios` of 0.8 and below |
+| Capped rods | +0.012 to +0.029 | No gain |
+| Flat-ended rods | +0.023 to +0.071 (2D rectangles most) | No gain, except +0.006 to +0.023 for 2D rectangles |
+
+For ellipsoids the default gains a quarter to a half of what spheres gain on the same sizes, most for
+shapes nearest a sphere. A mixture of two well-separated ellipsoid shapes gained no more than its
+less favourable shape alone, and a mixture of two rod lengths no more than its better length alone. The cost is higher than for spheres: at N = 1000 on one thread a run with permutation took 3.6
+to 4.6 times as long as the run without it for ellipsoids with orientations in place (4.5 to 6.3 times
+with travelling orientations), against 1.7 to 2.0 times for spheres. These timings are from two seeds
+and the pass has not been optimised.
+
+#### Quench with ellipsoids and rods
+
+`packing.quench()` moves positions and orientations together and brings the packing to force **and
+torque** balance. The residual of a particle combines its net force and its net torque (divided by
+the particle's bounding radius) relative to the sum of its contact forces. Statuses, `resume`, `held` and the
+other arguments are as described under [Quench to force balance](#quench-to-force-balance). Two
+defaults differ from spheres:
+
+| Argument | Spheres | Ellipsoids and rods | Why |
+| --- | --- | --- | --- |
+| `kappa_mult` | `1.003` (2D/3D) | `1.01` | At 0.3 % compression the quench did not converge for the more elongated or flattened ellipsoids (2D at 4:1, 3D prolate and oblate at 3:1, and the three-axis shape `[0.8, 0.64]`); at 1 % all converged. |
+| `dt_max` | `0.5` | `0.2` | At 0.5 the time step keeps overshooting and being cut back on elongated or flattened shapes: in an earlier survey 50 of 56 cases converged and 2D ellipses at 4:1 never did, where 0.2 brought all 56 to balance. With an exact contact solution in both cases, 0.5 still failed on 4 of 6 of the hardest cases and took 7 to 29 times the iterations on the other 2. |
+
+**If a quench of ellipsoids or rods stalls or fails, quench the packed state again with a lower
+`dt_max` (0.1, say) or slightly more compression (`kappa_mult=1.02`)**, as shown with measured
+numbers under [Quench to force balance](#quench-to-force-balance). Resuming with unchanged settings
+does not help, and a `dt_max` much lower than needed costs many more iterations. Keep a copy of the packed state for this,
+because a quench changes the packing in place.
+
+```python
+import warnings
+import rcpgenerator
+
+packing = rcpgenerator.Packing(N=200, Ndim=2, box=[1.0, 1.0], walls=[0, 0],
+                               aspect_ratios=[0.5], seed=1)
+packing.pack()
+packed = packing.copy()                # keep the packed state
+with warnings.catch_warnings():
+    warnings.simplefilter("ignore", RuntimeWarning)
+    packing.quench()                   # kappa_mult=1.01, dt_max=0.2 for this shape
+    if packing.quench_status != "converged":
+        packing = packed.copy()        # start again from the packed state
+        packing.quench(dt_max=0.1)     # retry the packed state: lower dt_max, or kappa_mult=1.02
+print(packing.quench_status, packing.quench_residual, packing.quench_iters)
+```
+
+**Rods are quenched as slightly rounded rods.** Where two flat sides or ends rest on each other, the
+contact energy of a sharp rod has a kink and a minimiser finds no balance point: trial quenches of
+sharp rods stalled in 4 of 4 cases. For the quench each rod is therefore replaced by a rod whose edges
+are rounded by 1 % (`rod_round=0.01`, an argument of `quench()` for rods). The balanced state is that
+of the rounded rods at 1 % compression. The packing itself is always made with the sharp shape.
+`rod_round=0` quenches the sharp rods and usually stalls. The rounded contact exists in 2D and 3D, so
+rods cannot be quenched in 4D and above.
+
+**Where it has been run.** With the defaults, 52 of 53 ellipsoid cases converged to a residual of
+1e-10 (the one that did not, 2D ellipses at 4:1, is the retry example under
+[Quench to force balance](#quench-to-force-balance)): 2D ellipses from nearly round to 4:1, 3D prolate and oblate shapes to 3:1 and a three-axis
+shape, hard walls, two size distributions, 4D, and N up to 2000, with two or three seeds each. The
+median was 14,100 iterations, against roughly 2,000 to 5,000 for spheres. For rods, 78 of 78 cases
+converged to 1e-10: 2D and 3D, capped and flat-ended, `rod_length` from 0.25 to 4, lognormal sizes,
+hard walls and mixed lengths. More elongated shapes than these have not been tried. The quenched state
+is not a small perturbation of the packed one: at 1 % compression the median particle moved 0.1 to
+0.2 `D` in the ellipsoid cases (N = 400).
+
+#### Rendering, the viewer and animation
+
+`render()`, `savefig()` and `show_packing()` draw ellipses, ellipsoids and rods with their true axes
+and orientations, in 2D and 3D, including a shape per particle. As for spheres, 2D pictures include
+the periodic images and 3D pictures do not. Drawing a 3D packing takes much longer than packing it.
+
+`animate_2d()` draws ellipses and rods at their recorded positions, sizes and orientations; capture
+the trajectory as for discs (see [Rendering and animation](#rendering-and-animation)).
+`trajectory_orientations[f][k]` is the rotation matrix of the particle in slot `k` of frame `f`. One
+combination is refused: a shape per particle (an `aspect_ratios` table, or a list for `rod_length` or
+`rod_radius`) together with `diameter_permute=True` raises `NotImplementedError`, because exchanges
+move shapes between particles and the frames do not record which shape sat where.
+
+`rcptools.bridge.write_bundle` writes the shape and the orientations into the viewer bundle. The
+viewer then shows a 2D packing directly and a 3D packing through its slice, where each particle
+appears as the exact outline that the slicing plane cuts from it. Pass the shape and the orientations
+together:
+
+```python
+import rcpgenerator
+from rcptools.bridge import write_bundle
+
+ellipses = rcpgenerator.Packing(N=80, Ndim=2, box=[1.0, 1.0], walls=[0, 0],
+                                aspect_ratios=[0.5], seed=1)
+ellipses.pack(capture_trajectory=True, trajectory_spacing="log", trajectory_per_decade=8)
+ellipses.render(path="ellipses.png")
+ellipses.animate_2d(path="ellipses.gif", show=False)
+write_bundle("my_ellipses", ellipses.positions, ellipses.diameters, ellipses.box,
+             walls=ellipses.walls,
+             aspect_ratios=ellipses.aspect_ratios, orientations=ellipses.orientations)
+
+rods = rcpgenerator.Packing(N=80, Ndim=2, box=[1.0, 1.0], walls=[0, 0],
+                            rod_length=2.0, rod_radius=0.5, rod_capped=True, seed=1)
+rods.pack()
+write_bundle("my_rods", rods.positions, rods.diameters, rods.box, walls=rods.walls,
+             rod_length=rods.rod_length, rod_radius=rods.rod_radius,
+             rod_capped=rods.rod_capped, orientations=rods.orientations)
+```
+
+Leaving out the shape arguments and the orientations writes an ordinary sphere bundle of diameter `D`
+without an error, so pass them whenever the packing has a shape. The viewer draws each ellipse as a
+polygon, one object per particle; this has been used up to N = 2500 and is not meant for the
+hundreds of thousands of particles that the disc display handles.
+
+### Cost and limits
+
+All numbers in this section are wall times of a complete `pack()` on one thread against a sphere
+packing with the same N, dimension and size distribution. *Elongation* is the longest axis divided by
+the shortest.
+
+**Ellipsoids** (N = 1000, equal sizes, one seed):
+
+| Shape | `aspect_ratios` | Time against spheres | `phi_contact` |
+| --- | --- | --- | --- |
+| 2D, elongation 1.25 to 2 | `[0.8]` to `[0.5]` | 2.1 to 2.3 times | 0.881 to 0.892 |
+| 2D, elongation 3 | `[0.333]` | 2.7 times | 0.858 |
+| 2D, elongation 4 | `[0.25]` | 3.2 times | 0.841 |
+| 2D, elongation 6 | `[0.167]` | 3.8 times | 0.802 |
+| 3D prolate, elongation 1.25 to 2 | `[0.8, 0.8]` to `[0.5, 0.5]` | 2.4 to 3.7 times | 0.695 to 0.709 |
+| 3D prolate, elongation 3 | `[0.333, 0.333]` | 6 times | 0.661 |
+| 3D prolate, elongation 4 | `[0.25, 0.25]` | 9 times | 0.621 |
+| 3D prolate, elongation 8 | `[0.125, 0.125]` | 23 times | 0.467 |
+| 3D oblate, elongation 1.25 to 2 | `[1, 0.8]` to `[1, 0.5]` | 2.2 to 2.7 times | 0.692 to 0.705 |
+| 3D oblate, elongation 4 | `[1, 0.25]` | 3.5 times | 0.623 |
+| 3D, three axes | `[0.8, 0.64]` | 2.7 times | 0.725 |
+
+Up to an elongation of 2 an ellipsoid packing takes 2.1 to 3.7 times as long as the sphere packing
+(3.0 times at N = 4000 on four threads, for prolate ellipsoids of elongation 1.5). Beyond that the
+cost is set by the neighbour search, which works on the particles' bounding spheres of diameter `D`:
+the number of pairs whose bounding spheres overlap grows roughly as the square of the elongation for
+prolate shapes, and the time follows it. Oblate shapes are much cheaper than prolate ones at the same
+elongation. Peak memory was 100 to 160 MB at N = 1000 whatever the shape. The packing fraction falls
+smoothly as the elongation grows.
+
+Where ellipsoids stop working (one seed each):
+
+- **3D prolate:** elongation 8 packs; elongation 12 fails with the `exceeded its neighbor capacity`
+  error, because a particle's bounding sphere then has more neighbours than its row holds. A larger
+  `neighbor_max` was not tried.
+- **2D:** elongation 12 packs; elongation 20 did not reach a jammed packing within the step limit.
+- **Oblate** shapes pack down to at least `[1, 0.08]`. Size ratios of 50 in 2D and 10 in 3D pack
+  (elongation 1.5), as do 4D and 5D ellipsoids. The shape code has a hard limit of 8 dimensions.
+
+**Rods** (N = 1000, `rod_radius=0.5`, equal sizes, mean of two seeds):
+
+| `rod_length` | 2D capped | 2D flat-ended | 3D capped | 3D flat-ended |
+| --- | --- | --- | --- | --- |
+| 0.5 | 2.1 times | — | 2.3 times | — |
+| 1 | 2.3 times | 2.6 times | 3.2 times | 7.0 times |
+| 2 | 3.0 times | 2.7 times | 6.2 times | 6.7 times |
+| 4 | 4.0 times | 3.4 times | 12 times | 9.5 times |
+
+Short rods, up to 2 thicknesses from tip to tip, take 2.1 to 2.7 times as long as spheres in 2D and
+2.3 to 3.2 times for capped rods in 3D. **3D flat-ended rods are the slowest shape: 6 to 7 times the
+sphere time even when short.** Two flat faces resting on each other have no closed-form contact, so
+each such contact is solved iteratively inside every step. As for ellipsoids, the time for longer rods
+follows the number of neighbours inside the bounding spheres: for 3D capped rods at N = 500, 12
+neighbours per rod and 5 s at `rod_length=0.5`, 384 neighbours and 79 s at `rod_length=16`, against
+2 s for spheres. Memory stayed between 78 and 125 MB in those runs.
+
+Packing fractions at contact from single runs at N = 1000 (`rod_radius=0.5`): 3D capped 0.708, 0.696,
+0.666 and 0.594 at `rod_length` 0.5, 1, 2 and 4; 3D flat-ended 0.684, 0.659 and 0.583 at 1, 2 and 4;
+2D capped 0.894 to 0.900, with stacks of parallel rods; 2D flat-ended 0.936, 0.887 and 0.855 at 1, 2
+and 4.
+
+Where rods stop working (one seed each, N = 500):
+
+- **Rods longer than half the box.** A rod that long can meet a periodic copy of its neighbour or of
+  itself, which the forces do not account for (`rod_length=16` at N = 500 is such a case). The
+  `periodic box is small` warning takes the rod's full extent into account; use more particles.
+- **3D flat-ended rods at `rod_length=16`** ended loose, with 0.6 contacts per rod.
+- **Capped rods in 5D** failed with the `exceeded its neighbor capacity` error at the automatic
+  setting; 4D packs.
 
 ## Neighbor capacity and memory
 
@@ -700,12 +1309,14 @@ packing.show_packing(palette_choice=3)
 
 `render()` returns the output path as a string when saving, otherwise `None`.
 It raises `ValueError` outside 2D and 3D. `savefig()` is a convenience wrapper
-with the renderer's default figure size and DPI.
+with the renderer's default figure size and DPI. Ellipsoids and rods are drawn with their
+true shapes and orientations, by the same calls; see
+[Rendering, the viewer and animation](#rendering-the-viewer-and-animation).
 
 To animate 2D relaxation, capture a trajectory during the run:
 
 ```python
-packing.pack(capture_trajectory=True, trajectory_interval=250)
+packing.pack(capture_trajectory=True, trajectory_spacing="log")   # frames evenly in log(step)
 packing.animate_2d(
     path="packing.gif",       # GIF is the only supported saved format
     show=False,
@@ -718,6 +1329,18 @@ packing.animate_2d(
 `animate_2d()` returns a Matplotlib `FuncAnimation`. It requires a 2D packing
 and a captured trajectory. In a notebook, leaving `show=True` displays an HTML
 animation when possible.
+
+Almost all of the motion happens in the first few hundred of some 16,000 steps.
+`trajectory_spacing="log"` records frames evenly in the logarithm of the step
+(`trajectory_per_decade` frames per factor of 10, default 20, about 85 frames in all), so
+the movie shows the particles spreading and growing throughout. The default,
+`trajectory_spacing="linear"`, records one frame every `trajectory_interval` steps, which
+is nearly still after the first frames.
+
+The packer renumbers particles while it runs, so `trajectory_positions[f][k]` is not the
+same particle in every frame `f`. `trajectory_origin[f][k]` gives the identity (the index
+at the start of the run) of the particle in slot `k` of frame `f`; `animate_2d()` uses it
+so that a particle keeps its colour for the whole movie.
 
 ## Low-level dictionary API
 
@@ -767,6 +1390,13 @@ advanced `fixed` mask of length `N`, where `1` exempts that particle's diameter
 from global diameter scaling and `0` leaves it active. The `config` dictionary
 accepts `box`, `walls`, `neighbor_max`, `seed`, and `fix_height`.
 
+For ellipsoids, add `orientations` to `input` (one flat list of `Ndim × Ndim` numbers per particle, a
+rotation matrix row by row) and `aspect_ratios` to `config`. For rods, add `orientations`, `rod_length`
+and `rod_radius` (lists of one number or of `N`) to `input` and `rod_capped` to `config`. At this level
+nothing generates orientations for you: a shape without orientations, or orientations without a shape,
+raises `RuntimeError`, and with neither the sphere code runs unchanged. The result then also carries
+`orientations`.
+
 This function performs a standard run with the engine defaults. Explicit
 maximum-step, target-fraction, progress-observer, and trajectory controls are
 provided by `Packing.relax()` and `Packing.pack()`, not by public
@@ -787,7 +1417,21 @@ provided by `Packing.relax()` and `Packing.pack()`, not by public
 | `exceeded its neighbor capacity` | Increase `neighbor_max` or reduce the particle-size ratio; see [Neighbor capacity and memory](#neighbor-capacity-and-memory). |
 | No trajectory recorded | Call `pack(capture_trajectory=True, ...)` before animation. |
 | Unsupported rendering dimension | Built-in rendering is limited to 2D and 3D, although the packing core supports higher dimensions. |
-| `RuntimeWarning: quench() did not converge` | Read `packing.quench_message`; the [quench status table](#quench-to-force-balance) lists the causes and remedies. The packing keeps the state the quench stopped in. |
+| `ValueError: aspect_ratios = [...] breaks the order rule` | The ratios are not in decreasing order or one exceeds 1. `D` is the longest axis: divide `D` by the largest ratio and list the ratios longest first, for example `[0.5]` and not `[2.0]`. The input is never reordered for you. |
+| `aspect_ratios needs Ndim-1 = ... entries` | Give one ratio for each axis after the first: one number in 2D, two in 3D. |
+| `a per-particle aspect_ratios table needs one row per particle`, `rod_length as a list needs one entry per particle` | A per-particle table or list must have exactly `N` entries. |
+| `orientations were given without aspect_ratios (or rod_length and rod_radius)` | Orientations need a shape. Supply the shape as well, or leave both out for spheres. |
+| `orientations needs one rotation per particle` | Pass exactly `N` rotation matrices, each `Ndim × Ndim`. |
+| `rods need both rod_length and rod_radius` | Give both keywords; `rod_radius=0.5` makes `D` the rod's thickness. |
+| `rod_length / rod_radius were given together with aspect_ratios` | A packing is of rods or of ellipsoids, not both. |
+| `rod_length must be positive: an uncapped rod of length 0 has no volume`, `rod_radius must be positive` | A flat-ended rod needs a positive length (a capped rod may have length 0, which is a sphere); every rod needs a positive radius. |
+| `NotImplementedError: uncapped (flat-ended) rods are implemented in 2D and 3D only` | Use capped rods above 3D. |
+| `NotImplementedError: ... is not supported with aspect_ratios (ellipsoids) yet` (or `with rods (rod_length / rod_radius) yet`) | The named feature (a research input such as the distribution morph or fixed particles) has not been extended to these shapes; see [What works with them and what refuses them](#what-works-with-them-and-what-refuses-them). |
+| `NotImplementedError: quench() of rods uses the rounded-rod contact` | Rods can be quenched in 2D and 3D only. |
+| `NotImplementedError: animate_2d with a shape per particle AND diameter_permute is not supported` | Animate a run without permutation, or with one shape for all particles. |
+| `NotImplementedError: viewer bundle: a per-particle aspect_ratios table is not supported yet` | The viewer draws one ellipsoid shape for all particles; `Packing.render()` draws tables. |
+| `exceeded its neighbor capacity` with long ellipsoids or rods | The neighbour search works on bounding spheres, so very elongated particles have many neighbours. See [Cost and limits](#cost-and-limits). |
+| `RuntimeWarning: quench() did not converge` | Read `packing.quench_message`; the [quench status table](#quench-to-force-balance) lists the causes and remedies. With ellipsoids or rods, first quench the packed state again with a lower `dt_max`. The packing keeps the state the quench stopped in. |
 
 Use the exact lowercase distribution names documented above. An unsupported
 distribution name is not a recoverable Python validation path in the current
@@ -833,6 +1477,9 @@ write_bundle(
 )
 ```
 
+For ellipsoids and rods, pass the shape and the orientations as well; the call is shown under
+[Rendering, the viewer and animation](#rendering-the-viewer-and-animation).
+
 Open the visualizer and select the generated bundle folder or ZIP file. Solid
 boundaries represent hard walls and dashed boundaries represent periodic
 boundaries. Repository tools can also create a self-contained HTML file with
@@ -874,7 +1521,9 @@ Inspect the returned histories and diagnostics and apply validation appropriate
 to the intended scientific use. The package does not label every returned state
 as perfectly force-balanced or mechanically stable; `Packing.quench()` brings a
 state to force balance where that is reachable and reports when it is not. Built-in visual rendering
-is limited to 2D and 3D, while the numerical core supports higher dimensions.
+is limited to 2D and 3D, while the numerical core supports higher dimensions. Ellipsoids and rods
+cost more than spheres and stop working at large elongations; the measured numbers are under
+[Cost and limits](#cost-and-limits).
 
 ## Building from source
 

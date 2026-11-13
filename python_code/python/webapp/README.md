@@ -41,3 +41,22 @@ wrap, large-N load, color-by, palettes, FOV stats, PNG-DPI, standalone file://, 
 overlay vs toolbox. `python gallery.py` -> `gallery/gallery.png` (visual review).
 Note: software-GL renders the same pixels (correctness valid); fps is a floor —
 on-GPU (e.g. RTX) is faster.
+
+## Ellipsoids and rods
+A bundle may carry a shape: `manifest.json` gains `aspect_ratios` (ndim-1 numbers; axis k has length
+D x ratio) and `orientations` (`ori.f32`: one row-major ndim x ndim rotation matrix per particle, columns =
+body axes). `rcptools.bridge.write_bundle(..., aspect_ratios=..., orientations=...)` writes them; `launch.py`
+embeds them. A 2D packing is then drawn as ellipses; a 3D packing is cut by the slice plane and each particle
+appears as the exact ellipse the plane cuts from it. The slice control has a "normal: z / y / x" selector.
+Bundles without these keys, and bundles whose ratios are all 1, are drawn exactly as before (discs through the
+`ScatterplotLayer`); ellipses are filled 96-point polygons on the exact outline (`PolygonLayer`).
+Code: `loader.js` (`VIZ.shapeMatrices`, `VIZ.bundleFiles`), `slice.js` (`VIZ.sliceEllipsoid`,
+`VIZ.computeSliceEllipsoid`), `wrap.js` (ghosts by half-extent), `render2d.js` (`ellipseLayer`), `ui.js` (axis
+selector).
+
+Rods: `write_bundle(..., rod_length=..., rod_radius=..., rod_capped=..., orientations=...)` adds
+`manifest["rods"] = {capped, length, radius}` (length and radius in units of each particle's D, each a number or
+a file of N float32) and the same `orientations` entry; the rod's axis is column 0 of its matrix. A 2D packing is
+drawn as stadiums (round ends) or rectangles (flat ends); a 3D packing is cut by the slice plane and each rod
+appears as the exact outline the plane cuts from it. Code: `rod.js`. Rod bundles are 2D and 3D only, and a shape
+per particle (an `aspect_ratios` table) is not supported in a bundle.

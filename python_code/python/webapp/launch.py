@@ -21,6 +21,12 @@ def embed(bundle_dir, out_file=None):
     man = json.loads((bundle_dir / "manifest.json").read_text())
     files = {"manifest.json": None}
     need = [man["positions"]["file"], man["diameters"]["file"]] + [L["file"] for L in man.get("layers", [])]
+    if man.get("orientations"):                      # ellipsoids: one rotation per particle
+        need.append(man["orientations"]["file"])
+    for key in ("length", "radius"):                 # rods: per-particle length / radius, when given as lists
+        entry = (man.get("rods") or {}).get(key)
+        if isinstance(entry, dict):
+            need.append(entry["file"])
     enc = {}
     for f in need:
         enc[f] = base64.b64encode((bundle_dir / f).read_bytes()).decode()

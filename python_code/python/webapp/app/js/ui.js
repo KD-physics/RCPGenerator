@@ -43,12 +43,17 @@ VIZ.buildUI = function (renderer, data, source) {
   // 3D slice slider
   let sliceRow = null;
   if (source) {
-    const Lz = source.box[2];
     const sl = el('input', { id: 'sliceSlider', type: 'range', min: 0, max: 1000, value: 500, style: 'width:100%' });
     const lbl = el('span', { textContent: 'z = 0.50' });
-    sl.oninput = () => { const z = (sl.value / 1000) * Lz; lbl.textContent = 'z = ' + (sl.value / 1000).toFixed(2);
-      renderer.setSlice(z); if (renderer.state.colorBy) applyColor(); VIZ.stats.draw(); };
-    sliceRow = row('3D cross-section', el('div', {}, [sl, lbl]));
+    // plane normal: z (default, as before), y or x. The slider runs over the box length along that axis.
+    const axSel = el('select', { id: 'sliceAxis', style: 'margin-left:8px' });
+    [['z', 2], ['y', 1], ['x', 0]].forEach(([n, v]) => axSel.appendChild(el('option', { value: String(v), textContent: 'normal: ' + n })));
+    const moveSlice = () => { const ax = parseInt(axSel.value), z = (sl.value / 1000) * source.box[ax];
+      lbl.textContent = 'xyz'[ax] + ' = ' + (sl.value / 1000).toFixed(2);
+      renderer.setSlice(z, ax); if (renderer.state.colorBy) applyColor(); VIZ.stats.draw(); };
+    sl.oninput = moveSlice;
+    axSel.onchange = () => { moveSlice(); renderer.fit(); };
+    sliceRow = row('3D cross-section', el('div', {}, [sl, lbl, axSel]));
   }
 
   // PNG export

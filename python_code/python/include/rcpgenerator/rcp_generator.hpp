@@ -182,6 +182,34 @@ struct PackingConfig {
     long   quench_stall_window = 0;     // stop as "stalled" when the best residual has not fallen by quench_stall_factor
     double quench_stall_factor = 0.5;   //   within this many iterations
     double quench_dt_min = 0.0;         // stop as "step collapse" when FIRE's time step falls below this
+    // Ellipsoids (additive; rcpgenerator/ellipsoid.hpp). Empty -> spheres, the code path is untouched.
+    // Ndim-1 numbers in decreasing order, 1 >= ratio_2 >= ... > 0: axis k (k = 2..Ndim) has length D x ratio_k;
+    // D is the first and LONGEST axis. One shape for every particle; for a shape per particle use
+    // PackingInput::aspect_ratios instead (not both). Must come with PackingInput::orientations.
+    std::vector<double> aspect_ratios;
+    int ell_iters = 5;                  // fixed number of contact-function iterations per overlapping pair
+    double ell_rot_scale = 1.0;         // orientation step = ell_rot_scale x alpha / (bounding radius)
+    double ell_track_tol = 1e-6;        // lam tracking tolerance inside a run (0: fixed ell_iters + 1 evaluations)
+    // Diameter permutation with ellipsoids (BUILD.md section 8; see ell_permute_pass in ellipsoid.hpp)
+    // Rods (additive; rcpgenerator/rod.hpp). rod_capped applies when PackingInput::rod_length / rod_radius are set:
+    // 1 capped (half-sphere ends), 0 uncapped (flat ends).
+    int rod_capped = 1;
+    // Rounded rods (rod.hpp, "rounded rods"): relative rounding eps of the rod's edges. rod_round applies to single
+    // evaluations (evaluate_once); quench_rod_round to a quench run. 0: the sharp rod of the packing loop.
+    double rod_round = 0.0;
+    double quench_rod_round = 0.0;
+    // Trajectory samples spaced evenly in log(step) instead of every trajectory_interval steps: this many per
+    // decade of steps (0: off, the interval is used). Only read when positions are captured.
+    int trajectory_per_decade = 0;
+    int ell_permute_orient = 0;         // 0 (default, Ken 2026-11-12 on the D5/D6 table): diameters and shapes are
+                                        //    exchanged, orientations stay with the sites; 1: orientations travel
+                                        //    with the particles (the move of BUILD.md section 8, kept as an option);
+                                        // 2: diagnostic: decided as in 0, moved as in 1
+    int ell_permute_partners = 64;      // partners examined per particle per pass (the sphere engine's cap)
+    int ell_permute_guard = 1;          // 1: an exchange must also not raise the two particles' cage overlap
+                                        //    (not applied to a pair of spheres); 0: room gain alone
+    long ell_capture = 0;               // test hook: n > 0 records the state and the engine's forces, torques and
+                                        // energy at the force pass that follows the n-th pass with an exchange
 };
 
 struct PackingInput {
@@ -190,6 +218,16 @@ struct PackingInput {
     // Cascade (additive): per-particle flag, 1 = diameter frozen (exempt from the
     // global kappa scaling). Empty / all-zero -> standard one-shot path (unchanged).
     std::vector<std::int8_t> fixed;
+    // Ellipsoids (additive): one rotation matrix per particle, row-major Ndim x Ndim (Ndim*Ndim numbers),
+    // columns = body axes in the lab frame. Empty -> spheres. Both-or-neither with the aspect ratios.
+    std::vector<std::vector<double>> orientations;
+    // Ellipsoids, a shape per particle (additive): N rows of Ndim-1 ratios, each obeying the decreasing-order
+    // rule. Empty -> the single shape of PackingConfig::aspect_ratios (or spheres); supplying both is an error.
+    // A row follows its particle wherever the diameter and the orientation go.
+    std::vector<std::vector<double>> aspect_ratios;
+    // Rods (additive): straight length and radius in units of the particle's D, each one number (every particle) or
+    // N numbers. Both or neither; with orientations; never together with aspect ratios.
+    std::vector<double> rod_length, rod_radius;
 };
 
 struct PackingResult {
@@ -283,6 +321,19 @@ struct PackingResult {
     std::size_t checkpoint_last_step = 0;  // step of the last successful checkpoint write
     std::vector<double> swap_events;
     int swap_event_width = 8;          // doubles per event row       // per-trade event log (8 doubles/event)
+    // Ellipsoids (additive): final orientations, in the same particle order as positions; empty for spheres.
+    std::vector<std::vector<double>> orientations;
+    // Per-particle shapes in the same particle order as positions; filled only when the input carried a table.
+    std::vector<std::vector<double>> aspect_ratios;
+    std::vector<double> rod_length, rod_radius;   // rods: per particle, in the output particle order
+    // Permutation with ellipsoids: totals, and the ell_capture record (empty unless requested and reached).
+    std::size_t ell_permute_candidates = 0;
+    long ell_capture_step = -1;
+    double ell_capture_energy = 0.0;
+    std::vector<double> ell_capture_positions, ell_capture_diameters, ell_capture_orientations,
+                        ell_capture_ratios, ell_capture_forces, ell_capture_torques, ell_capture_exchanges,
+                        ell_capture_z;
+    double torque_magnitude = 0.0;     // mean |generalised torque| / (mean contact force x mean radius) at the end
 };
 
 struct PackingObservation {
@@ -301,6 +352,11 @@ struct PackingTrace {
     std::vector<double> force;
     std::vector<double> energy;
     std::vector<double> max_min_dist;
+    std::vector<std::vector<std::vector<double>>> orientations;   // ellipsoids only; one entry per sample
+    // Which particle sits in which slot of each sample: origins[f][k] = the index at the start of the run of the
+    // particle in slot k of sample f (the loop renumbers particles for cache locality while it runs). One entry
+    // per sample that has positions.
+    std::vector<std::vector<std::size_t>> origins;
 };
 
 struct PackingRunOptions {
@@ -325,6 +381,50 @@ struct PackingRunOptions {
     bool has_initial_phi_target = false;
     double initial_phi_target = 0.55;
 };
+
+// ---- single evaluations (additive; used by the ellipsoid tests and for reporting) --------------------------
+// One evaluation of forces, torques, energy and the kappa gradient on the configuration as given (no rescale,
+// no steps), through the same input rule as a run: no aspect ratios and no orientations -> the sphere kernel
+// get_forces_nd_3; both -> the ellipsoid kernel; one without the other -> error. All pairs are listed.
+struct SingleEvaluation {
+    std::vector<std::vector<double>> forces;    // N x Ndim, force on each particle (-dE/dx)
+    std::vector<std::vector<double>> torques;   // N x Ndim(Ndim-1)/2 (zeros for spheres)
+    double U = 0.0;             // the code's diagnostic (square of the mean fractional overlap)
+    double dkappa = 0.0;        // the code's kappa gradient, including the mu term
+    double max_overlap = 0.0;   // max over pairs of 1 - s  (1 - dist/r_ij for spheres)
+    double energy = 0.0;        // sum over contacts of (K/2)(sigma - d)^2 (+ wall terms)
+    double Fmean = 0.0;
+    double Lc = 0.0;
+    std::vector<std::size_t> z;
+};
+SingleEvaluation evaluate_once(const struct PackingInput& input, const struct PackingConfig& config, double mu);
+
+// Exact shrink-to-contact of a configuration: the largest uniform factor (<= 1) by which every particle can be
+// scaled about its centre so that no pair (and no flat wall) overlaps, computed to convergence. Spheres too.
+struct ContactScale {
+    double scale = 1.0;             // min(1, min over contacts of s)
+    std::size_t pair_i = 0, pair_j = 0;   // the tightest pair (pair_j == N: a wall)
+    std::size_t n_overlapping = 0;  // contacts with s < 1 before the shrink
+    double particle_volume = 0.0;   // total particle volume before the shrink
+};
+ContactScale contact_scale(const struct PackingInput& input, const struct PackingConfig& config);
+
+// Ellipsoid permutation outside a run (tests and inspection). The state is the input's; all pairs are listed.
+struct PermuteOnce {
+    std::vector<double> diameters;
+    std::vector<std::vector<double>> aspect_ratios;   // N rows
+    std::vector<std::vector<double>> orientations;    // N flat row-major matrices
+    std::vector<double> rod_length, rod_radius;       // rods: per particle after the pass
+    std::vector<double> exchanges;                    // (i, j, gain) per accepted exchange
+    std::size_t candidates = 0;
+};
+// One permutation pass on the configuration as given: window config.swap_geo_w, at most config.swap_geo_B
+// exchanges (<= 0: no limit), config.ell_permute_partners (<= 0: every partner in the window),
+// config.ell_permute_orient.
+PermuteOnce permute_once(const struct PackingInput& input, const struct PackingConfig& config);
+// One forced exchange of particles i and j (the move itself, no decision).
+PermuteOnce exchange_once(const struct PackingInput& input, const struct PackingConfig& config, std::size_t i,
+                          std::size_t j);
 
 using PackingObserver = std::function<void(
     const PackingObservation& observation,

@@ -27,6 +27,9 @@ add_library(rcpgenerator_core
     src/core/initialize_particles.cpp
     src/core/rcp_generator.cpp
     src/core/diameter_permute.cpp
+    src/core/ellipsoid.cpp
+    src/core/rod.cpp
+    src/core/curved_wall.cpp
 )
 set_target_properties(rcpgenerator_core PROPERTIES
     POSITION_INDEPENDENT_CODE ON

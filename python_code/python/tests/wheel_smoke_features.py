@@ -1,4 +1,4 @@
-"""Fast installed-wheel smoke test for the public rcpgenerator 1.1 features."""
+"""Fast installed-wheel smoke test for established public rcpgenerator features."""
 
 import io
 import json
@@ -98,7 +98,7 @@ def main() -> None:
         ).pack()
     assert any("periodic box is small" in str(item.message) for item in caught)
 
-    print("rcpgenerator 1.1 feature smoke OK")
+    print("rcpgenerator feature smoke OK")
 
 
 if __name__ == "__main__":

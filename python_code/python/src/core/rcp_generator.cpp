@@ -1,5 +1,8 @@
 #include "rcpgenerator/rcp_generator.hpp"
 #include "rcpgenerator/diameter_permute.hpp"
+#include "rcpgenerator/ellipsoid.hpp"
+#include "rcpgenerator/rod.hpp"
+#include "rcpgenerator/curved_wall.hpp"
 
 #include <algorithm>
 #include <atomic>
@@ -4869,6 +4872,327 @@ void adam_update(
     (void)a_old;
 }
 
+// ---- ellipsoids: glue between the public structs and rcpgenerator/ellipsoid.hpp (additive) -------------------
+namespace {
+
+// The rule at the core input. Returns the shape and fills the flat rotation array (N * Ndim * Ndim).
+// Is this the non-spherical path: aspect ratios (ellipsoids), rod inputs, or orientations?
+bool ell_input_present(const PackingInput& input, const PackingConfig& config) {
+    return !config.aspect_ratios.empty() || !input.aspect_ratios.empty() || !input.orientations.empty() ||
+           !input.rod_length.empty() || !input.rod_radius.empty();
+}
+
+// Force pass of the non-spherical path: ellipsoids or rods, by the shape's kind.
+void shape_forces(const std::uint32_t* pairs_data, const std::uint64_t* pair_offsets, const double* x, std::size_t N,
+                  const EllShape& sh, const std::vector<double>& Db, const std::vector<double>& box,
+                  const std::vector<std::int8_t>& walls, const double* Rot, double* F, double* Tq, double& U,
+                  double& max_min_dist, double& Lc, double& Fmean, double mu, double& dkappa,
+                  std::vector<std::size_t>& z, double& energy, std::vector<double>& Amat_work,
+                  EllPairCache* cache = nullptr, double* gsum = nullptr, RodPairCache* rod_cache = nullptr) {
+    if (sh.kind != 0) {
+        rod_forces(pairs_data, pair_offsets, x, N, sh, Db, box, walls, Rot, F, Tq, U, max_min_dist, Lc, Fmean, mu, dkappa,
+                   z, energy, Amat_work, gsum, rod_cache);
+        return;
+    }
+    ell_forces(pairs_data, pair_offsets, x, N, sh, Db, box, walls, Rot, F, Tq, U, max_min_dist, Lc, Fmean, mu, dkappa, z,
+               energy, Amat_work, cache, gsum);
+}
+
+void ell_read_orientations(const PackingInput& input, std::size_t N, std::size_t Ndim, std::vector<double>& rot,
+                           const char* who) {
+    if (input.orientations.size() != N) {
+        throw std::runtime_error(std::string(who) + ": orientations needs one rotation per particle (" +
+                                 std::to_string(N) + "), got " + std::to_string(input.orientations.size()));
+    }
+    rot.assign(N * Ndim * Ndim, 0.0);
+    for (std::size_t i = 0; i < N; ++i) {
+        if (input.orientations[i].size() != Ndim * Ndim) {
+            throw std::runtime_error(std::string(who) + ": each orientation is a row-major Ndim x Ndim rotation matrix (" +
+                                     std::to_string(Ndim * Ndim) + " numbers); particle " + std::to_string(i) +
+                                     " has " + std::to_string(input.orientations[i].size()));
+        }
+        for (std::size_t k = 0; k < Ndim * Ndim; ++k) rot[i * Ndim * Ndim + k] = input.orientations[i][k];
+        ell_check_orientation(rot.data() + i * Ndim * Ndim, Ndim, i);
+    }
+}
+
+EllShape ell_resolve_input(const PackingInput& input, const PackingConfig& config, std::size_t N,
+                           std::size_t Ndim, std::vector<double>& rot, std::vector<double>& qtab,
+                           std::vector<double>& deq, std::vector<double>& bfac,
+                           std::vector<double>* rod_user = nullptr) {
+    bfac.assign(N, 1.0);   // bounding diameter / user's D: 1 for ellipsoids (D is the longest axis)
+    const bool rods = !input.rod_length.empty() || !input.rod_radius.empty();
+    if (rods) {
+        if (!config.aspect_ratios.empty() || !input.aspect_ratios.empty()) {
+            throw std::runtime_error("rods: rod_length / rod_radius were supplied together with aspect_ratios; a packing "
+                                     "is of rods or of ellipsoids, not both");
+        }
+        if (input.orientations.empty()) {
+            throw std::runtime_error("rods: rod_length and rod_radius were supplied without orientations; supply both "
+                                     "(rods) or neither (spheres). At the Packing level the initializer generates "
+                                     "orientations for you");
+        }
+        EllShape sh;
+        sh.Ndim = Ndim;
+        sh.kind = config.rod_capped != 0 ? SHAPE_ROD_CAPPED : SHAPE_ROD_UNCAPPED;
+        sh.n_iter = std::max(config.ell_iters, 30);   // bound of the 3D uncapped iteration (most pairs need none)
+        // sh.track_tol stays 0 here (single evaluations iterate to convergence); a run sets it from ell_track_tol
+        sh.all_one = false;
+        sh.rod_round = config.rod_round > 0.0 ? config.rod_round : 0.0;   // single evaluations; a quench run sets its own
+        rod_build_shape_table(input.rod_length, input.rod_radius, config.rod_capped != 0, N, Ndim, qtab, deq, bfac);
+        if (rod_user) {   // the user's own numbers per particle (length, radius), handed back unchanged at the end
+            rod_user->assign(2 * N, 0.0);
+            for (std::size_t i = 0; i < N; ++i) {
+                (*rod_user)[2 * i] = input.rod_length.size() == 1 ? input.rod_length[0] : input.rod_length[i];
+                (*rod_user)[2 * i + 1] = input.rod_radius.size() == 1 ? input.rod_radius[0] : input.rod_radius[i];
+            }
+        }
+        sh.qtab = qtab.data();
+        sh.deqtab = deq.data();
+        ell_read_orientations(input, N, Ndim, rot, "rods");
+        return sh;
+    }
+    if (config.aspect_ratios.empty() && input.aspect_ratios.empty()) {
+        throw std::runtime_error("ellipsoids: orientations were supplied without aspect_ratios (or rod_length and "
+                                 "rod_radius); supply both (ellipsoids or rods) or neither (spheres)");
+    }
+    if (input.orientations.empty()) {
+        throw std::runtime_error("ellipsoids: aspect_ratios were supplied without orientations; supply both "
+                                 "(ellipsoids) or neither (spheres). At the Packing level the initializer "
+                                 "generates orientations for you");
+    }
+    // One list for every particle or a table of N rows; either way the kernel works from the per-particle table
+    // (so a table of equal rows and the single list are the same computation).
+    EllShape sh;
+    sh.Ndim = Ndim;
+    sh.n_iter = config.ell_iters < 1 ? 1 : config.ell_iters;
+    ell_build_shape_table(config.aspect_ratios, input.aspect_ratios, N, Ndim, qtab, deq, sh.all_one);
+    sh.qtab = qtab.data();
+    sh.deqtab = deq.data();
+    if (input.orientations.size() != N) {
+        throw std::runtime_error("ellipsoids: orientations needs one rotation per particle (" +
+                                 std::to_string(N) + "), got " + std::to_string(input.orientations.size()));
+    }
+    rot.assign(N * Ndim * Ndim, 0.0);
+    for (std::size_t i = 0; i < N; ++i) {
+        if (input.orientations[i].size() != Ndim * Ndim) {
+            throw std::runtime_error("ellipsoids: each orientation is a row-major Ndim x Ndim rotation matrix (" +
+                                     std::to_string(Ndim * Ndim) + " numbers); particle " + std::to_string(i) +
+                                     " has " + std::to_string(input.orientations[i].size()));
+        }
+        for (std::size_t k = 0; k < Ndim * Ndim; ++k) rot[i * Ndim * Ndim + k] = input.orientations[i][k];
+        ell_check_orientation(rot.data() + i * Ndim * Ndim, Ndim, i);
+    }
+    return sh;
+}
+
+std::vector<std::vector<double>> ell_nested_orientations(const std::vector<double>& rot, std::size_t N,
+                                                         std::size_t Ndim) {
+    std::vector<std::vector<double>> out(N, std::vector<double>(Ndim * Ndim, 0.0));
+    for (std::size_t i = 0; i < N; ++i)
+        for (std::size_t k = 0; k < Ndim * Ndim; ++k) out[i][k] = rot[i * Ndim * Ndim + k];
+    return out;
+}
+
+// Mean |torque| over particles carrying one, relative to (mean fractional contact force x mean contact length):
+// the rotational counterpart of the reported force magnitude. 0 for spheres.
+double ell_torque_magnitude(const std::vector<double>& tq, std::size_t N, std::size_t Ndim, double Fmean,
+                            double Lc) {
+    const std::size_t nrot = ell_nrot(Ndim);
+    double sum = 0.0;
+    std::size_t count = 0;
+    for (std::size_t i = 0; i < N; ++i) {
+        double t2 = 0.0;
+        for (std::size_t c = 0; c < nrot; ++c) t2 += tq[i * nrot + c] * tq[i * nrot + c];
+        if (t2 > 1.0e-32) { sum += std::sqrt(t2); ++count; }
+    }
+    if (count == 0 || !(Fmean > 0.0) || !(Lc > 0.0)) return 0.0;
+    return (sum / double(count)) / (Fmean * Lc * Lc);
+}
+
+// All-pairs half list in the layout the force kernels read: row i = [count, j > i ...].
+void all_pairs_layout(std::size_t N, std::vector<std::uint64_t>& offsets, std::vector<std::uint32_t>& data) {
+    offsets.assign(N + 1, 0);
+    for (std::size_t i = 0; i < N; ++i) offsets[i + 1] = offsets[i] + (N - i);
+    data.assign(offsets[N] + 1, 0);
+    for (std::size_t i = 0; i < N; ++i) {
+        std::uint32_t* row = data.data() + offsets[i];
+        row[0] = static_cast<std::uint32_t>(N - 1 - i);
+        for (std::size_t j = i + 1; j < N; ++j) row[j - i] = static_cast<std::uint32_t>(j);
+    }
+}
+
+struct FlatInput {
+    std::size_t N = 0, Ndim = 0;
+    std::vector<double> x, D, box;
+    std::vector<std::int8_t> walls;
+};
+
+FlatInput flatten_input(const PackingInput& input, const PackingConfig& config) {
+    FlatInput f;
+    f.N = input.positions.size();
+    f.Ndim = f.N ? input.positions[0].size() : 0;
+    if (f.N == 0 || f.Ndim < 2) throw std::runtime_error("need at least one particle in Ndim >= 2");
+    if (input.diameters.size() != f.N) throw std::runtime_error("diameters length does not match positions");
+    f.x.assign(f.N * f.Ndim, 0.0);
+    for (std::size_t i = 0; i < f.N; ++i)
+        for (std::size_t d = 0; d < f.Ndim; ++d) f.x[i * f.Ndim + d] = input.positions[i][d];
+    f.D = input.diameters;
+    f.box = config.box.empty() ? std::vector<double>(f.Ndim, 1.0) : config.box;
+    f.walls = config.walls.empty() ? std::vector<std::int8_t>(f.Ndim, 0) : config.walls;
+    if (f.box.size() != f.Ndim || f.walls.size() != f.Ndim) throw std::runtime_error("box/walls length mismatch");
+    return f;
+}
+
+}  // namespace
+
+SingleEvaluation evaluate_once(const PackingInput& input, const PackingConfig& config, double mu) {
+    FlatInput f = flatten_input(input, config);
+    const std::size_t N = f.N, Ndim = f.Ndim;
+    const bool ell = ell_input_present(input, config);
+    std::vector<std::uint64_t> offsets;
+    std::vector<std::uint32_t> pairs;
+    all_pairs_layout(N, offsets, pairs);
+    std::vector<double> F(N * Ndim, 0.0);
+    SingleEvaluation out;
+    std::size_t nrot = ell_nrot(Ndim);
+    out.torques.assign(N, std::vector<double>(nrot, 0.0));
+    if (ell) {
+        std::vector<double> rot, amat, tq(N * nrot, 0.0), qtab, deq, bfac;
+        const EllShape sh = ell_resolve_input(input, config, N, Ndim, rot, qtab, deq, bfac);
+        for (std::size_t i = 0; i < N; ++i) f.D[i] *= bfac[i];
+        shape_forces(pairs.data(), offsets.data(), f.x.data(), N, sh, f.D, f.box, f.walls, rot.data(), F.data(),
+                   tq.data(), out.U, out.max_overlap, out.Lc, out.Fmean, mu, out.dkappa, out.z, out.energy, amat);
+        for (std::size_t i = 0; i < N; ++i)
+            for (std::size_t c = 0; c < nrot; ++c) out.torques[i][c] = tq[i * nrot + c];
+    } else {
+        std::vector<std::vector<double>> min_dist;
+        get_forces_nd_3(pairs.data(), offsets.data(), f.x.data(), N, Ndim, f.D, f.box, f.walls, F.data(), out.U,
+                        min_dist, out.max_overlap, out.Lc, out.Fmean, mu, out.dkappa, out.z);
+        // The sphere kernel never evaluates an energy; the one its forces derive from is written out here.
+        double e = 0.0;
+        for (std::size_t i = 0; i < N; ++i) {
+            for (std::size_t j = i + 1; j < N; ++j) {
+                double d2 = 0.0;
+                for (std::size_t d = 0; d < Ndim; ++d) {
+                    double delta = f.x[j * Ndim + d] - f.x[i * Ndim + d];
+                    if (f.walls[d] == 0) delta -= std::nearbyint(delta / f.box[d]) * f.box[d];
+                    d2 += delta * delta;
+                }
+                const double r_ij = 0.5 * (f.D[i] + f.D[j]);
+                if (d2 < r_ij * r_ij) { const double ov = r_ij - std::sqrt(d2); e += 0.5 * ov * ov; }
+            }
+            for (std::size_t d = 0; d < Ndim; ++d) {
+                if (f.walls[d] != 1) continue;
+                for (int wall = 0; wall < 2; ++wall) {
+                    const double dist = std::abs(f.box[d] * wall - f.x[i * Ndim + d]);
+                    if (dist < 0.5 * f.D[i]) e += (0.5 * f.D[i] - dist) * (0.5 * f.D[i] - dist);
+                }
+            }
+            if (f.walls[0] < 0) {   // curved container: force 2 (r - gap) towards the axis, energy (r - gap)^2
+                const std::size_t tc = curved_axes(f.walls[0], Ndim);
+                const double Rc = 0.5 * f.box[0];
+                double dc2 = 0.0;
+                for (std::size_t m = 0; m < tc; ++m) { const double u = f.x[i * Ndim + m] - Rc; dc2 += u * u; }
+                const double gap = Rc - std::sqrt(dc2);
+                if (gap < 0.5 * f.D[i]) e += (0.5 * f.D[i] - gap) * (0.5 * f.D[i] - gap);
+            }
+        }
+        out.energy = e;
+    }
+    out.forces.assign(N, std::vector<double>(Ndim, 0.0));
+    for (std::size_t i = 0; i < N; ++i)
+        for (std::size_t d = 0; d < Ndim; ++d) out.forces[i][d] = F[i * Ndim + d];
+    return out;
+}
+
+ContactScale contact_scale(const PackingInput& input, const PackingConfig& config) {
+    FlatInput f = flatten_input(input, config);
+    const std::size_t N = f.N, Ndim = f.Ndim;
+    const bool ell = ell_input_present(input, config);
+    EllShape sh;
+    std::vector<double> rot, qtab, deq, bfac;
+    if (ell) {
+        sh = ell_resolve_input(input, config, N, Ndim, rot, qtab, deq, bfac);
+        for (std::size_t i = 0; i < N; ++i) f.D[i] *= bfac[i];
+        sh.vol_factor = sh.kind != 0 ? rod_volume_factor(N, Ndim, f.D.data(), qtab.data(), sh.kind == SHAPE_ROD_CAPPED)
+                                     : ell_volume_factor(N, Ndim, f.D.data(), qtab.data());
+    } else {
+        sh = make_ell_shape(std::vector<double>(Ndim - 1, 1.0), Ndim, config.ell_iters);
+        rot.assign(N * Ndim * Ndim, 0.0);
+        for (std::size_t i = 0; i < N; ++i)
+            for (std::size_t d = 0; d < Ndim; ++d) rot[i * Ndim * Ndim + d * Ndim + d] = 1.0;
+    }
+    ContactScale out;
+    out.scale = sh.kind != 0
+        ? rod_min_contact_scale(N, sh, f.x.data(), f.D.data(), rot.data(), f.box, f.walls, out.pair_i, out.pair_j, out.n_overlapping)
+        : ell_min_contact_scale(N, sh, f.x.data(), f.D.data(), rot.data(), f.box, f.walls, out.pair_i,
+                                      out.pair_j, out.n_overlapping);
+    double vol = 0.0;
+    for (double dv : f.D) vol += sphere_volume(0.5 * dv, Ndim);
+    out.particle_volume = vol * sh.vol_factor;
+    return out;
+}
+
+namespace {
+PermuteOnce ell_permute_outside(const PackingInput& input, const PackingConfig& config, bool forced,
+                                std::size_t fi, std::size_t fj) {
+    FlatInput f = flatten_input(input, config);
+    const std::size_t N = f.N, Ndim = f.Ndim, nn = Ndim * Ndim;
+    std::vector<double> rot, qtab, deq, bfac, rodu;
+    EllShape sh = ell_resolve_input(input, config, N, Ndim, rot, qtab, deq, bfac, &rodu);
+    for (std::size_t i = 0; i < N; ++i) f.D[i] *= bfac[i];
+    auto swap_user = [&](std::size_t a, std::size_t b) { if (!rodu.empty()) { std::swap(rodu[2 * a], rodu[2 * b]); std::swap(rodu[2 * a + 1], rodu[2 * b + 1]); } };
+    PermuteOnce out;
+    std::vector<EllExchangeRecord> done;
+    const bool move = config.ell_permute_orient != 0;
+    if (forced) {
+        if (fi >= N || fj >= N || fi == fj) throw std::runtime_error("exchange_once: i and j must be two different particles");
+        ell_exchange(Ndim, fi, fj, f.D.data(), nullptr, qtab.data(), deq.data(), rot.data(), move);
+        std::swap(bfac[fi], bfac[fj]); swap_user(fi, fj);
+    } else {
+        std::vector<std::uint64_t> offsets;
+        std::vector<std::uint32_t> pairs;
+        all_pairs_layout(N, offsets, pairs);
+        std::vector<double> amat(N * nn);
+        if (sh.kind == 0) ell_shape_matrices(N, sh, f.D.data(), rot.data(), amat.data());
+        EllPermuteParams ep;
+        ep.window = config.swap_geo_w;
+        ep.budget = config.swap_geo_B > 0 ? config.swap_geo_B : static_cast<long>(N);
+        ep.max_partners = config.ell_permute_partners > 0 ? config.ell_permute_partners : static_cast<int>(N);
+        ep.move_orientations = move;
+        ep.decide_in_place = config.ell_permute_orient != 1;
+        ep.overlap_guard = config.ell_permute_guard != 0;
+        ep.n_iter = sh.n_iter;
+        ep.kind = sh.kind;
+        out.candidates = ell_permute_pass(pairs.data(), offsets.data(), f.x.data(), N, Ndim, f.box, f.walls,
+                                          f.D.data(), nullptr, qtab.data(), deq.data(), rot.data(), amat.data(), ep, done);
+        for (const EllExchangeRecord& e : done) { std::swap(bfac[e.i], bfac[e.j]); swap_user(e.i, e.j); }
+    }
+    for (std::size_t i = 0; i < N; ++i) f.D[i] /= bfac[i];
+    if (sh.kind != 0) {   // rods: the shape out as length and radius per particle
+        out.rod_length.assign(N, 0.0); out.rod_radius.assign(N, 0.0);
+        for (std::size_t i = 0; i < N; ++i) { out.rod_length[i] = rodu[2 * i]; out.rod_radius[i] = rodu[2 * i + 1]; }
+    }
+    out.diameters = f.D;
+    out.orientations = ell_nested_orientations(rot, N, Ndim);
+    out.aspect_ratios.assign(N, std::vector<double>(Ndim - 1, 1.0));
+    for (std::size_t i = 0; i < N; ++i)
+        for (std::size_t k = 1; k < Ndim; ++k) out.aspect_ratios[i][k - 1] = qtab[i * Ndim + k];
+    for (const EllExchangeRecord& e : done) {
+        out.exchanges.push_back(static_cast<double>(e.i)); out.exchanges.push_back(static_cast<double>(e.j)); out.exchanges.push_back(e.gain);
+    }
+    return out;
+}
+}  // namespace
+
+PermuteOnce permute_once(const PackingInput& input, const PackingConfig& config) {
+    return ell_permute_outside(input, config, false, 0, 0);
+}
+PermuteOnce exchange_once(const PackingInput& input, const PackingConfig& config, std::size_t i, std::size_t j) {
+    return ell_permute_outside(input, config, true, i, j);
+}
+
 PackingResult run_packing(
     const PackingInput& input,
     const PackingConfig& config)
@@ -4889,6 +5213,50 @@ std::pair<PackingResult, PackingTrace> run_packing_observed(
     std::vector<double> D = input.diameters;
     std::vector<double> D0;
     std::size_t Ndim = (input.positions.empty() ? 0 : input.positions[0].size());
+    // ---- ellipsoids (additive; rcpgenerator/ellipsoid.hpp) --------------------------------------------------
+    // The rule at the core input: no aspect ratios and no orientations -> ell_on == false and nothing below
+    // that is guarded by ell_on runs (the sphere path, bit for bit); both -> the ellipsoid path; one without
+    // the other -> error. In the ellipsoid path D holds the BOUNDING diameter (D_user x rmax) from here to
+    // result assembly, so the neighbour machinery works unchanged; see the header for the conventions.
+    const bool ell_on = ell_input_present(input, config);
+    EllShape ell_shape;
+    std::vector<double> ell_rot, ell_torque, ell_m, ell_v, ell_amat;
+    std::vector<double> ell_rodu;         // rods: the user's (length, radius) per particle, to hand back bit for bit
+    std::vector<double> ell_bfac;         // bounding diameter / user's D per particle (1 for ellipsoids; rods: rod.hpp)
+    std::vector<double> ell_q, ell_deq;   // per-particle shape (N x Ndim) and volume-equivalent factor; follow the particle
+    auto ell_sync = [&]() { ell_shape.qtab = ell_q.data(); ell_shape.deqtab = ell_deq.data(); };
+    std::vector<EllExchangeRecord> ell_exch;   // permutation: the exchanges of the current pass
+    std::size_t ell_perm_candidates = 0;
+    long ell_perm_productive = 0;              // passes that made at least one exchange
+    bool ell_capture_armed = false;
+    long ell_cap_step = -1; double ell_cap_energy = 0.0;
+    std::vector<double> ell_cap_x, ell_cap_D, ell_cap_rot, ell_cap_q, ell_cap_F, ell_cap_T, ell_cap_exch, ell_cap_z;
+    double ell_q_stall_u = -1.0;  // quench: energy at the stall rule's last reference point
+    std::vector<double> ell_qw;   // quench: rotational FIRE velocities, in length units (angular velocity x bounding radius)
+    EllPairCache ell_cache;   // each pair's lam from the previous step
+    RodPairCache rod_cache;   // 3D uncapped rods: each pair's contact normal from the previous step
+    double ell_energy = 0.0;
+    if (ell_on) {
+        ell_shape = ell_resolve_input(input, config, N, Ndim, ell_rot, ell_q, ell_deq, ell_bfac, &ell_rodu);
+        ell_shape.track_tol = config.ell_track_tol > 0.0 ? config.ell_track_tol : 0.0;
+        if (config.quench_mode != 0) {
+            // A quench balances forces to ~1e-10 of the contact load, so the contact function is converged
+            // (lam iterated until its step is below 1e-15, started from the pair's previous value) instead of
+            // tracked to ell_track_tol: the forces are then the exact gradient of the energy, to rounding.
+            ell_shape.track_tol = 1e-300;
+            ell_shape.conv_tol = 1e-15;
+            ell_shape.n_iter = std::max(ell_shape.n_iter, 30);
+        }
+        ell_cache.reset(N);
+        if (ell_shape.kind != 0) ell_shape.rod_round = config.quench_mode != 0 && config.quench_rod_round > 0.0 ? config.quench_rod_round : 0.0;
+        if (ell_shape.kind == SHAPE_ROD_UNCAPPED && Ndim == 3 && !(ell_shape.rod_round > 0.0)) rod_cache.reset(N);
+        for (std::size_t i = 0; i < N; ++i) D[i] *= ell_bfac[i];
+        const std::size_t nrot = ell_nrot(Ndim);
+        ell_torque.assign(N * nrot, 0.0);
+        ell_m.assign(N * nrot, 0.0);
+        ell_v.assign(N * nrot, 0.0);
+        if (config.quench_mode != 0) ell_qw.assign(N * nrot, 0.0);
+    }
     // Cycle 14: x and x_last are flat [N*Ndim]. Convert from the caller's
     // nested input once here; convert back to nested at result time.
     std::vector<double> x(N * Ndim, 0.0);
@@ -4991,6 +5359,43 @@ std::pair<PackingResult, PackingTrace> run_packing_observed(
 
         phi_modifier = sphere_volume(1 / 2., -walls[0]);
     }
+    if (ell_on) {
+        // Features not yet extended to ellipsoids refuse aspect ratios (they must never run on the sphere
+        // assumption).
+        const bool rods_on = ell_shape.kind != 0;
+        auto refuse = [rods_on](const char* what) {
+            if (rods_on) throw std::runtime_error(std::string("rods (rod_length / rod_radius) are not supported with ") + what +
+                                                  " yet; remove the rod inputs or do not use that feature");
+            throw std::runtime_error(std::string("ellipsoids (aspect_ratios) are not supported with ") + what +
+                                     " yet; remove aspect_ratios or do not use that feature");
+        };
+        // Diameter permutation is extended to ellipsoids in the form the public controls use (capacity-matched
+        // exchanges on a fixed cadence: swap_geo == 1 with the proxy sweeps off). The engine's research variants
+        // work from sphere quantities and are not.
+        if (config.swap > 0.0 &&
+            (config.swap_geo != 1 || !config.swap_sweeps_off || config.swap_exact != 0 || config.swap_rescue > 0.0 ||
+             config.swap_cycle3 > 0.0 || config.swap_geo_T > 0.0 || config.swap_geo_cycle4 != 0 ||
+             config.swap_geo_capk != 0 || config.swap_geo_cage != 0 || config.swap_geo_bottleneck != 0 ||
+             config.swap_geo_nonsep != 0 || config.swap_geo_reopen != 0 || config.swap_event_log_stride > 0)) {
+            refuse("the permutation engine's research variants (only the diameter_permute recipe is extended)");
+        }
+        // The quench is extended to ellipsoids (positions and orientations); its research-only variants are not.
+        if (config.quench_mode != 0 && (config.quench_two_level != 0 || config.quench_freeze_damp > 0.0 ||
+                                        config.quench_warm_steps > 0 || config.quench_mix_mode > 1)) {
+            refuse("the quench's two-level, activity-damping, warm-up or per-particle-reset variants");
+        }
+        if (!config.morph_target.empty()) refuse("the distribution morph");
+        if (has_fixed) refuse("fixed (frozen-diameter) particles");
+        if (!config.swap_inject.empty()) refuse("swap injection");
+    }
+    // Ellipsoids: every volume in the loop is the TRUE particle volume = bounding-sphere volume x ell_vf, so
+    // phi, phi_history and every threshold on them mean the same thing as for spheres. ell_vf is used only
+    // inside ell_on branches; the sphere path never multiplies by it.
+    // With a shape per particle ell_vf is the ratio of the two totals (true volume / bounding-sphere volume):
+    // one number for the run, because rescaling, reordering and exchanging whole particles leave it unchanged.
+    const double ell_vf = !ell_on ? 1.0
+        : ell_shape.kind != 0 ? rod_volume_factor(N, Ndim, D.data(), ell_q.data(), ell_shape.kind == SHAPE_ROD_CAPPED)
+        : ell_volume_factor(N, Ndim, D.data(), ell_q.data());
 
     // [226] fix_height: the box arrives REALIZED (the initializer already set box[Ndim-1] = multiple x the largest
     // diameter, and both Packing and run_packing pass that box on). Multiplying by D[0] again here shrank the height
@@ -5013,7 +5418,7 @@ std::pair<PackingResult, PackingTrace> run_packing_observed(
     int direction_flag = 0;
     double F_magnitude = 0.0;
     if (!options.fix_diameter) {
-        auto scaled_pair = scale_diameters_nd(D, phi * phi_modifier, box, Ndim, fix_height);
+        auto scaled_pair = scale_diameters_nd(D, ell_on ? phi * phi_modifier / ell_vf : phi * phi_modifier, box, Ndim, fix_height);
         auto D_scaled = std::move(scaled_pair.first);
         double factor = scaled_pair.second;
         if (fix_height) {
@@ -5030,6 +5435,7 @@ std::pair<PackingResult, PackingTrace> run_packing_observed(
     for (std::size_t i = 0; i < D.size(); ++i) {
         current_volume += coeff * std::pow(D[i] / 2.0, Ndim);
     }
+    if (ell_on) current_volume *= ell_vf;
 
     double box_volume = std::accumulate(box.begin(), box.end(), 1.0, std::multiplies<double>());
     phi = current_volume / box_volume / phi_modifier;
@@ -5378,6 +5784,7 @@ std::pair<PackingResult, PackingTrace> run_packing_observed(
             for (std::size_t k = 0; k < Ndim; ++k) rN *= r;
             s += rN;
         }
+        if (ell_on) s *= ell_vf;   // ellipsoids: S_D0 carries the true volume
         return std::make_pair(dmin, s);
     };
     auto d0_cache = recompute_d0_cache();
@@ -5572,6 +5979,25 @@ std::pair<PackingResult, PackingTrace> run_packing_observed(
         apply_perm_flat(v_update_flat);
         apply_perm_flat(m_hat_flat);
         apply_perm_flat(v_hat_flat);
+        if (ell_on) {   // ellipsoids: orientation and its Adam moments follow their particle
+            auto apply_perm_stride = [&](std::vector<double>& arr, std::size_t stride) {
+                std::vector<double> tmp(N * stride);
+                for (std::size_t k = 0; k < N; ++k)
+                    for (std::size_t d = 0; d < stride; ++d) tmp[k * stride + d] = arr[perm[k] * stride + d];
+                arr = std::move(tmp);
+            };
+            apply_perm_stride(ell_rot, Ndim * Ndim);
+            apply_perm_stride(ell_q, Ndim);
+            apply_perm_stride(ell_deq, 1);
+            apply_perm_stride(ell_bfac, 1);
+            if (!ell_rodu.empty()) apply_perm_stride(ell_rodu, 2);
+            ell_sync();
+            apply_perm_stride(ell_m, ell_nrot(Ndim));
+            apply_perm_stride(ell_v, ell_nrot(Ndim));
+            if (!ell_qw.empty()) apply_perm_stride(ell_qw, ell_nrot(Ndim));
+            ell_cache.clear();   // indices changed: every pair starts cold on the next force pass
+            if (!rod_cache.count.empty()) rod_cache.clear();
+        }
         if (!q_v.empty()) apply_perm_flat(q_v);          // [221] FIRE velocities follow their particles through the reorder
         if (quench_on) {
             std::vector<char> th(N); for (std::size_t k = 0; k < N; ++k) th[k] = q_held[perm[k]]; q_held.swap(th);
@@ -5694,10 +6120,16 @@ std::pair<PackingResult, PackingTrace> run_packing_observed(
     }
 
     g_t_forces.begin();
+    if (ell_on) {
+        shape_forces(pairs_data.data(), pair_offsets.data(), x.data(), N, ell_shape, D, box, walls, ell_rot.data(),
+                   F, ell_torque.data(), U, max_min_dist, Lc, Fmean, mu, dkappa, z, ell_energy, ell_amat,
+                   ell_shape.track_tol > 0.0 ? &ell_cache : nullptr, nullptr, rod_cache.count.empty() ? nullptr : &rod_cache);
+    } else
     get_forces_nd_3(pairs_data.data(), pair_offsets.data(), x.data(), N, Ndim, D, box, walls, F, U, min_dist, max_min_dist, Lc, Fmean, mu, dkappa, z);
     g_t_forces.end();
 
     PackingTrace trace;
+    std::size_t traj_log_next = 1, traj_last_captured = 0;   // log-spaced samples: next step to take; last step sampled
     auto record_observation = [&](std::size_t step_value, bool capture_sample_positions) {
         PackingObservation observation;
         observation.step = step_value;
@@ -5708,6 +6140,12 @@ std::pair<PackingResult, PackingTrace> run_packing_observed(
 
         if (capture_sample_positions) {
             trace.steps.push_back(step_value);
+            if (ell_on) {   // ellipsoids: report the user's D (first axis) and the orientations
+                std::vector<double> Du(D);
+                for (std::size_t i = 0; i < N; ++i) Du[i] /= ell_bfac[i];
+                trace.diameters.push_back(std::move(Du));
+                trace.orientations.push_back(ell_nested_orientations(ell_rot, N, Ndim));
+            } else
             trace.diameters.push_back(D);
             trace.phi.push_back(observation.phi);
             trace.force.push_back(observation.force_magnitude);
@@ -5720,6 +6158,7 @@ std::pair<PackingResult, PackingTrace> run_packing_observed(
                     for (std::size_t d = 0; d < Ndim; ++d)
                         snap[i][d] = x[i * Ndim + d];
                 trace.positions.push_back(std::move(snap));
+                trace.origins.push_back(particle_origin);
             }
         }
 
@@ -5983,6 +6422,14 @@ std::pair<PackingResult, PackingTrace> run_packing_observed(
         double v = std::atof(s);
         return (v > 0.0) ? v : 5e-3;
     }();
+    // The force threshold of the stop test. Flat-ended rods have their own (Ken, 2026-11-13; FINDINGS C39): their
+    // normalised force does not fall below about 6e-3 (2D) and 1e-2 to 5e-2 (3D) in this scheme, whatever the
+    // tightness of the contact solve (flat contacts; LOG [038]), so 5e-3 could never be met. 2e-2 and 1e-1 lie
+    // above the largest force seen in the 750 steps before the stop in 18 + 18 survey cases: the force test
+    // rarely decides when these shapes stop. An explicit RCP_OSC_F_THRESH applies to every shape.
+    const double stop_f_thresh =
+        (ell_on && ell_shape.kind == SHAPE_ROD_UNCAPPED && !(std::getenv("RCP_OSC_F_THRESH") && std::getenv("RCP_OSC_F_THRESH")[0]))
+            ? (Ndim == 2 ? 2e-2 : 1e-1) : osc_f_thresh;
     const double osc_ov_thresh = [](){
         const char* s = std::getenv("RCP_OSC_OV_THRESH");
         if (!s || !s[0]) return 5e-4;
@@ -6298,6 +6745,9 @@ std::pair<PackingResult, PackingTrace> run_packing_observed(
             (packed_d0_on && !packed_d0_mirror.empty()) ? 1 : 0;
         RCP_CK(has_pd0);
         if (has_pd0) WV(packed_d0_mirror);
+        if (ell_on) { WV(ell_rot); WV(ell_m); WV(ell_v); WV(ell_q); WV(ell_deq);   // ellipsoids only: sphere blobs are unchanged
+                      WV(ell_cache.ids); WV(ell_cache.lam); WV(ell_cache.count); }
+        if (ell_on && ell_shape.kind != 0) { WV(ell_bfac); WV(ell_rodu); WV(rod_cache.ids); WV(rod_cache.count); WV(rod_cache.tag); WV(rod_cache.nvec); }   // rods only: ellipsoid blobs are unchanged
         ok = ok && swap_engine.save_state(fp);
         const char tail[5] = "RCPE"; W(tail, 4);
 #undef RCP_CK
@@ -6413,6 +6863,9 @@ std::pair<PackingResult, PackingTrace> run_packing_observed(
         }
         std::uint8_t has_pd0 = 0; RCP_CK(has_pd0);
         if (has_pd0) RV(packed_d0_mirror);
+        if (ell_on) { RV(ell_rot); RV(ell_m); RV(ell_v); RV(ell_q); RV(ell_deq); ell_sync();
+                      RV(ell_cache.ids); RV(ell_cache.lam); RV(ell_cache.count); }
+        if (ell_on && ell_shape.kind != 0) { RV(ell_bfac); RV(ell_rodu); RV(rod_cache.ids); RV(rod_cache.count); RV(rod_cache.tag); RV(rod_cache.nvec); }
         ok = ok && swap_engine.load_state(fp);
         char tail[4]; R(tail, 4);
         if (!ok || std::memcmp(tail, "RCPE", 4) != 0)
@@ -6578,10 +7031,18 @@ std::pair<PackingResult, PackingTrace> run_packing_observed(
                 const double last_peak_time =
                     static_cast<double>(osc_cycles_total) - 0.25;
                 if (cycle_progress >= last_peak_time) {
-                    const double F_now = (step >= 1)
-                        ? F_history[step - 1] : 0.0;
+                    // The force of the PREVIOUS step's pass (the same pass max_min_dist comes from). The slot of
+                    // the current step, F_history[step - 1], is written only after this test and was always 0
+                    // here, so the force condition never acted (LOG [037], BUILD.md section 10).
+                    const double F_now = (step >= 2)
+                        ? F_history[step - 2] : 0.0;
+                    // F_now is (mean net force of the particles that carry one above 1e-8) / (mean contact force): 0/0,
+                    // not a number, when no particle carries such a force, as when no contact is left. The force
+                    // condition then counts as met; without this a run that had shrunk out of contact idled to the
+                    // step cap, since a comparison with a NaN is false (LOG [038], [039]).
+                    const bool no_contact_left = std::isnan(F_now);
                     const bool conditions_met =
-                        (F_now < osc_f_thresh) &&
+                        ((F_now < stop_f_thresh) || no_contact_left) &&
                         (max_min_dist < osc_ov_thresh);
                     if (conditions_met) {
                         osc_consec_conv += 1;
@@ -6600,9 +7061,10 @@ std::pair<PackingResult, PackingTrace> run_packing_observed(
             auto mm = std::minmax_element(it_lo, it_hi);
             const double phi_range = *mm.second - *mm.first;
             if (phi_range < mu_decay_flat_thresh) {
-                const double F_now = (step >= 1) ? F_history[step - 1] : 0.0;
+                const double F_now = (step >= 2) ? F_history[step - 2] : 0.0;   // previous step's force: see the peak gate above
+                const bool no_contact_left = std::isnan(F_now);   // 0/0: no force-carrying particle; counts as met (see the peak gate)
                 const bool conditions_met =
-                    (F_now < osc_f_thresh) && (max_min_dist < osc_ov_thresh);
+                    ((F_now < stop_f_thresh) || no_contact_left) && (max_min_dist < osc_ov_thresh);
                 if (conditions_met) {
                     osc_consec_conv += 1;
                     if (osc_consec_conv >= osc_conv_K) {
@@ -6801,13 +7263,17 @@ std::pair<PackingResult, PackingTrace> run_packing_observed(
         }
 
         g_t_bk_alpha.begin();
+        // phi_history holds phi / phi_modifier, so the comparison is made with phi / phi_modifier. The released code
+        // compared the raw phi: in a curved container (phi_modifier != 1) "phi fell by more than 5e-4" was then always
+        // true and alpha was cut by 1.5 every 500 steps for the whole run (LOG [035], [040]; repaired for every shape).
+        const double phi_cmp = phi / phi_modifier;
         if ((step - LastAlphaUpdate > 500) &&
             (method == "ADAM") &&
-            ((phi - phi_history[std::max<std::size_t>(step - 250, 1)]) < 5e-4) &&
+            ((phi_cmp - phi_history[std::max<std::size_t>(step - 250, 1)]) < 5e-4) &&
             (step > 2500) && step > mu_change + 500) {
 
             double trend1 = mean(F_history, step - 450, step - 250) / mean(F_history, step - 75, step - 1);
-            double trend2 = (phi - phi_history[std::max<std::size_t>(step - 250, 1)]);
+            double trend2 = (phi_cmp - phi_history[std::max<std::size_t>(step - 250, 1)]);
 
             if ((mu_flag < 1 && trend1 < 0.85) || trend2 < -5E-4) {
                 LastAlphaUpdate = step;
@@ -6927,7 +7393,7 @@ std::pair<PackingResult, PackingTrace> run_packing_observed(
             if (user_phi >= options.target_phi) {
                 auto target_scaled = scale_diameters_nd(
                     D,
-                    options.target_phi * phi_modifier,
+                    ell_on ? options.target_phi * phi_modifier / ell_vf : options.target_phi * phi_modifier,
                     box,
                     Ndim,
                     fix_height);
@@ -7443,6 +7909,7 @@ std::pair<PackingResult, PackingTrace> run_packing_observed(
             swap_sink.want_edges = (config.swap_exact != 0) || rescue_step_now || geo_step_now ||
                                    (config.swap_event_log_geom != 0 && config.swap_event_log_stride > 0);
             swap_sink.want_gsum = (config.swap_exact == 0);
+            if (ell_on) swap_sink.want_edges = false;   // the ellipsoid pass reads the neighbour lists itself
             if (swap_sink.want_edges) swap_sink.margin = swap_engine.edge_margin(D, D0);
             if ((config.swap_event_log_geom != 0 && config.swap_event_log_stride > 0) || geo_step_now) {
                 // ME0-iv: the geometry shell is r < 1.1 (R_i + R_k); the geo pass uses
@@ -7452,6 +7919,26 @@ std::pair<PackingResult, PackingTrace> run_packing_observed(
                 swap_sink.margin = std::max(swap_sink.margin, (geo_step_now ? 0.50 : 0.10) * dmax);
             }
         }
+        if (ell_on) {
+            shape_forces(pairs_data.data(), pair_offsets.data(), x.data(), N, ell_shape, D, box, walls, ell_rot.data(),
+                       F, ell_torque.data(), U, max_min_dist, Lc, Fmean, mu_eff, dkappa, z, ell_energy, ell_amat,
+                       ell_shape.track_tol > 0.0 ? &ell_cache : nullptr,
+                       quench_on ? (swap_sink.gsum.resize(N), swap_sink.gsum.data()) : nullptr,
+                       rod_cache.count.empty() ? nullptr : &rod_cache);
+            if (ell_capture_armed) {   // test hook: the engine's own numbers on the state right after exchanges
+                ell_capture_armed = false;
+                const std::size_t nrot = ell_nrot(Ndim);
+                ell_cap_step = static_cast<long>(step); ell_cap_energy = ell_energy;
+                ell_cap_x = x; ell_cap_D = D; ell_cap_rot = ell_rot;
+                ell_cap_q.assign(N * (Ndim - 1), 1.0);
+                for (std::size_t i = 0; i < N; ++i)
+                    for (std::size_t k = 1; k < Ndim; ++k) ell_cap_q[i * (Ndim - 1) + k - 1] = ell_q[i * Ndim + k];
+                ell_cap_F.assign(F, F + N * Ndim);
+                ell_cap_T.assign(ell_torque.begin(), ell_torque.begin() + N * nrot);
+                ell_cap_z.assign(N, 0.0);
+                for (std::size_t i = 0; i < N; ++i) ell_cap_z[i] = static_cast<double>(z[i]);
+            }
+        } else
         get_forces_nd_3(pairs_data.data(), pair_offsets.data(), x.data(), N, Ndim, D, box, walls, F, U, min_dist, max_min_dist, Lc, Fmean, mu_eff, dkappa, z,
                         // Cycle 21k: packed-D0 + the kappa the last D-update used
                         // (D[j] == D0[j]*kappa bit-for-bit at this point).
@@ -7476,6 +7963,71 @@ std::pair<PackingResult, PackingTrace> run_packing_observed(
             g_t_swap.begin();
             swap_touched.clear();
             SwapSweepStats sst;
+            const bool geo_sphere_now = geo_step_now && !ell_on;   // the sphere engine's passes below
+            if (geo_step_now && ell_on) {
+                // ---- ellipsoids: one permutation pass (ellipsoid.hpp, ell_permute_pass). Two particles trade
+                // places: diameter, shape and (ell_permute_orient) orientation, at fixed positions.
+                EllPermuteParams ep;
+                ep.window = config.swap_geo_w;
+                ep.budget = std::max<long>(0, config.swap_geo_B);
+                ep.max_partners = config.ell_permute_partners;
+                ep.move_orientations = config.ell_permute_orient != 0;
+                ep.decide_in_place = config.ell_permute_orient != 1;
+                ep.overlap_guard = config.ell_permute_guard != 0;
+                ep.pass_index = swap_engine.geo_passes_;
+                ep.n_iter = std::max(1, config.ell_iters);
+                ep.kind = ell_shape.kind;
+                ell_exch.clear();
+                ell_perm_candidates += ell_permute_pass(pairs_data.data(), pair_offsets.data(), x.data(), N, Ndim, box,
+                                                        walls, D.data(), D0.data(), ell_q.data(), ell_deq.data(),
+                                                        ell_rot.data(), ell_amat.data(), ep, ell_exch);
+                ++swap_engine.geo_passes_;
+                swap_engine.geo_trades_ += ell_exch.size();
+                if (!ell_exch.empty()) {
+                    auto& sc = swap_engine.swap_counts();
+                    if (sc.size() != N) sc.assign(N, 0);
+                    const std::size_t nrot = ell_nrot(Ndim);
+                    std::vector<char> tch(N, 0);
+                    for (const EllExchangeRecord& e : ell_exch) {
+                        swap_touched.push_back(e.i); swap_touched.push_back(e.j);
+                        std::swap(ell_bfac[e.i], ell_bfac[e.j]);
+                        if (!ell_rodu.empty()) { std::swap(ell_rodu[2 * e.i], ell_rodu[2 * e.j]); std::swap(ell_rodu[2 * e.i + 1], ell_rodu[2 * e.j + 1]); }
+                        ++sc[e.i]; ++sc[e.j]; tch[e.i] = tch[e.j] = 1;
+                        if (ep.move_orientations) {
+                            // the orientation's Adam state: the second moment (the scale of the torques this
+                            // particle has felt) travels with it, the first moment (a direction that belonged
+                            // to the old site) is dropped
+                            for (std::size_t c = 0; c < nrot; ++c) {
+                                std::swap(ell_v[e.i * nrot + c], ell_v[e.j * nrot + c]);
+                                ell_m[e.i * nrot + c] = 0.0; ell_m[e.j * nrot + c] = 0.0;
+                            }
+                        }
+                    }
+                    // a pair with an exchanged particle starts its contact function cold on the next pass
+                    for (std::size_t i = 0; i < N; ++i) {
+                        if (tch[i]) { ell_cache.count[i] = 0; continue; }
+                        std::uint32_t keep = 0;
+                        for (std::uint32_t c = 0; c < ell_cache.count[i]; ++c) {
+                            const std::uint32_t id = ell_cache.ids[i * EllPairCache::CAP + c];
+                            if (tch[id]) continue;
+                            ell_cache.ids[i * EllPairCache::CAP + keep] = id;
+                            ell_cache.lam[i * EllPairCache::CAP + keep] = ell_cache.lam[i * EllPairCache::CAP + c];
+                            ++keep;
+                        }
+                        ell_cache.count[i] = keep;
+                    }
+                    if (!rod_cache.count.empty()) rod_cache.purge(tch);
+                    sst.accepted = ell_exch.size();
+                    ++ell_perm_productive;
+                    if (config.ell_capture > 0 && ell_perm_productive == config.ell_capture) {
+                        ell_capture_armed = true;
+                        ell_cap_exch.clear();
+                        for (const EllExchangeRecord& e : ell_exch) {
+                            ell_cap_exch.push_back(static_cast<double>(e.i)); ell_cap_exch.push_back(static_cast<double>(e.j)); ell_cap_exch.push_back(e.gain);
+                        }
+                    }
+                }
+            }
             if (sweep_step_now) sst = swap_engine.sweep(N, D, D0, swap_sink, z, swap_touched);
             // H7 HANDOFF [127]: when capk is on with a handoff step, geo runs ONLY
             // before it and cage runs ONLY after it -> no competing every-step passes
@@ -7489,7 +8041,7 @@ std::pair<PackingResult, PackingTrace> run_packing_observed(
             const bool geo_yielded =
                 (capk_on && capk_start > 0 && static_cast<long>(step) >= capk_start) ||
                 (cage_on && cage_start > 0 && static_cast<long>(step) >= cage_start);
-            if (geo_step_now && !geo_yielded) {
+            if (geo_sphere_now && !geo_yielded) {
                 // H12 [148]/[162]: at a reopen (= the CONVERGED terminal, OSC-DONE) the forced
                 // pass is bottleneck-relief; normal c_min-geo runs during initial compression.
                 // mode 1 = un-shrunk bneck (infidelic [155]); mode 3 = shrink-to-just-touching
@@ -7504,9 +8056,9 @@ std::pair<PackingResult, PackingTrace> run_packing_observed(
                     swap_engine.geo_reopen_active_ = false;
                 }
             }
-            if (geo_step_now && config.swap_geo_cycle != 0 && !geo_yielded)  // H2 [117]: 3-cycles
+            if (geo_sphere_now && config.swap_geo_cycle != 0 && !geo_yielded)  // H2 [117]: 3-cycles
                 swap_engine.geo_cycle_pass(N, D, D0, swap_sink, swap_touched);
-            if (geo_step_now && config.swap_geo_cycle4 != 0 && !geo_yielded) // H34 [194]: 4-cycles
+            if (geo_sphere_now && config.swap_geo_cycle4 != 0 && !geo_yielded) // H34 [194]: 4-cycles
                 swap_engine.geo_cycle4_pass(N, D, D0, swap_sink, swap_touched);
             // H12b [152]: mode 2 = bottleneck-relief ADDITIVELY during the mu_1 rung
             // (mu_flag==1), under residual overlap/compression above jamming ("the signal
@@ -7514,17 +8066,17 @@ std::pair<PackingResult, PackingTrace> run_packing_observed(
             // the rung-1 ADAM dynamics provide the gentle relax between passes.
             // NOTE [155]: mode 2 evaluates at the CURRENT (overlapping) scale and does NOT
             // shrink -> starved accommodation gate -> 0 trades (infidelic). Superseded by 3.
-            if (geo_step_now && config.swap_geo_bottleneck == 2 && mu_flag == 1 && !geo_yielded)
+            if (geo_sphere_now && config.swap_geo_bottleneck == 2 && mu_flag == 1 && !geo_yielded)
                 swap_engine.geo_bottleneck_pass(N, D, D0, swap_sink, swap_touched);
             // H12c [162] VARIANT B: mode-3 bneck engages at the CONVERGED terminal (not
             // during the run) via the reopen hook (geo_force_step), where geo_reopens_done>0.
             // Handled in the forced-pass branch above (config.swap_geo_bottleneck 1||3 ->
             // geo_bottleneck_pass). At worst it makes 0 swaps and phi is unchanged; it can
             // only keep or improve phi, never lose density.
-            if (geo_step_now && capk_on &&
+            if (geo_sphere_now && capk_on &&
                 (capk_start <= 0 || static_cast<long>(step) >= capk_start))  // H7 cage (post-handoff)
                 swap_engine.geo_capk_pass(N, D, D0, swap_sink, swap_touched);
-            if (geo_step_now && cage_on &&
+            if (geo_sphere_now && cage_on &&
                 (cage_start <= 0 || static_cast<long>(step) >= cage_start))  // H8 overlap-energy (post-handoff)
                 swap_engine.geo_cage_pass(N, D, D0, swap_sink, swap_touched,
                                           x.data(), box.data(), static_cast<int>(Ndim));  // x/box used only if geo_cage_move [133]
@@ -7883,6 +8435,177 @@ std::pair<PackingResult, PackingTrace> run_packing_observed(
         }
         g_t_bookkeep.end();
         g_t_position.begin();
+        if (quench_on && ell_on) {
+            // ---- ellipsoid quench (additive). The same FIRE minimisation as the sphere branch below, on positions
+            // AND orientations. A particle's generalised force is (F_i, T_i / a_i) and its generalised velocity
+            // (v_i, a_i w_i), with a_i the bounding radius: every component is then a length (or a force), and the
+            // power F.v + T.w is unchanged. Residual of a load-bearing particle: |(F_i, T_i/a_i)| / S_i, S_i the sum
+            // of its contact force magnitudes, so it measures force AND torque balance. Not implemented here: the
+            // two-level, activity-damping, warm-up and per-particle-reset variants (refused at input).
+            const std::size_t nrot = ell_nrot(Ndim), nn = Ndim * Ndim, nd = N * Ndim;
+            if (q_iter == 0) {
+                std::fill(q_held.begin(), q_held.end(), 0);
+                if (!config.quench_held.empty()) {
+                    std::vector<char> want(N, 0);
+                    for (double hi : config.quench_held) { const long k = static_cast<long>(hi); if (k >= 0 && k < static_cast<long>(N)) want[k] = 1; }
+                    for (std::size_t k = 0; k < N; ++k) q_held[k] = want[particle_origin[k]];
+                }
+                q_any_held = std::any_of(q_held.begin(), q_held.end(), [](char h) { return h != 0; });
+                if (config.quench_kappa_mult != 1.0 && config.quench_kappa_mult > 0.0) kappa *= config.quench_kappa_mult;
+            }
+            // flat-wall contacts: half-width h = sqrt(A_dd) in the role of the sphere's radius, force 2 (h - gap)
+            const bool q_walls = std::any_of(walls.begin(), walls.end(), [](std::int8_t w) { return w != 0; });
+            if (q_walls) {
+                q_wall_s.assign(N, 0.0); q_wall_n.assign(N, 0);
+                for (std::size_t i = 0; i < N; ++i) {
+                    for (std::size_t d = 0; d < Ndim; ++d) {
+                        if (walls[d] != 1) continue;
+                        const double h = std::sqrt(ell_amat[i * nn + d * Ndim + d]);
+                        for (int side = 0; side < 2; ++side) {
+                            const double gap = std::abs(box[d] * side - x[i * Ndim + d]);
+                            if (gap < h) { q_wall_s[i] += 2.0 * (h - gap); ++q_wall_n[i]; }
+                        }
+                    }
+                    if (walls[0] < 0) {   // curved container: force 2 (h - delta) at the farthest point, one contact
+                        CurvedWallSum cw;
+                        const double Rc = 0.5 * box[0];
+                        if (shape_curved_wall(ell_shape, Ndim, curved_axes(walls[0], Ndim), Rc, 1.0, x.data() + i * Ndim, D[i],
+                                              ell_amat.data() + i * nn, ell_rot.data() + i * nn, ell_q.data() + i * Ndim,
+                                              nullptr, nullptr, cw)) { q_wall_s[i] += cw.f; q_wall_n[i] += cw.count; }
+                    }
+                }
+            }
+            auto qS = [&](std::size_t i) { return q_walls ? swap_sink.gsum[i] + q_wall_s[i] : swap_sink.gsum[i]; };
+            auto qZ = [&](std::size_t i) { return q_walls ? static_cast<long>(z[i]) + q_wall_n[i] : static_cast<long>(z[i]); };
+            auto qA = [&](std::size_t i) { return 0.5 * D[i]; };                          // bounding radius
+            const long q_zmin = static_cast<long>(Ndim) + 1;
+            auto gen_force2 = [&](std::size_t i) {
+                double g2 = 0.0;
+                for (std::size_t d = 0; d < Ndim; ++d) g2 += F[i * Ndim + d] * F[i * Ndim + d];
+                const double ia = 1.0 / qA(i);
+                for (std::size_t c = 0; c < nrot; ++c) { const double g = ell_torque[i * nrot + c] * ia; g2 += g * g; }
+                return g2;
+            };
+            double f2 = 0.0, ssum = 0.0; long zsum = 0;
+            for (std::size_t d = 0; d < Ndim; ++d) q_held_force[d] = 0.0;
+            for (std::size_t i = 0; i < N; ++i) {
+                if (q_held[i]) { for (std::size_t d = 0; d < Ndim; ++d) q_held_force[d] += F[i * Ndim + d]; continue; }
+                const double S = qS(i);
+                if (S > 0.0) { ssum += S; zsum += qZ(i); }
+            }
+            const double fmean = zsum > 0 ? ssum / static_cast<double>(zsum) : 1.0;
+            const double s_floor = 1e-2 * fmean * 4.0;
+            double rmax = 0.0; std::size_t nback = 0;
+            for (std::size_t i = 0; i < N; ++i) {
+                if (q_held[i]) continue;
+                const double S = qS(i);
+                if (qZ(i) >= q_zmin && S >= s_floor) {
+                    const double g2 = gen_force2(i);
+                    ++nback; f2 += g2; const double r = std::sqrt(g2) / S; if (r > rmax) rmax = r;
+                }
+            }
+            q_res = rmax; q_gres = (fmean > 0.0 && nback > 0) ? std::sqrt(f2 / static_cast<double>(std::max<std::size_t>(nback, 1))) / fmean : 0.0;
+            if (q_iter % std::max<long>(1, config.quench_report_every) == 0) {
+                q_log.push_back(static_cast<double>(q_iter)); q_log.push_back(q_res); q_log.push_back(q_gres);
+                q_log.push_back(U); q_log.push_back(static_cast<double>(nback)); q_log.push_back(q_dt);
+            }
+            const bool q_armed = (q_iter >= 1) || (config.quench_kappa_mult == 1.0);
+            if (q_armed && nback > 0 && q_res <= config.quench_tol) q_status = 1;
+            else if (!std::isfinite(q_res) || !std::isfinite(U) || !std::isfinite(q_gres)) q_status = 6;
+            else if (q_armed && nback == 0 && (U == 0.0 || ++q_unjam_streak >= 50)) q_status = 4;
+            else if (q_iter >= config.quench_max_iter) q_status = 2;
+            if (nback > 0) q_unjam_streak = 0;
+            if (q_status == 0 && q_armed && nback > 0) {
+                // progress = the residual halved (as for spheres) OR the energy fell by more than 0.1 % since the
+                // reference point: ellipsoid packings rearrange slowly, lowering U for tens of thousands of
+                // iterations while the largest per-particle residual wanders
+                if (q_stall_ref < 0.0 || q_res <= config.quench_stall_factor * q_stall_ref || U < 0.999 * ell_q_stall_u) { q_stall_ref = q_res; q_stall_ref_iter = q_iter; ell_q_stall_u = U; }
+                else if (config.quench_stall_window > 0 && q_iter - q_stall_ref_iter >= config.quench_stall_window) q_status = 3;
+                if (q_status == 0 && config.quench_dt_min > 0.0 && q_dt < config.quench_dt_min) q_status = 5;
+            }
+            if (q_status != 0) {
+                q_converged = (q_status == 1); steps = step; g_t_position.end(); break;
+            }
+            if (config.quench_mass_scaled && (q_iter % 200 == 0 || q_minv.size() != N)) {
+                q_minv.assign(N, 1.0); std::vector<double> zz; zz.reserve(N);
+                for (std::size_t i = 0; i < N; ++i) if (qZ(i) > 0) zz.push_back(static_cast<double>(qZ(i)));
+                double med = 1.0; if (!zz.empty()) { std::nth_element(zz.begin(), zz.begin() + zz.size() / 2, zz.end()); med = zz[zz.size() / 2]; }
+                for (std::size_t i = 0; i < N; ++i) q_minv[i] = med / std::max(1.0, static_cast<double>(qZ(i)));
+            }
+            auto q_free = [&](std::size_t i) { return !(q_held[i] || qS(i) <= 0.0); };
+            // FIRE: P = G.V over translational and rotational components
+            double P = 0.0, fnorm2 = 0.0;
+            for (std::size_t i = 0; i < N; ++i) {
+                if (!q_free(i)) continue;
+                const double mi = config.quench_mass_scaled ? q_minv[i] : 1.0, ia = 1.0 / qA(i);
+                for (std::size_t d = 0; d < Ndim; ++d) { const double a = F[i * Ndim + d] * mi; P += a * q_v[i * Ndim + d]; fnorm2 += a * a; }
+                for (std::size_t c = 0; c < nrot; ++c) { const double a = ell_torque[i * nrot + c] * ia * mi; P += a * ell_qw[i * nrot + c]; fnorm2 += a * a; }
+            }
+            if (P > 0.0) { if (++q_npos > 5) { q_dt = std::min(q_dt * 1.1, config.quench_dt_max); q_alpha *= 0.99; } }
+            else {
+                q_npos = 0; q_dt *= 0.5; q_alpha = config.quench_alpha0;
+                // half a step back, in position and in orientation, then stop
+                for (std::size_t k = 0; k < nd; ++k) { x[k] -= 0.5 * q_dt * q_v[k]; q_v[k] = 0.0; }
+                double wback[8 * 7 / 2];
+                for (std::size_t i = 0; i < N; ++i) {
+                    const double ia = 1.0 / qA(i); bool any = false;
+                    for (std::size_t c = 0; c < nrot; ++c) { wback[c] = -0.5 * q_dt * ell_qw[i * nrot + c] * ia; if (wback[c] != 0.0) any = true; ell_qw[i * nrot + c] = 0.0; }
+                    if (any) ell_rotate_by(Ndim, ell_rot.data() + i * nn, wback);
+                }
+            }
+            const double fn = std::sqrt(fnorm2);
+            // pass 1: V <- V + dt G/m
+            double vnew2 = 0.0; std::size_t nact = 0;
+            for (std::size_t i = 0; i < N; ++i) {
+                if (!q_free(i)) {
+                    for (std::size_t d = 0; d < Ndim; ++d) q_v[i * Ndim + d] = 0.0;
+                    for (std::size_t c = 0; c < nrot; ++c) ell_qw[i * nrot + c] = 0.0;
+                    continue;
+                }
+                const double mi = config.quench_mass_scaled ? q_minv[i] : 1.0, ia = 1.0 / qA(i); ++nact;
+                for (std::size_t d = 0; d < Ndim; ++d) { const double vv = q_v[i * Ndim + d] + q_dt * F[i * Ndim + d] * mi; q_v[i * Ndim + d] = vv; vnew2 += vv * vv; }
+                for (std::size_t c = 0; c < nrot; ++c) { const double vv = ell_qw[i * nrot + c] + q_dt * ell_torque[i * nrot + c] * ia * mi; ell_qw[i * nrot + c] = vv; vnew2 += vv * vv; }
+            }
+            const double vn = std::sqrt(vnew2);
+            // pass 2: mixing V <- (1 - alpha) V + alpha |V| G/|G| (global norms, or per particle for mix_mode 1)
+            std::vector<double> vmean(Ndim, 0.0);
+            for (std::size_t i = 0; i < N; ++i) {
+                if (!q_free(i)) continue;
+                const double mi = config.quench_mass_scaled ? q_minv[i] : 1.0, ia = 1.0 / qA(i);
+                double vn_i = vn, fn_i = fn;
+                if (config.quench_mix_mode >= 1) {
+                    double a2 = 0.0, b2 = 0.0;
+                    for (std::size_t d = 0; d < Ndim; ++d) { const double a = F[i * Ndim + d] * mi; a2 += a * a; b2 += q_v[i * Ndim + d] * q_v[i * Ndim + d]; }
+                    for (std::size_t c = 0; c < nrot; ++c) { const double a = ell_torque[i * nrot + c] * ia * mi; a2 += a * a; b2 += ell_qw[i * nrot + c] * ell_qw[i * nrot + c]; }
+                    fn_i = std::sqrt(a2); vn_i = std::sqrt(b2);
+                }
+                for (std::size_t d = 0; d < Ndim; ++d) {
+                    double vv = q_v[i * Ndim + d];
+                    if (fn_i > 0.0) vv = (1.0 - q_alpha) * vv + q_alpha * vn_i * (F[i * Ndim + d] * mi) / fn_i;
+                    q_v[i * Ndim + d] = vv; vmean[d] += vv;
+                }
+                for (std::size_t c = 0; c < nrot; ++c) {
+                    double vv = ell_qw[i * nrot + c];
+                    if (fn_i > 0.0) vv = (1.0 - q_alpha) * vv + q_alpha * vn_i * (ell_torque[i * nrot + c] * ia * mi) / fn_i;
+                    ell_qw[i * nrot + c] = vv;
+                }
+            }
+            for (std::size_t d = 0; d < Ndim; ++d) vmean[d] = nact ? vmean[d] / static_cast<double>(nact) : 0.0;
+            // move: positions (uniform translation removed along periodic directions when nothing is held), then orientations
+            double wstep[8 * 7 / 2];
+            for (std::size_t i = 0; i < N; ++i) {
+                if (q_held[i]) continue;
+                for (std::size_t d = 0; d < Ndim; ++d) {
+                    if (qS(i) > 0.0 && walls[d] == 0 && !q_any_held) q_v[i * Ndim + d] -= vmean[d];
+                    double xv = x[i * Ndim + d] + q_dt * q_v[i * Ndim + d]; const double L = box[d];
+                    if (xv >= L) xv -= L; else if (xv < 0.0) xv += L; x[i * Ndim + d] = xv;
+                }
+                const double ia = 1.0 / qA(i); bool any = false;
+                for (std::size_t c = 0; c < nrot; ++c) { wstep[c] = q_dt * ell_qw[i * nrot + c] * ia; if (wstep[c] != 0.0) any = true; }
+                if (any) ell_rotate_by(Ndim, ell_rot.data() + i * nn, wstep);
+            }
+            ++q_iter;
+        } else
         if (quench_on) {   // [221] FIRE quench: adaptive inertial descent on the true energy, unit or z-scaled masses
             const std::size_t nd = N * Ndim;
             if (q_iter == 0) {
@@ -8250,6 +8973,10 @@ std::pair<PackingResult, PackingTrace> run_packing_observed(
         }
         }  // end non-fused path
         }  // end quench/adam branch [221]
+        if (ell_on && !ell_shape.all_one && !quench_on) {   // ellipsoids: Adam step on the orientations, same alpha, betas and step counter (spheres do not turn)
+            ell_rotation_step(N, Ndim, ell_torque.data(), ell_m.data(), ell_v.data(), ell_rot.data(), D.data(),
+                              alpha * config.ell_rot_scale, beta1, beta2, double(t), epsilon);
+        }
         g_t_position.end();
         if (inj_quench) {                                                                // [207] hold everyone else
             for (std::size_t k = 0; k < N; ++k) {
@@ -8269,8 +8996,17 @@ std::pair<PackingResult, PackingTrace> run_packing_observed(
 
         const bool should_report =
             observer && progress_interval > 0 && (step % progress_interval == 0);
-        const bool should_capture =
+        // samples every trajectory_interval steps, or (trajectory_per_decade > 0) evenly in log(step)
+        bool should_capture =
             capture_positions && trajectory_interval > 0 && (step % trajectory_interval == 0);
+        if (capture_positions && config.trajectory_per_decade > 0) {
+            should_capture = static_cast<std::size_t>(step) >= traj_log_next;
+            if (should_capture) {
+                const double grown = static_cast<double>(step) * std::pow(10.0, 1.0 / config.trajectory_per_decade);
+                traj_log_next = std::max(static_cast<std::size_t>(step) + 1, static_cast<std::size_t>(std::llround(grown)));
+            }
+        }
+        if (should_capture) traj_last_captured = static_cast<std::size_t>(step);
         if (should_report || should_capture) {
             record_observation(step, should_capture);
         }
@@ -8395,6 +9131,27 @@ std::pair<PackingResult, PackingTrace> run_packing_observed(
     for (std::size_t i = 0; i < N; ++i)
         for (std::size_t d = 0; d < Ndim; ++d)
             result.positions[i][d] = x[i * Ndim + d];
+    if (ell_on) {   // ellipsoids: back to the user's D (first axis); orientations out
+        for (std::size_t i = 0; i < N; ++i) D[i] /= ell_bfac[i];
+        if (ell_shape.kind != 0) {   // rods: length and radius per particle, in the output order
+            result.rod_length.assign(N, 0.0); result.rod_radius.assign(N, 0.0);
+            for (std::size_t i = 0; i < N; ++i) { result.rod_length[i] = ell_rodu[2 * i]; result.rod_radius[i] = ell_rodu[2 * i + 1]; }
+        }
+        result.orientations = ell_nested_orientations(ell_rot, N, Ndim);
+        if (!input.aspect_ratios.empty()) {   // a table came in: the table goes out, in the output particle order
+            result.aspect_ratios.assign(N, std::vector<double>(Ndim - 1, 1.0));
+            for (std::size_t i = 0; i < N; ++i)
+                for (std::size_t k = 1; k < Ndim; ++k) result.aspect_ratios[i][k - 1] = ell_q[i * Ndim + k];
+        }
+        result.torque_magnitude = ell_torque_magnitude(ell_torque, N, Ndim, Fmean, Lc);
+        result.ell_permute_candidates = ell_perm_candidates;
+        result.ell_capture_step = ell_cap_step; result.ell_capture_energy = ell_cap_energy;
+        result.ell_capture_positions = std::move(ell_cap_x); result.ell_capture_diameters = std::move(ell_cap_D);
+        result.ell_capture_orientations = std::move(ell_cap_rot); result.ell_capture_ratios = std::move(ell_cap_q);
+        result.ell_capture_forces = std::move(ell_cap_F); result.ell_capture_torques = std::move(ell_cap_T);
+        result.ell_capture_exchanges = std::move(ell_cap_exch);
+        result.ell_capture_z = std::move(ell_cap_z);
+    }
     result.diameters = std::move(D);
     result.particle_origin = std::move(particle_origin);
     result.box = std::move(box);
@@ -8504,18 +9261,20 @@ std::pair<PackingResult, PackingTrace> run_packing_observed(
     result.force_magnitude = F_magnitude;
 
     const bool final_already_captured =
-        capture_positions && trajectory_interval > 0 && steps > 0 && (steps % trajectory_interval == 0);
+        capture_positions && steps > 0 && traj_last_captured == static_cast<std::size_t>(steps);
     const bool final_already_reported =
         observer && progress_interval > 0 && steps > 0 && (steps % progress_interval == 0);
     if ((capture_positions && !final_already_captured) || (observer && !final_already_reported)) {
         trace.steps.push_back(steps);
         trace.diameters.push_back(result.diameters);
+        if (ell_on) trace.orientations.push_back(result.orientations);
         trace.phi.push_back(phi);
         trace.force.push_back(F_magnitude);
         trace.energy.push_back(U);
         trace.max_min_dist.push_back(max_min_dist);
         if (capture_positions) {
             trace.positions.push_back(result.positions);
+            trace.origins.push_back(result.particle_origin);   // particle_origin itself was moved into the result above
         }
         if (observer) {
             PackingObservation observation;

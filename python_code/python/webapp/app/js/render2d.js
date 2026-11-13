@@ -21,7 +21,55 @@ VIZ.Renderer2D = function (container, data0, opts) {
 
   function halfRadii(d) { const r = new Float32Array(d.N); for (let i = 0; i < d.N; i++) r[i] = d.diameters[i] * 0.5; return r; }
 
+  // Ellipses (cur.shape = [sxx, sxy, syy] per particle): each is drawn as a filled polygon of ELL_SEG points
+  // on its exact outline, centre + L (cos t, sin t) with L the Cholesky factor of the shape matrix. Discs
+  // (no cur.shape) keep the ScatterplotLayer below, unchanged.
+  const ELL_SEG = 96;
+  let ellCache = null, ellFor = null;
+  function ellipsePolygons() {
+    if (ellFor === cur && ellCache) return ellCache;
+    const n = cur.N, sh = cur.shape, p = cur.positions, cs = new Float64Array(ELL_SEG), sn = new Float64Array(ELL_SEG);
+    for (let k = 0; k < ELL_SEG; k++) { cs[k] = Math.cos(2 * Math.PI * k / ELL_SEG); sn[k] = Math.sin(2 * Math.PI * k / ELL_SEG); }
+    const out = new Array(n);
+    for (let i = 0; i < n; i++) {
+      const l11 = Math.sqrt(sh[i * 3]), l21 = l11 > 0 ? sh[i * 3 + 1] / l11 : 0;
+      const l22 = Math.sqrt(Math.max(0, sh[i * 3 + 2] - l21 * l21)), x = p[i * 2], y = p[i * 2 + 1];
+      const poly = new Array(ELL_SEG + 1);
+      for (let k = 0; k < ELL_SEG; k++) poly[k] = [x + l11 * cs[k], y + l21 * cs[k] + l22 * sn[k]];
+      poly[ELL_SEG] = poly[0];
+      out[i] = { polygon: poly, i };
+    }
+    ellCache = out; ellFor = cur;
+    return out;
+  }
+  // Polygons (cur.outline[i] = vertices relative to the particle's position; rods and their cuts, rod.js):
+  // drawn by the same PolygonLayer as the ellipses.
+  let outCache = null, outFor = null;
+  function outlinePolygons() {
+    if (outFor === cur && outCache) return outCache;
+    const n = cur.N, p = cur.positions, out = new Array(n);
+    for (let i = 0; i < n; i++) {
+      const rel = cur.outline[i], m = rel.length / 2, x = p[i * 2], y = p[i * 2 + 1], poly = new Array(m + 1);
+      for (let k = 0; k < m; k++) poly[k] = [x + rel[2 * k], y + rel[2 * k + 1]];
+      poly[m] = poly[0];
+      out[i] = { polygon: poly, i };
+    }
+    outCache = out; outFor = cur;
+    return out;
+  }
+  function ellipseLayer(polygons) {
+    const cols = (state.colorBy && cur.colors) ? cur.colors : null;
+    return new D.PolygonLayer({
+      id: 'particles', data: polygons || ellipsePolygons(), getPolygon: d => d.polygon, parameters: { depthTest: false },
+      filled: true, getFillColor: cols ? (d => [cols[d.i * 3], cols[d.i * 3 + 1], cols[d.i * 3 + 2]]) : state.fillColor,
+      stroked: state.outline > 0, getLineColor: state.outlineColor, lineWidthUnits: 'pixels',
+      getLineWidth: state.outline, lineWidthMinPixels: 0, lineWidthMaxPixels: 3,
+      updateTriggers: { getFillColor: [cols, state.fillColor], getLineColor: [state.outlineColor], getLineWidth: [state.outline] } });
+  }
+
   function particleLayer() {
+    if (cur.outline) return ellipseLayer(outlinePolygons());
+    if (cur.shape) return ellipseLayer();
     const attrs = { getPosition: { value: cur.positions, size: cur.ndim },
                     getRadius: { value: radii, size: 1 } };
     const props = { id: 'particles', data: { length: cur.N, attributes: attrs },
@@ -84,7 +132,8 @@ VIZ.Renderer2D = function (container, data0, opts) {
     setViewState: (vs) => { viewState = Object.assign({}, viewState, vs); dk.setProps({ viewState }); },
     refresh: () => dk.setProps({ layers: buildLayers() }),
     setData: (nd) => { cur = nd; radii = halfRadii(cur); api.refresh(); },
-    fit: () => api.setViewState({ target: [cur.box[0] / 2, cur.box[1] / 2, 0], zoom: fitZoom }),
+    fit: () => api.setViewState({ target: [cur.box[0] / 2, cur.box[1] / 2, 0],
+                                  zoom: (cur.box[0] === Lx && cur.box[1] === Ly) ? fitZoom : Math.log2(Math.min(w / cur.box[0], h / cur.box[1])) - 0.07 }),
     fitTight: () => api.setViewState({ target: [cur.box[0] / 2, cur.box[1] / 2, 0], zoom: fullFit })
   };
   return api;

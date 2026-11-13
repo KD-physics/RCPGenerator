@@ -12,6 +12,8 @@ from typing import Any
 from ._rcpgenerator import initialize_particles as _initialize_particles
 from ._rcpgenerator import run_packing_observed as _run_packing_observed
 from ._rcpgenerator import run_packing as _run_packing
+from ._rcpgenerator import contact_scale as _contact_scale
+from ._rcpgenerator import random_orientations as _random_orientations
 
 
 def _container_fraction(walls):
@@ -48,9 +50,45 @@ class Packing:
     the permutation diagnostics. (The recipe is assembled
     from internal fields under a legacy ``swap_`` prefix; they are not part of the
     public API.)
+
+    Ellipsoids: pass ``aspect_ratios`` (Ndim - 1 numbers) to pack ellipsoids instead of spheres. The ratios
+    are written in DECREASING order, each at most 1 (``1 >= ratio_2 >= ratio_3 >= ... > 0``): ``D`` is the full
+    length of a particle along its first body axis, which is its LONGEST axis, and axis k has length
+    ``D * aspect_ratios[k-2]`` (2D 2:1 ellipse ``[0.5]``; 3D prolate ``[0.5, 0.5]``, oblate ``[1, 0.5]``).
+    Input that breaks the order raises ``ValueError`` and is never reordered. One list applies to every
+    particle; a list of N lists gives a shape per particle. Row i goes to the i-th largest particle when the
+    diameters are generated (the order of ``diameters`` after construction), and with entry i of the user's own
+    diameter list when ``dist`` is of type ``"custom"`` (rod lists follow the same rule). After ``pack()``, ``aspect_ratios`` is the table in the
+    packing's own particle order.
+
+    Rods: pass ``rod_length`` and ``rod_radius`` (both, each one number or a list of N, in units of the
+    particle's ``D``) and ``rod_capped``. Capped (``True``, the default): a straight section of length
+    ``D * rod_length`` with a half-sphere of radius ``D * rod_radius`` on each end, so ``rod_length + 2 *
+    rod_radius`` from tip to tip, and length 0 is a sphere. Uncapped (``False``): flat ends, ``rod_length`` is
+    the full length; 2D and 3D only. With ``rod_radius=0.5``, ``D`` is the rod's thickness. Rods and aspect
+    ratios cannot be combined.
+
+    For both shapes the initializer generates random orientations (``orientations``: one Ndim x Ndim rotation
+    matrix per particle, columns = body axes in the lab frame; column 0 is the longest axis, or the rod's
+    axis); pass ``orientations=`` to supply your own. After ``pack()``: ``orientations`` holds the final
+    rotations, ``phi_final`` the raw (slightly overlapping) packing fraction as for spheres, and
+    ``phi_contact`` the packing fraction after the exact uniform shrink to zero overlap (``shrink_factor``):
+    the value to report. Without ``aspect_ratios`` or the rod keywords nothing changes. Available with both
+    shapes: periodic boxes, flat hard walls, curved containers and ``fix_height``; ``diameter_permute=True`` (an exchange trades diameter and
+    shape; orientations stay in place by default, ``ell_permute_orient=1`` makes them travel); ``quench()``
+    (force and torque balance; defaults ``kappa_mult=1.01`` and ``dt_max=0.2``; rods are balanced as slightly
+    rounded rods, ``rod_round=0.01``, in 2D and 3D only); ``render`` / ``savefig`` / ``show_packing`` /
+    ``animate_2d``, which draw the true shapes and orientations. Not available with either shape (each
+    raises): the research inputs (distribution morph, fixed particles, internal ``swap_*`` settings). Flat-ended
+    rods and the quench of rods are 2D and 3D only. See README "Ellipsoids and rods".
     """
 
-    _INIT_KEYS = {"phi", "N", "Ndim", "box", "walls", "fix_height", "dist"}
+    _INIT_KEYS = {"phi", "N", "Ndim", "box", "walls", "fix_height", "dist", "aspect_ratios",
+                  "rod_length", "rod_radius", "rod_capped"}
+    # Ellipsoid controls that travel in the pack config (sent to the core only when aspect_ratios is set).
+    _ELL_DEFAULTS = {"ell_iters": 5, "ell_rot_scale": 1.0, "ell_track_tol": 1e-6,
+                     "ell_permute_orient": 0, "ell_permute_partners": 64, "ell_permute_guard": 1,
+                     "ell_capture": 0}
     # Public diameter-permutation controls (translated onto the internal swap_* fields in
     # _collect_pack_config; inert - and bitwise identical to the pristine core - when off).
     _PERMUTE_DEFAULTS = {"diameter_permute": False, "permute_budget": 0.25, "permute_interval": 5, "permute_start": 4000}
@@ -64,7 +102,7 @@ class Packing:
     # [221] quench to force balance: core fields behind Packing.quench() (inert when quench_mode == 0). The public
     # interface is the quench() method; these fields are internal, kept for checkpoint-path runs and the research record.
     _QUENCH_DEFAULTS = {"quench_stall_window": 0, "quench_stall_factor": 0.5, "quench_dt_min": 0.0, "quench_mode": 0, "quench_tol": 1e-10, "quench_max_iter": 200000, "quench_dt0": 0.05, "quench_dt_max": 0.5,
-                        "quench_alpha0": 0.1, "quench_mass_scaled": 0, "quench_report_every": 500, "quench_kappa_mult": 1.0, "quench_mix_mode": 0, "quench_two_level": 0, "quench_light_frac": 0.3, "quench_light_omega": 1.0, "quench_warm_steps": 0, "quench_warm_amp": 0.1, "quench_freeze_damp": 0.0, "quench_freeze_frac": 0.1, "quench_class_every": 100, "quench_held": []}
+                        "quench_alpha0": 0.1, "quench_mass_scaled": 0, "quench_report_every": 500, "quench_kappa_mult": 1.0, "quench_mix_mode": 0, "quench_two_level": 0, "quench_light_frac": 0.3, "quench_light_omega": 1.0, "quench_warm_steps": 0, "quench_warm_amp": 0.1, "quench_freeze_damp": 0.0, "quench_freeze_frac": 0.1, "quench_class_every": 100, "quench_held": [], "quench_rod_round": 0.0}
     # Internal diameter-permutation fields (legacy ``swap_`` prefix, not public API); all
     # inert at swap == 0. They travel in the pack config so they reach the core through
     # pack() (PackingRunOptions does not).
@@ -82,8 +120,8 @@ class Packing:
         "swap_event_log_stride": 0, "swap_event_log_cap": 1000000, "swap_event_log_geom": 0,
         "swap_sweeps_off": 0, "swap_inject": [],
     }
-    _PACK_KEYS = {"box", "walls", "neighbor_max", "seed", "fix_height"} | set(_SWAP_DEFAULTS) | set(_PERMUTE_DEFAULTS) | set(_MORPH_DEFAULTS) | set(_QUENCH_DEFAULTS)
-    _REALIZED_STATE_KEYS = {"positions", "diameters"}
+    _PACK_KEYS = {"box", "walls", "neighbor_max", "seed", "fix_height"} | set(_ELL_DEFAULTS) | set(_SWAP_DEFAULTS) | set(_PERMUTE_DEFAULTS) | set(_MORPH_DEFAULTS) | set(_QUENCH_DEFAULTS)
+    _REALIZED_STATE_KEYS = {"positions", "diameters", "orientations"}
     _RESULT_KEYS = {
         "steps",
         "phi_final",
@@ -121,9 +159,22 @@ class Packing:
         obj.neighbor_max = pack_config.get("neighbor_max", 0)
         obj.seed = pack_config.get("seed", 0)
         obj._init_extension_state(pack_config, consume=False)
+        obj._init_ellipsoid_state(init_config.get("aspect_ratios", pack_config.get("aspect_ratios", [])),
+                                  pack_config)
+        obj._init_rod_state(init_config.get("rod_length"), init_config.get("rod_radius"), init_config.get("rod_capped", True))
+        for key in ("rod_length", "rod_radius"):   # per-particle lists in the order of the realized state
+            if obj.is_rod and isinstance(getattr(obj, key), list) and realized_state.get(key):
+                setattr(obj, key, [float(v) for v in realized_state[key]])
 
         obj.positions = deepcopy(realized_state.get("positions", []))
         obj.diameters = deepcopy(realized_state.get("diameters", []))
+        obj.orientations = obj._nested_orientations(realized_state.get("orientations", []))
+        if realized_state.get("aspect_ratios"):   # per-particle shapes in the order of the realized state
+            obj.aspect_ratios = [[float(a) for a in row] for row in realized_state["aspect_ratios"]]
+        obj.phi_contact = final_result.get("phi_contact")
+        obj.shrink_factor = final_result.get("shrink_factor")
+        obj.torque_magnitude = final_result.get("torque_magnitude")
+        obj.trajectory_orientations = deepcopy(trajectory.get("orientations", []))
         obj.steps = final_result.get("steps", 0)
         obj.phi_final = final_result.get("phi_final")
         obj.max_min_dist = final_result.get("max_min_dist")
@@ -138,6 +189,7 @@ class Packing:
         obj.trajectory_force = deepcopy(trajectory.get("force", []))
         obj.trajectory_energy = deepcopy(trajectory.get("energy", []))
         obj.trajectory_max_min_dist = deepcopy(trajectory.get("max_min_dist", []))
+        obj.trajectory_origin = deepcopy(trajectory.get("origins", []))
 
         object.__setattr__(obj, "_initialized", bool(status.get("initialized", bool(obj.positions) and bool(obj.diameters))))
         object.__setattr__(obj, "_packed", bool(status.get("packed", bool(obj.steps))))
@@ -165,6 +217,10 @@ class Packing:
         self.neighbor_max = kwargs.pop("neighbor_max", 0)
         self.seed = kwargs.pop("seed", 0)
         self._init_extension_state(kwargs, consume=True)
+        self._init_ellipsoid_state(kwargs.pop("aspect_ratios", None),
+                                   {k: kwargs.pop(k) for k in list(self._ELL_DEFAULTS) if k in kwargs})
+        self._init_rod_state(kwargs.pop("rod_length", None), kwargs.pop("rod_radius", None), kwargs.pop("rod_capped", True))
+        user_orientations = kwargs.pop("orientations", None)
         
         # self.box = deepcopy(kwargs.pop("box", []))
         # self.walls = deepcopy(kwargs.pop("walls", []))
@@ -193,6 +249,7 @@ class Packing:
         self.trajectory_force = []
         self.trajectory_energy = []
         self.trajectory_max_min_dist = []
+        self.trajectory_origin = []
 
         if kwargs:
             unknown = ", ".join(sorted(kwargs))
@@ -200,6 +257,217 @@ class Packing:
 
         object.__setattr__(self, "_mutating_internal_state", False)
         self.initialize()
+        if user_orientations is not None:
+            if not self._nonsphere:
+                raise ValueError("orientations were given without aspect_ratios (or rod_length and rod_radius): "
+                                 "supply both (ellipsoids or rods) or neither (spheres)")
+            object.__setattr__(self, "_mutating_internal_state", True)
+            try:
+                self.orientations = self._nested_orientations(user_orientations, check=True)
+            finally:
+                object.__setattr__(self, "_mutating_internal_state", False)
+
+    # ------------------------------------------------------------------ ellipsoids ----------------------------
+    def _init_ellipsoid_state(self, aspect_ratios, config: dict[str, Any]) -> None:
+        """Shape and orientation state (all empty / None for spheres)."""
+        self.aspect_ratios = self._normalised_ratios(aspect_ratios)
+        # the shapes as the user gave them: for a per-particle table, row i belongs to particle i of the
+        # INITIALISED packing (the order of `diameters` after initialize(): largest first). pack() returns the
+        # particles in another order and the table with them, so the table for a re-initialisation is kept apart
+        object.__setattr__(self, "_aspect_init", deepcopy(self.aspect_ratios))
+        for k, v in self._ELL_DEFAULTS.items():
+            setattr(self, k, type(v)(config.get(k, v)))
+        self.orientations = []
+        self.phi_contact = None       # packing fraction after the exact shrink to zero overlap (ellipsoid packs)
+        self.shrink_factor = None     # the uniform factor of that shrink (multiply every diameter by it)
+        self.torque_magnitude = None
+        self.trajectory_orientations = []
+
+    # ------------------------------------------------------------------ rods ----------------------------------
+    def _init_rod_state(self, rod_length, rod_radius, rod_capped) -> None:
+        """Rod shape (None for spheres and ellipsoids): rod_length and rod_radius in units of each particle's D,
+        each one number or a list of N (entry i belongs to particle i of the INITIALISED packing, largest
+        first); rod_capped one flag for the packing."""
+        self.rod_length = self._normalised_rod(rod_length)
+        self.rod_radius = self._normalised_rod(rod_radius)
+        self.rod_capped = bool(rod_capped)
+        object.__setattr__(self, "_rod_init", (deepcopy(self.rod_length), deepcopy(self.rod_radius)))
+
+    @staticmethod
+    def _normalised_rod(value):
+        if value is None:
+            return None
+        if hasattr(value, "tolist"):
+            value = value.tolist()
+        if isinstance(value, (list, tuple)):
+            return [float(v) for v in value]
+        return float(value)
+
+    @property
+    def is_rod(self) -> bool:
+        return self.rod_length is not None or self.rod_radius is not None
+
+    @property
+    def _nonsphere(self) -> bool:
+        """Particles with an orientation: ellipsoids (aspect_ratios) or rods."""
+        return bool(self.aspect_ratios) or self.is_rod
+
+    def _rod_rows(self, n: int | None = None):
+        """(lengths, radii) per particle, in the order of ``diameters``."""
+        n = len(self.diameters) if n is None else n
+        L = self.rod_length if isinstance(self.rod_length, list) else [self.rod_length] * n
+        R = self.rod_radius if isinstance(self.rod_radius, list) else [self.rod_radius] * n
+        return L, R
+
+    def _rod_bounding_factor(self, L: float, R: float) -> float:
+        """Largest extent of a rod in units of its D."""
+        return L + 2.0 * R if self.rod_capped else 2.0 * math.sqrt(0.25 * L * L + R * R)
+
+    def _check_rod_inputs(self) -> None:
+        if self.aspect_ratios:
+            raise ValueError("rod_length / rod_radius were given together with aspect_ratios: a packing is of rods "
+                             "or of ellipsoids, not both")
+        if self.rod_length is None or self.rod_radius is None:
+            raise ValueError("rods need both rod_length and rod_radius (each one number or one per particle); "
+                             "rod_radius=0.5 makes D the rod's thickness")
+        n_part = len(self.diameters) if self.diameters else int(self.N)
+        for name, val in (("rod_length", self.rod_length), ("rod_radius", self.rod_radius)):
+            vals = val if isinstance(val, list) else [val]
+            if isinstance(val, list) and len(val) != n_part:
+                raise ValueError(f"{name} as a list needs one entry per particle ({n_part}), got {len(val)}")
+            for i, v in enumerate(vals):
+                who = f" (particle {i})" if isinstance(val, list) else ""
+                if not math.isfinite(v):
+                    raise ValueError(f"{name}{who} must be finite")
+                if name == "rod_radius" and not v > 0.0:
+                    raise ValueError(f"rod_radius{who} must be positive")
+                if name == "rod_length" and (v < 0.0 or (not self.rod_capped and not v > 0.0)):
+                    raise ValueError(f"rod_length{who} must be " + ("zero or positive (0 is a sphere)" if self.rod_capped
+                                     else "positive: an uncapped rod of length 0 has no volume"))
+        if not self.rod_capped and int(self.Ndim) > 3:
+            raise NotImplementedError("uncapped (flat-ended) rods are implemented in 2D and 3D only; capped rods work "
+                                      "in any dimension")
+
+    @staticmethod
+    def _normalised_ratios(aspect_ratios):
+        """One list of floats (the same shape for every particle) or a list of N such lists (a shape per particle)."""
+        if aspect_ratios is None:
+            return []
+        if hasattr(aspect_ratios, "tolist"):
+            aspect_ratios = aspect_ratios.tolist()
+        ratios = list(aspect_ratios)
+        if ratios and (isinstance(ratios[0], (list, tuple)) or hasattr(ratios[0], "__len__")):
+            return [[float(a) for a in row] for row in ratios]
+        return [float(a) for a in ratios]
+
+    @property
+    def is_ellipsoid(self) -> bool:
+        return bool(self.aspect_ratios)
+
+    @property
+    def has_shape_table(self) -> bool:
+        """True when ``aspect_ratios`` is a table with one row per particle."""
+        return bool(self.aspect_ratios) and isinstance(self.aspect_ratios[0], list)
+
+    def _shape_rows(self, n: int | None = None) -> list:
+        """The shape of every particle: N rows of Ndim-1 ratios, in the order of ``diameters``."""
+        if self.has_shape_table:
+            return self.aspect_ratios
+        n = len(self.diameters) if n is None else n
+        return [self.aspect_ratios] * n
+
+    def _all_ratios_one(self) -> bool:
+        rows = self.aspect_ratios if self.has_shape_table else [self.aspect_ratios]
+        return all(float(a) == 1.0 for row in rows for a in row)
+
+    def _reach_factor(self) -> float:
+        """Largest extent of a particle in units of D: 1 for ellipsoids (D is the longest axis); a rod's tip-to-tip
+        (capped) or corner-to-corner (uncapped) length."""
+        if self.is_rod and self.rod_length is not None and self.rod_radius is not None:
+            L, R = self._rod_rows(max(1, len(self.diameters)))
+            return max(self._rod_bounding_factor(a, b) for a, b in zip(L, R))
+        return 1.0
+
+    _ORDER_RULE = ("aspect ratios are listed in decreasing order, 1 >= ratio_2 >= ratio_3 >= ... > 0: D is the "
+                   "LONGEST axis and axis k has length D x ratio_k (3D prolate [0.5, 0.5], oblate [1, 0.5]). The "
+                   "input is not reordered for you, because that would rescale D and change what the size "
+                   "distribution means: divide D by the largest ratio and list the ratios longest first")
+
+    def _check_shape_rows(self) -> None:
+        nd = int(self.Ndim)
+        table = self.has_shape_table
+        rows = self.aspect_ratios if table else [self.aspect_ratios]
+        n_part = len(self.diameters) if self.diameters else int(self.N)
+        if table and len(rows) != n_part:
+            raise ValueError(f"a per-particle aspect_ratios table needs one row per particle ({n_part}), got {len(rows)}")
+        for i, row in enumerate(rows):
+            who = f" (particle {i})" if table else ""
+            if len(row) != nd - 1:
+                raise ValueError(f"aspect_ratios{who} needs Ndim-1 = {nd - 1} entries (axis k has length D x ratio_k; "
+                                 f"the first axis is D), got {len(row)}")
+            if any(not (a > 0.0) or not math.isfinite(a) for a in row):
+                raise ValueError(f"every aspect ratio{who} must be a positive finite number")
+            prev = 1.0
+            for a in row:
+                if a > prev:
+                    raise ValueError(f"aspect_ratios{who} = {list(row)} breaks the order rule: {self._ORDER_RULE}")
+                prev = a
+
+    def _nested_orientations(self, value, check: bool = False):
+        """Orientations as N nested Ndim x Ndim matrices; accepts nested matrices or flat row-major lists."""
+        nd = int(self.Ndim)
+        out = []
+        for item in (value if value is not None else []):
+            rows = [list(map(float, row)) for row in item] if (len(item) and isinstance(item[0], (list, tuple))
+                    or (hasattr(item, "ndim") and getattr(item, "ndim") == 2)) else None
+            if rows is None:
+                flat = [float(v) for v in item]
+                if len(flat) != nd * nd:
+                    raise ValueError(f"each orientation needs Ndim*Ndim = {nd * nd} numbers (a rotation matrix), "
+                                     f"got {len(flat)}")
+                rows = [flat[a * nd:(a + 1) * nd] for a in range(nd)]
+            if len(rows) != nd or any(len(r) != nd for r in rows):
+                raise ValueError(f"each orientation must be an Ndim x Ndim = {nd} x {nd} rotation matrix")
+            out.append(rows)
+        if check and len(out) != len(self.diameters):
+            raise ValueError(f"orientations needs one rotation per particle ({len(self.diameters)}), got {len(out)}")
+        return out
+
+    def _flat_orientations(self) -> list:
+        return [[v for row in R for v in row] for R in self.orientations]
+
+    def _check_ellipsoid_supported(self) -> None:
+        """Features not yet extended to ellipsoids refuse aspect ratios; they never run on the sphere assumption."""
+        if not self._nonsphere:
+            return
+        if self.is_rod:
+            self._check_rod_inputs()
+        else:
+            self._check_shape_rows()
+        what = "rods (rod_length / rod_radius)" if self.is_rod else "aspect_ratios (ellipsoids)"
+
+        def refuse(feature: str) -> None:
+            raise NotImplementedError(f"{feature} is not supported with {what} yet; "
+                                      f"remove them or do not use it")
+        if float(self.swap) > 0.0 and not self.diameter_permute:
+            refuse("the internal swap_* permutation settings (use diameter_permute=True)")
+        if self.morph_target:
+            refuse("the distribution morph (morph_target)")
+
+    def shrink_to_contact(self) -> dict[str, Any]:
+        """Exact shrink-to-contact of the current configuration (spheres or ellipsoids; flat or periodic box).
+
+        Returns ``scale`` (the largest uniform factor <= 1 by which every particle can be scaled about its
+        centre so that no pair and no wall overlaps, computed from the converged contact function over all
+        pairs, less a 1e-12 safety margin), ``phi`` (the packing fraction at that scale), ``n_overlapping``
+        (contacts that overlapped before the shrink) and ``pair`` (the tightest pair). The packing itself is
+        not modified: multiply ``diameters`` by ``scale`` to get the non-overlapping configuration."""
+        cs = _contact_scale(self._collect_pack_input(), self._collect_pack_config(translate=False))
+        scale = float(cs["scale"])
+        if scale < 1.0:
+            scale *= (1.0 - 1e-12)
+        return {"scale": scale, "phi": self._current_phi() * scale ** int(self.Ndim),
+                "n_overlapping": int(cs["n_overlapping"]), "pair": (int(cs["pair_i"]), int(cs["pair_j"]))}
 
     def _init_extension_state(self, config: dict[str, Any], *, consume: bool) -> None:
         """Set the fields added after v1.0 (diameter permutation, morph, quench, internal permutation fields)
@@ -275,6 +543,12 @@ class Packing:
             return
         if getattr(self, "_mutating_internal_state", False):
             return
+        if name in ("rod_length", "rod_radius"):   # new rod numbers from the user: what initialize() will use
+            object.__setattr__(self, name, self._normalised_rod(value))
+            object.__setattr__(self, "_rod_init", (deepcopy(self.rod_length), deepcopy(self.rod_radius)))
+        if name == "aspect_ratios":   # a new shape (or table) from the user: it is what initialize() will use
+            object.__setattr__(self, "aspect_ratios", self._normalised_ratios(value))
+            object.__setattr__(self, "_aspect_init", deepcopy(self.aspect_ratios))
         if name in self._INIT_KEYS:
             self._mark_needs_initialize()
         elif name in self._PACK_KEYS or name in self._REALIZED_STATE_KEYS:
@@ -303,13 +577,25 @@ class Packing:
             "fix_height": self.fix_height,
             "dist": deepcopy(self.dist),
             "seed": self.seed,   # deterministic, seed-varying initial configuration
+            **({"aspect_ratios": deepcopy(self._aspect_init)} if self.aspect_ratios else {}),
+            **({"rod_length": deepcopy(self._rod_init[0]), "rod_radius": deepcopy(self._rod_init[1]),
+                "rod_capped": self.rod_capped} if self.is_rod else {}),
         }
 
     def _collect_pack_input(self) -> dict[str, Any]:
-        return {
+        state = {
             "positions": deepcopy(self.positions),
             "diameters": deepcopy(self.diameters),
         }
+        if self.is_rod:   # rods: length and radius are part of the state (one number or one per particle)
+            state["orientations"] = self._flat_orientations()
+            state["rod_length"] = list(self.rod_length) if isinstance(self.rod_length, list) else [self.rod_length]
+            state["rod_radius"] = list(self.rod_radius) if isinstance(self.rod_radius, list) else [self.rod_radius]
+        if self.aspect_ratios:
+            state["orientations"] = self._flat_orientations()
+            if self.has_shape_table:   # a shape per particle is part of the state, like the diameters
+                state["aspect_ratios"] = deepcopy(self.aspect_ratios)
+        return state
 
     def _collect_pack_config(self, translate: bool = True) -> dict[str, Any]:
         cfg = {
@@ -323,6 +609,13 @@ class Packing:
             **{k: deepcopy(getattr(self, k)) for k in self._MORPH_DEFAULTS},
             **{k: deepcopy(getattr(self, k)) for k in self._QUENCH_DEFAULTS},
         }
+        if self.aspect_ratios:   # ellipsoids only: a sphere pack config is exactly what it always was
+            if not self.has_shape_table:   # one shape for all travels in the config, a table in the input
+                cfg["aspect_ratios"] = list(self.aspect_ratios)
+            cfg.update({k: getattr(self, k) for k in self._ELL_DEFAULTS})
+        if self.is_rod:
+            cfg["rod_capped"] = int(self.rod_capped)
+            cfg.update({k: getattr(self, k) for k in self._ELL_DEFAULTS})
         if translate and self.diameter_permute:   # to_dict() keeps the user's settings (translate=False)
             cfg.update(self._permute_recipe())
         return cfg
@@ -406,6 +699,9 @@ class Packing:
         self.mu_flag_history = []
         self.mu_history = []
         self.alpha_history = []
+        self.phi_contact = None
+        self.shrink_factor = None
+        self.torque_magnitude = None
 
     def _clear_trajectory(self) -> None:
         self.trajectory_positions = []
@@ -415,6 +711,8 @@ class Packing:
         self.trajectory_force = []
         self.trajectory_energy = []
         self.trajectory_max_min_dist = []
+        self.trajectory_orientations = []
+        self.trajectory_origin = []
 
     def _current_phi(self) -> float:
         if not self.positions or not self.diameters or not self.box:
@@ -429,6 +727,18 @@ class Packing:
         phi_modifier = 1.0
         if self.walls and self.walls[0] < 0:
             phi_modifier = math.pi ** ((-self.walls[0]) / 2.0) / math.gamma(((-self.walls[0]) / 2.0) + 1.0) * (0.5 ** (-self.walls[0]))
+        if self.aspect_ratios:   # ellipsoid volume = sphere volume for D x product of the ratios
+            particle_volume = 0.0
+            for diameter, row in zip(self.diameters, self._shape_rows()):
+                particle_volume += coeff * (diameter / 2.0) ** self.Ndim * math.prod(row)
+        if self.is_rod:   # straight section x cross-section, plus one ball of the rod's radius when capped
+            nd = int(self.Ndim)
+            c1 = math.pi ** ((nd - 1) / 2.0) / math.gamma((nd - 1) / 2.0 + 1.0)
+            particle_volume = 0.0
+            L, R = self._rod_rows()
+            for diameter, a, b in zip(self.diameters, L, R):
+                rad = diameter * b
+                particle_volume += c1 * rad ** (nd - 1) * diameter * a + (coeff * rad ** nd if self.rod_capped else 0.0)
         return particle_volume / box_volume / phi_modifier
 
     def _mark_realized_state_updated(self) -> None:
@@ -439,8 +749,24 @@ class Packing:
     def _clear_realized_state(self) -> None:
         self.positions = []
         self.diameters = []
+        self.orientations = []
         self._clear_results()
         self._clear_trajectory()
+
+    def _user_list_order(self, n: int):
+        """Which entry of the user's own diameter list each particle carries, or None.
+
+        The initializer sorts particles by decreasing diameter. When the code GENERATES the diameters (any
+        ``dist`` but "custom") there is no user order: row i of a per-particle shape table or rod list goes to the
+        i-th largest particle. When the user SUPPLIES the diameters (``dist = {"type": "custom", "custom": [...]}``)
+        entry i of a shape table or rod list belongs to entry i of that diameter list and stays with it through
+        the sort: particle k (the k-th largest) carries the user's entry ``order[k]``. Equal diameters keep the
+        user's order among themselves."""
+        dist = self.dist if isinstance(self.dist, dict) else {}
+        custom = dist.get("custom") if dist.get("type") == "custom" else None
+        if custom is None or len(custom) != n:
+            return None
+        return sorted(range(n), key=lambda i: -float(custom[i]))
 
     def _apply_initializer_result(self, result: dict[str, Any]) -> None:
         object.__setattr__(self, "_mutating_internal_state", True)
@@ -449,6 +775,34 @@ class Packing:
             self.diameters = result["diameters"]
             self.box = result["box"]
             self.walls = result["walls"]
+            order = self._user_list_order(len(self.diameters))
+            if self.is_rod:
+                self.rod_length, self.rod_radius = deepcopy(self._rod_init[0]), deepcopy(self._rod_init[1])
+                if order is not None:   # the user's own diameter list: entry i of a rod list goes with entry i of it
+                    if isinstance(self.rod_length, list):
+                        self.rod_length = [self.rod_length[k] for k in order]
+                    if isinstance(self.rod_radius, list):
+                        self.rod_radius = [self.rod_radius[k] for k in order]
+                self.orientations = self._nested_orientations(
+                    _random_orientations(len(self.diameters), int(self.Ndim), int(self.seed)))
+                if self.fix_height:
+                    # fix_height: the height is a multiple of the largest particle EXTENT. The initializer set it
+                    # from the largest D; a rod's extent is its bounding diameter D x (tip to tip, or the diagonal),
+                    # so the last axis is stretched by (largest extent) / (largest D), positions with it. The
+                    # packing loop then keeps height / size fixed as every particle grows by the same factor.
+                    L, R = self._rod_rows()
+                    extent = max(d * self._rod_bounding_factor(a, b) for d, a, b in zip(self.diameters, L, R))
+                    stretch = extent / max(self.diameters)
+                    self.box = list(self.box[:-1]) + [self.box[-1] * stretch]
+                    self.positions = [list(x[:-1]) + [x[-1] * stretch] for x in self.positions]
+            elif self.aspect_ratios:   # the initializer generates orientations, as it generates positions
+                self.aspect_ratios = deepcopy(self._aspect_init)   # table: row i <-> particle i as initialised
+                if order is not None and self.has_shape_table:   # the user's own diameter list: row i goes with entry i of it
+                    self.aspect_ratios = [self.aspect_ratios[k] for k in order]
+                self.orientations = self._nested_orientations(
+                    _random_orientations(len(self.diameters), int(self.Ndim), int(self.seed)))
+            else:
+                self.orientations = []
             self._clear_results()
         finally:
             object.__setattr__(self, "_mutating_internal_state", False)
@@ -516,6 +870,20 @@ class Packing:
             self.morph_rate_ceiling = float(result.get("morph_rate_ceiling", 0.0))
             self.swap_events = list(result.get("swap_events", []))
             self.swap_event_width = int(result.get("swap_event_width", 8))
+            if self.is_rod:
+                for key in ("rod_length", "rod_radius"):   # per-particle lists come back with their particles
+                    if isinstance(getattr(self, key), list) and result.get(key):
+                        setattr(self, key, [float(v) for v in result[key]])
+            if self._nonsphere:   # ellipsoids and rods: orientations out, and the reported phi after the exact shrink
+                self.orientations = self._nested_orientations(result.get("orientations", []))
+                if self.has_shape_table and result.get("aspect_ratios"):   # shapes come back with their particles
+                    self.aspect_ratios = [[float(a) for a in row] for row in result["aspect_ratios"]]
+                self.torque_magnitude = float(result.get("torque_magnitude", 0.0))
+                self.ell_capture_record = result.get("ell_capture")
+                self.ell_permute_candidates = int(result.get("ell_permute_candidates", 0))
+                shrunk = self.shrink_to_contact()
+                self.shrink_factor = shrunk["scale"]
+                self.phi_contact = shrunk["phi"]
         finally:
             object.__setattr__(self, "_mutating_internal_state", False)
 
@@ -532,6 +900,10 @@ class Packing:
             self.trajectory_force = trace.get("force", [])
             self.trajectory_energy = trace.get("energy", [])
             self.trajectory_max_min_dist = trace.get("max_min_dist", [])
+            self.trajectory_orientations = [self._nested_orientations(o) for o in trace.get("orientations", [])]
+            # which particle is in which slot of each frame (the core renumbers particles while it runs):
+            # trajectory_origin[f][k] = index at the start of this run of the particle in slot k of frame f
+            self.trajectory_origin = [list(o) for o in trace.get("origins", [])]
         finally:
             object.__setattr__(self, "_mutating_internal_state", False)
 
@@ -543,8 +915,13 @@ class Packing:
         capture_trajectory: bool,
         trajectory_interval: int,
         options: dict[str, Any] | None = None,
+        trajectory_per_decade: int = 0,
     ) -> dict[str, Any]:
         self._clear_trajectory()
+        self._check_ellipsoid_supported()
+        if self._nonsphere and len(self.orientations) != len(self.diameters):
+            raise ValueError("aspect_ratios (or rod inputs) are set but orientations do not match the particles: supply both "
+                             "(ellipsoids) or neither (spheres); initialize() generates orientations")
         if verbose:
             print("rcpgenerator: running packing")
 
@@ -558,9 +935,12 @@ class Packing:
                         f"energy={update['energy']:.6g}"
                     )
 
+            pack_config = self._collect_pack_config()
+            if trajectory_per_decade > 0:      # frames evenly in log(step); the interval is then not used
+                pack_config = dict(pack_config, trajectory_per_decade=int(trajectory_per_decade))
             observed = _run_packing_observed(
                 self._collect_pack_input(),
-                self._collect_pack_config(),
+                pack_config,
                 progress_interval if verbose else 0,
                 capture_trajectory,
                 trajectory_interval if capture_trajectory else 0,
@@ -594,6 +974,8 @@ class Packing:
         if not self.diameters or not self.box or not self.walls:
             return
         dmax = max(self.diameters)
+        if self._nonsphere:   # an elongated particle reaches further than its D
+            dmax *= self._reach_factor()
         if not dmax > 0:
             return
         w0 = int(self.walls[0])
@@ -650,6 +1032,7 @@ class Packing:
         self._log("rcpgenerator: initializing particles")
         config = self._collect_init_config()
         config["walls"] = self._validated_walls()
+        self._check_ellipsoid_supported()
         result = _initialize_particles(config)
         self._apply_initializer_result(result)
         self._log("rcpgenerator: initialization complete")
@@ -661,7 +1044,18 @@ class Packing:
         progress_interval: int = 1000,
         capture_trajectory: bool = False,
         trajectory_interval: int = 1000,
+        trajectory_spacing: str = "linear",
+        trajectory_per_decade: int = 20,
     ) -> dict[str, Any]:
+        """Run the packing. ``capture_trajectory=True`` records frames for ``animate_2d``: every
+        ``trajectory_interval`` steps (``trajectory_spacing="linear"``), or evenly in the LOGARITHM of the step,
+        ``trajectory_per_decade`` frames per factor of 10 in steps (``trajectory_spacing="log"``). Most of the
+        motion happens in the first few hundred steps of some 16,000, so log spacing gives a movie in which
+        things happen throughout; linear spacing gives one that is almost still after the first frames."""
+        if trajectory_spacing not in ("linear", "log"):
+            raise ValueError("trajectory_spacing must be 'linear' or 'log'")
+        if trajectory_spacing == "log" and int(trajectory_per_decade) < 1:
+            raise ValueError("trajectory_per_decade must be at least 1")
         effective_verbose = self.verbose if verbose is None else verbose
         if self._needs_initialize or not self._initialized:
             if effective_verbose:
@@ -675,6 +1069,7 @@ class Packing:
             progress_interval=progress_interval,
             capture_trajectory=capture_trajectory,
             trajectory_interval=trajectory_interval,
+            trajectory_per_decade=int(trajectory_per_decade) if (capture_trajectory and trajectory_spacing == "log") else 0,
         )
 
     def relax(
@@ -724,12 +1119,17 @@ class Packing:
         verbose: bool | None = None,
         mass_scaled: bool = True,
         dt0: float = 0.05,
-        dt_max: float = 0.5,
+        dt_max: float | None = None,
         alpha0: float = 0.03,
         mix_mode: int = 1,
         report_every: int = 500,
+        rod_round: float | None = None,
     ) -> dict[str, Any]:
         """Drive the current packing to mechanical force balance at fixed diameters.
+
+        With ``aspect_ratios`` (ellipsoids) the same minimisation moves positions and orientations together and
+        the residual measures force and torque balance: |(Σf, Στ/a)| / Σ|f| per load-bearing particle, with ``a``
+        the particle's largest semi-axis. ``orientations`` come back in the caller's order like the positions.
 
         A FIRE minimisation of the overlap energy replaces the packing update: every
         diameter is first multiplied once by ``kappa_mult`` and then frozen, the μ schedule
@@ -752,16 +1152,26 @@ class Packing:
             be balanced, so a small compression is needed. Default for a fresh quench: 1.003
             (0.3 % larger diameters) in 2D and 3D, which converges for size ratios up to
             about 10; 1.01 in 4D and above, where broad size distributions need the larger
-            compression to converge reliably. Not applied when ``resume=True``.
+            compression to converge reliably, and 1.01 for ellipsoids in any dimension (their
+            packings have fewer contacts than degrees of freedom and are held stable by the
+            compression itself). Not applied when ``resume=True``.
         resume : bool
             Continue from the state a previous ``quench()`` left (for example with a
             tighter ``tol`` or after a stop): the diameters are not rescaled again.
         held : sequence of int, optional
             Indices (into ``positions`` as they are now) of particles that must not move;
             the net force on them is reported in ``quench_held_force``.
+        rod_round : float, optional
+            Rods only. The quench balances forces and torques on slightly ROUNDED rods (edges rounded by this
+            relative amount, default 0.01): a sharp rod's contact energy has kinks where two flat faces rest on
+            each other, and no balance point exists for a descent method to find. 0 uses the sharp rods (the
+            quench then usually stalls). The independent check of the result must use the same value
+            (``evaluate_once`` config key ``rod_round``).
         stall_window : int, optional
             Give up when the best residual has not halved within this many iterations.
-            Default ``max(20000, 20 * N)``; 0 disables the check.
+            Default ``max(20000, 20 * N)``; 0 disables the check. With ellipsoids a fall of the
+            energy by more than 0.1 % within the window also counts as progress (slow rearrangements
+            lower the energy for tens of thousands of iterations before the residual drops).
         verbose : bool, optional
             Print the outcome (defaults to the packing's ``verbose``).
         mass_scaled, dt0, dt_max, alpha0, mix_mode, report_every
@@ -787,6 +1197,18 @@ class Packing:
             raise ValueError("quench(resume=True) continues at the current diameters; kappa_mult cannot be applied "
                              "(call quench(kappa_mult=...) without resume to rescale)")
         default_kmult = 1.003 if int(self.Ndim) <= 3 else 1.01   # [228] 4D+: x1.003 gives up in ~40 % of broad-distribution runs
+        if self.is_rod or (self.aspect_ratios and not self._all_ratios_one()):
+            # ellipsoids: x1.003 leaves 2D ratio 3, 3D ratio 1.05 and the 1.25:1:0.8 shape wandering at a residual
+            # of 1e-3 to 1e-2 for 200,000 iterations; x1.01 converges them (EllipsoidalPacking LOG [020], [021])
+            default_kmult = 1.01
+            ell_shaped = True
+        else:
+            ell_shaped = False
+        if dt_max is None:
+            # spheres 0.5 as before. Ellipsoids 0.2: at 0.5 the step keeps overshooting and being cut back on the
+            # more elongated or flattened shapes (2D ratio 4, 3D ratio 3 and 0.33 did not converge); at 0.2 it holds
+            # (EllipsoidalPacking LOG [022])
+            dt_max = 0.2 if ell_shaped else 0.5
         kmult = 1.0 if resume else (default_kmult if kappa_mult is None else float(kappa_mult))
         if not (tol > 0.0) or int(max_iter) < 1 or not (kmult > 0.0):
             raise ValueError("quench(): tol and kappa_mult must be > 0 and max_iter >= 1")
@@ -810,6 +1232,11 @@ class Packing:
             # the quench acts on the realized state held here, never on a checkpoint: with checkpoint_path set the
             # run would resume the blob (dropping kappa_mult) and overwrite it at exit
             self.checkpoint_path = ""
+            diameters_before = list(self.diameters)
+            run_finished = False
+            if self.is_rod and int(self.Ndim) > 3 and (0.01 if rod_round is None else float(rod_round)) > 0.0:
+                raise NotImplementedError("quench() of rods uses the rounded-rod contact, which is implemented in 2D and "
+                                          "3D only")
             if kmult != 1.0:
                 self.diameters = [float(d) * kmult for d in self.diameters]
             for k, v in self._QUENCH_DEFAULTS.items():   # research-only fields stay at their (off) defaults
@@ -826,6 +1253,8 @@ class Packing:
             self.quench_mix_mode = int(mix_mode)
             self.quench_stall_window = window
             self.quench_dt_min = 1e-8
+            # rods: the quench works on slightly rounded rods (smooth contact; see rod.hpp), default rounding 1 %
+            self.quench_rod_round = (0.01 if rod_round is None else float(rod_round)) if self.is_rod else 0.0
             self.quench_held = [float(i) for i in held_idx]
             self.diameter_permute = False          # frozen diameters: no permutation during the quench
             self.swap = 0.0
@@ -837,9 +1266,12 @@ class Packing:
                 trajectory_interval=0,
                 options={"max_steps": int(max_iter) + 1, "fix_diameter": True},
             )
+            run_finished = True
         finally:
             object.__setattr__(self, "_mutating_internal_state", True)
             try:
+                if not run_finished and "diameters_before" in locals():   # refused or failed: nothing was done
+                    self.diameters = diameters_before
                 for k, v in saved.items():
                     setattr(self, k, v)
             finally:
@@ -870,6 +1302,26 @@ class Packing:
                     dia[i] = self.diameters[k]
                 self.positions, self.diameters = pos, dia
                 result["positions"], result["diameters"] = pos, dia
+                if self.has_shape_table and len(self.aspect_ratios) == n:   # so does a per-particle shape
+                    tab = [None] * n
+                    for k in range(n):
+                        tab[q_origin[k]] = self.aspect_ratios[k]
+                    self.aspect_ratios = tab
+                    result["aspect_ratios"] = tab
+                for key in ("rod_length", "rod_radius"):   # rods: per-particle lists follow their particle too
+                    val = getattr(self, key, None)
+                    if isinstance(val, list) and len(val) == n:
+                        lst = [0.0] * n
+                        for k in range(n):
+                            lst[q_origin[k]] = val[k]
+                        setattr(self, key, lst)
+                        result[key] = lst
+                if self._nonsphere and len(self.orientations) == n:   # orientations follow their particle
+                    ori = [None] * n
+                    for k, i in enumerate(q_origin):
+                        ori[i] = self.orientations[k]
+                    self.orientations = ori
+                    result["orientations"] = [[v for row in R for v in row] for R in ori]
             for k, v in kept.items():
                 setattr(self, k, v)
             result["particle_origin"] = self.particle_origin
@@ -900,7 +1352,12 @@ class Packing:
                 cause = (" The overlap energy fell by a factor of %.0e, so the packing is relaxing apart rather than "
                          "balancing: it is under-compressed. Quench the original state with a larger kappa_mult." % (e0 / max(e1, 1e-300)))
             else:
-                cause = " Call quench(resume=True) to keep trying, or quench the original state with a larger kappa_mult."
+                cause = (" Quench the ORIGINAL (packed) state again with a lower dt_max (for example half the present one; much lower "
+                         "than needed costs many more iterations) or with slightly more compression (a larger kappa_mult); when a "
+                         "lower dt_max does not help, more compression is the next thing to try. "
+                         "Resuming with unchanged settings does not help unless the residual was still falling.")
+                if self.is_rod and not self.rod_capped and int(self.Ndim) == 3 and self.walls and int(self.walls[0]) < 0:
+                    cause += " (Flat-ended rods in a 3D curved container often need this retry.)"
             return (f"gave up: the max residual has not halved in {window} iterations (now {res:.2e}, tol {tol:.0e})."
                     f"{cause}{size_note}")
         if st == "unjammed":
@@ -908,8 +1365,9 @@ class Packing:
                     "carry load. Quench the original state with a larger kappa_mult.")
         if st == "step_collapse":
             return (f"gave up: the minimiser's time step collapsed after {it} iterations (max residual {res:.2e}), so it "
-                    f"found no step it could follow downhill. This is typical of a loose, under-compressed state; quench "
-                    f"the original state with a larger kappa_mult.{size_note}")
+                    f"found no step it could follow downhill. Quench the original (packed) state again with a lower dt_max "
+                    f"(for example half the present one) or with slightly more compression (a larger kappa_mult); "
+                    f"resuming with unchanged settings does not help.{size_note}")
         if st == "non_finite":
             return (f"failed: a non-finite force or energy appeared after {it} iterations; the stored state may contain "
                     "invalid values and should not be used.")
@@ -1061,6 +1519,16 @@ class Packing:
         return self.copy()
 
     def to_dict(self) -> dict[str, Any]:
+        data = self._to_dict_base()
+        if self._nonsphere:   # ellipsoids and rods only: a sphere packing gets none of these keys (its only new key is pack_config.quench_rod_round)
+            data["final_result"].update(phi_contact=self.phi_contact, shrink_factor=self.shrink_factor,
+                                        torque_magnitude=self.torque_magnitude)
+            data["trajectory"]["orientations"] = deepcopy(self.trajectory_orientations)
+        if self.trajectory_origin:   # only with a captured trajectory: a packing without one serialises exactly as before
+            data["trajectory"]["origins"] = deepcopy(self.trajectory_origin)
+        return data
+
+    def _to_dict_base(self) -> dict[str, Any]:
         return {
             "init_config": self._collect_init_config(),
             "pack_config": self._collect_pack_config(translate=False),
