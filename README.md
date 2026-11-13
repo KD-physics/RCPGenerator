@@ -11,7 +11,7 @@ Quick Links:  [Run in Colab ↗](https://colab.research.google.com/github/KD-phy
 RCPGenerator is an open-source Python package for generating dense, disordered
 packings of polydisperse particles. It supports 2D disks, 3D spheres, and
 higher-dimensional hyperspheres with periodic boundaries, hard walls, and curved
-containers including circles, cylinders, and spheres.
+containers including circles, cylinders, and spheres. It also packs ellipsoids (oblate and prolate) and rods (with and without end caps), in the same boxes and containers.
 
 The maintained implementation is the `rcpgenerator` Python package. Its numerical
 engine is current C++ code compiled into a Python extension with pybind11 and OpenMP;
@@ -108,6 +108,11 @@ viewer-bundle export, interpretation guidance, and the complete public API.
 | ![Cropped dense 2D packing](Images/example1.png) | ![Dense disks in a circular container](Images/example2.png) | ![Spheres in a cylindrical container](Images/example3.png) | ![Spheres in a spherical container](Images/example4.png) |
 |:---:|:---:|:---:|:---:|
 | Dense 2D packing with periodic and hard-wall boundaries | Dense 2D disks in a circular container | 3D spheres with cylindrical confinement | 3D spheres with spherical confinement |
+
+| ![2D ellipses of two shapes with a power-law size distribution](Images/example5.png) | ![2D rods with rounded ends being packed](Images/example6.gif) | ![Oblate ellipsoids in a spherical container](Images/example7.png) | ![Long rods with rounded ends](Images/example8.png) |
+|:---:|:---:|:---:|:---:|
+| 2D ellipses of two shapes with a power-law size distribution | 2D rods with rounded ends being packed | 3D oblate ellipsoids with spherical confinement | 3D long rods of mixed length with rounded ends |
+
 
 ## Interactive packing app
 
