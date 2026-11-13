@@ -8,10 +8,7 @@ Sections:    [Install](#install-the-current-python-package) | [Quickstart](#pyth
 
 Quick Links:  [Run in Colab ↗](https://colab.research.google.com/github/KD-physics/RCPGenerator/blob/main/getting_started.ipynb) | [Packing app](https://kd-physics.github.io/RCPGenerator/webapp/index.html) | [Packing visualizer](https://kd-physics.github.io/RCPGenerator/python_code/python/webapp/app/index.html) | [Python API documentation](https://github.com/KD-physics/RCPGenerator/blob/main/python_code/python/README.md)  
 
-RCPGenerator is an open-source Python package for generating dense, disordered
-packings of polydisperse particles. It supports 2D disks, 3D spheres, and
-higher-dimensional hyperspheres with periodic boundaries, hard walls, and curved
-containers including circles, cylinders, and spheres. It also packs ellipsoids (oblate and prolate) and rods (with and without end caps), in the same boxes and containers.
+RCPGenerator is an open-source Python package for generating dense, disordered random packings of polydisperse spheres and nonspherical particles. It supports 2D disks, 3D spheres, N-dimensional hyperspheres, prolate and oblate ellipsoids, and capped or flat-ended rods, with periodic boundaries, planar hard walls, and curved containers including circles, cylinders, and spheres.
 
 The maintained implementation is the `rcpgenerator` Python package. Its numerical
 engine is current C++ code compiled into a Python extension with pybind11 and OpenMP;
