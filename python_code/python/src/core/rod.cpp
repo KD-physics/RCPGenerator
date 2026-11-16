@@ -1348,10 +1348,12 @@ void rod_forces(const std::uint32_t* pairs_data, const std::uint64_t* pair_offse
 double rod_min_contact_scale(std::size_t N, const EllShape& sh, const double* x, const double* Db,
                              const double* Rot, const std::vector<double>& box,
                              const std::vector<std::int8_t>& walls, std::size_t& pair_i, std::size_t& pair_j,
-                             std::size_t& n_overlapping, int mode, std::vector<int>* zout) {
+                             std::size_t& n_overlapping, int mode, std::vector<int>* zout,
+                             double* pair_stats) {
     const std::size_t n = sh.Ndim, nn = n * n;
     const int kind = sh.kind;
     if (zout) zout->assign(N, 0);
+    double ps_n = 0.0, ps_sum = 0.0, ps_max = 0.0;
     const PairGrid grid(N, n, x, Db, box, walls, mode);
     std::vector<std::uint32_t> later;
     double inv_box[MD] = {0.0};
@@ -1377,6 +1379,7 @@ double rod_min_contact_scale(std::size_t N, const EllShape& sh, const double* x,
             }
             if (!(d2 < rb * rb)) continue;
             const double s = rod_pair_scale_exact(n, kind, r, axis.data() + i * n, hl[i], rad[i], axis.data() + j * n, hl[j], rad[j]);
+            if (s < 1.0) { ps_n += 1.0; ps_sum += 1.0 - s; if (1.0 - s > ps_max) ps_max = 1.0 - s; }
             if (s < 1.0) { ++nover; if (zout) { ++(*zout)[i]; ++(*zout)[j]; } if (s < best || (s == best && i == bi && j < bj)) { best = s; bi = i; bj = j; } }
         }
         for (std::size_t d = 0; d < n; ++d) {
@@ -1397,6 +1400,7 @@ double rod_min_contact_scale(std::size_t N, const EllShape& sh, const double* x,
         }
     }
     pair_i = bi; pair_j = bj; n_overlapping = nover;
+    if (pair_stats) { pair_stats[0] = ps_n; pair_stats[1] = ps_sum; pair_stats[2] = ps_max; }
     return best;
 }
 

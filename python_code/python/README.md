@@ -25,7 +25,7 @@ Project resources: [repository](https://github.com/KD-physics/RCPGenerator) ·
 pip install rcpgenerator
 ```
 
-The version 1.2.1 wheel workflow builds and tests CPython 3.10–3.14 on:
+The version 1.2.2 wheel workflow builds and tests CPython 3.10–3.14 on:
 
 - Windows x86-64
 - Linux x86-64
@@ -399,6 +399,7 @@ After `pack()` or `relax()`, the most commonly used attributes are:
 | `mu_history` | Chemical-potential value by step. |
 | `z` | Contacts per particle, in the particle order of `positions`: the neighbours it overlaps, plus one for each wall it overlaps. Filled by `pack()`, `quench()` and `adaptive_quench()` and on loading a packed state; it describes the state those left. `None` before a run and for spheres above 8 dimensions. |
 | `z_mean`, `n_rattlers`, `z_mean_no_rattlers` | The mean of `z` over all particles; the number of rattlers (particles with fewer than `Ndim + 1` contacts, which cannot be held in place); the mean of `z` over the particles that are not rattlers. A packing straight from `pack()` is not in force balance, so there these count the pairs that happen to overlap at the stop; after a quench they are the contact numbers of the balanced network. |
+| `mean_overlap`, `max_overlap` | The mean and the largest relative overlap over the pairs of particles that overlap: for spheres `1 - distance / (r_i + r_j)`, for ellipsoids and rods one minus the factor by which the pair would have to shrink to touch. Wall contacts are not included (`1 - shrink_factor` is the largest overlap with walls included). Filled with `z`. Shrinking every diameter by the factor `1 - mean_overlap` lowers the packing fraction by about `Ndim * mean_overlap`; this is the number to use when two packings are to be compared at the same degree of overlap. |
 | `mu_final` | The pressure term `mu` the run ended on; the default `mu` of [`adaptive_quench()`](#adaptive-quench-balance-at-a-pressure). `None` for a state that was not packed by this version. |
 | `alpha_history` | Learning-rate value by step. |
 | `mu_flag_history` | Chemical-potential rung indicator (`-1`, `0`, or `1`) by step. |
@@ -783,7 +784,8 @@ forces while the diameters adapt: one common scale factor on all diameters follo
 `mu`, the same `mu` that drives the swelling in `pack()`. The particles swell while their contacts
 carry less than `mu` and shrink while they carry more, so the call ends in the force-balanced packing
 whose contact forces carry `mu`. The mean overlap of that packing is proportional to `mu`. One value
-of `mu` is used throughout; there is no schedule. Spheres only.
+of `mu` is used throughout; there is no schedule. It works for spheres, ellipsoids and rods (rods in 2D and 3D,
+as for `quench()`); with shapes, positions and orientations move together and torques are balanced too.
 
 ```python
 packing.pack()
@@ -806,7 +808,8 @@ above `2 * Ndim`. Read it from `packing.z` (per particle), `packing.z_mean`, `pa
 | `coast` | `True` | A particle that loses its last contact keeps its velocity until the minimiser next resets. `False`: it stops where the contact ended. (On one packing of 600 spheres with a size ratio of 5: 41,235 iterations with it, 77,501 without.) |
 | `gamma` | `0.05` | Rate at which the size scale follows the pressure. Lower it if the sizes oscillate. |
 | `verbose` | packing's `verbose` | Print the outcome. |
-| `mass_scaled`, `dt0`, `dt_max`, `alpha0`, `mix_mode`, `report_every` | `True`, `0.05`, `0.5`, `0.03`, `1`, `500` | FIRE settings, as in `quench()`. |
+| `rod_round` | `0.01` | Rods only: the rounding of the rods the quench balances, as in `quench()`. |
+| `mass_scaled`, `dt0`, `dt_max`, `alpha0`, `mix_mode`, `report_every` | `True`, `0.05`, `0.5` (`0.2` for ellipsoids and rods), `0.03`, `1`, `500` | FIRE settings, as in `quench()`. |
 
 After the call, `quench_status` is `"converged"`, `"max_iter"` or `"non_finite"` and `quench_message`
 explains it; anything other than `"converged"` also raises a `RuntimeWarning`. `phi_final`,
@@ -819,7 +822,9 @@ packing is modified in place, whether or not the call converges, and particle `i
 bidisperse spheres in 3D converge in about 40,000 iterations (6 s); 5,000 spheres with a size ratio of
 10 were not yet balanced after 150,000 (5 minutes). In 5D (600 spheres, size ratio 2) the call at the default
 `mu` was still compacting after 150,000 iterations, with the sizes creeping up, and converged in 82,000 at five
-times that `mu` (`adaptive_quench(mu=5 * packing.mu_final)`). When a call stops at `max_iter`, call it again to continue; when the
+times that `mu` (`adaptive_quench(mu=5 * packing.mu_final)`). Ellipsoids take longer than spheres: 500 to 600
+ellipses or ellipsoids (2:1 down to 1.25:1, 2D and 3D) converged in 140,000 to 190,000 iterations at the default
+`mu`, and 3D ellipsoids against a wall and 3D rods needed more than 200,000. When a call stops at `max_iter`, call it again to continue; when the
 residual is no longer falling, the settings to change are a lower `dt_max`, a larger `mu`, or a looser
 `tol`.
 
@@ -831,6 +836,12 @@ residual is no longer falling, the settings to change are a lower `dt_max`, a la
 | The contact network resolved | `pack()`, then `adaptive_quench()`. |
 | A compressed, force-balanced packing at fixed diameters | `pack()`, then `quench(kappa_mult=1.003)` (the expansion sets the compression). |
 | Balance kept through a deformation | `adaptive_quench()`, then `quench()`; move or hold particles; `quench()` again after each change. `quench()` never changes the diameters unless `kappa_mult` is passed. |
+
+**Rods.** As in `quench()`, the rods that are balanced are slightly rounded (`rod_round`, 1 %), and the rounded body
+is a little larger than the rod. With the sizes free, the rods therefore shrink by a fraction of a percent (0.2 to
+0.5 % in the cases run) until the rounded bodies carry `mu`, and the true rods end just short of touching. The
+contact numbers reported for rods after a quench are those of the rounded bodies, which is the network that is
+in balance; `phi_final` is the packing fraction of the true rods at the sizes reached.
 
 After an adaptive quench at a small `mu` the overlaps are small, and the tightest residual `quench()`
 can reach is limited by floating-point rounding of the positions (roughly 6e-14 divided by the mean

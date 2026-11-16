@@ -1,6 +1,6 @@
 # Changelog
 
-## 1.2.1
+## 1.2.2
 
 ### New
 - **`extend`**: `Packing(extend=x)` or `pack(extend=x)` lengthens the first stage of a run (the stage at the starting
@@ -9,12 +9,16 @@
   32,145 steps with `extend=3`, 0.7426 in 67,843 steps with `extend=8.04`. Not set: the run is unchanged.
 - **`adaptive_quench(mu=..., tol=..., max_iter=...)`**: force balance with the diameters free. One common scale
   factor on all diameters follows the pressure term `mu` until the contact forces carry it. Default `mu`: the new
-  attribute `mu_final`, the value the packing run ended on. Spheres only. README, "Adaptive quench".
+  attribute `mu_final`, the value the packing run ended on. Spheres, ellipsoids and rods (rods in 2D and 3D).
+  README, "Adaptive quench".
 - `mu_final`: the `mu` a run ended on. `to_dict()` has one more `final_result` key for it.
 - **Contact numbers**: `z` (contacts per particle, in the order of `positions`; a wall the particle touches counts
   as one), `z_mean`, `n_rattlers` (fewer than `Ndim + 1` contacts) and `z_mean_no_rattlers`. Filled by `pack()`,
   `quench()` and `adaptive_quench()` and on loading a packed state, for every shape (`None` for spheres above 8
   dimensions). They are counted in the pass that computes `phi_contact`, at no extra cost. Not saved by `to_dict()`.
+- **Overlaps**: `mean_overlap` and `max_overlap`, the mean and the largest relative overlap over the pairs that
+  overlap (walls not included), filled with the contact numbers. Use `mean_overlap` to compare packing fractions
+  at the same degree of overlap.
 - **Spheres get `phi_contact` and `shrink_factor` too**: `pack()` fills them for every shape (`None` for spheres
   above 8 dimensions); `phi_final` is unchanged. A sphere `to_dict()` therefore has two more `final_result` keys.
 - The exact shrink behind them examines only pairs that can overlap (a cell grid) instead of every pair, with the

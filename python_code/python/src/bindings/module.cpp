@@ -370,6 +370,7 @@ py::dict packing_result_to_dict(const rcpgenerator::PackingResult& result) {
     output["quench_log"] = result.quench_log;
     output["quench_held_force"] = result.quench_held_force;
     if (!result.quench_aq_log.empty()) output["quench_aq_log"] = result.quench_aq_log;   // adaptive quench only
+    if (!result.quench_z.empty()) output["quench_z"] = result.quench_z;                  // quench runs only
     // Ellipsoids only: a sphere run's result dict has exactly the keys it always had.
     if (!result.aspect_ratios.empty()) output["aspect_ratios"] = result.aspect_ratios;
     if (!result.rod_length.empty()) { output["rod_length"] = result.rod_length; output["rod_radius"] = result.rod_radius; }
@@ -545,6 +546,9 @@ PYBIND11_MODULE(_rcpgenerator, m) {
             out["n_overlapping"] = cs.n_overlapping;
             out["particle_volume"] = cs.particle_volume;
             out["z"] = cs.z;
+            out["pair_count"] = cs.pair_count;
+            out["pair_overlap_sum"] = cs.pair_overlap_sum;
+            out["pair_overlap_max"] = cs.pair_overlap_max;
             return out;
         },
         py::arg("input"), py::arg("config"), py::arg("pairs") = -1,

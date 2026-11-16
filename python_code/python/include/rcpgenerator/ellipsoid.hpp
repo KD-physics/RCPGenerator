@@ -158,7 +158,10 @@ private:
 double ell_min_contact_scale(std::size_t N, const EllShape& sh, const double* x, const double* Db,
                              const double* Rot, const std::vector<double>& box,
                              const std::vector<std::int8_t>& walls, std::size_t& pair_i, std::size_t& pair_j,
-                             std::size_t& n_overlapping, int mode = PAIRS_AUTO, std::vector<int>* zout = nullptr);
+                             std::size_t& n_overlapping, int mode = PAIRS_AUTO, std::vector<int>* zout = nullptr,
+                             double* pair_stats = nullptr);
+// pair_stats (optional, 3 doubles): over the overlapping PAIR contacts (walls not included): their number, the sum
+// of their relative overlaps 1 - s, and the largest.
 // zout (optional): receives, per particle, the number of its overlapping contacts (pairs with s < 1, plus one for
 // each wall it overlaps): the particle's contact number in this configuration.
 

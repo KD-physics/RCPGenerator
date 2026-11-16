@@ -5144,10 +5144,12 @@ ContactScale contact_scale(const PackingInput& input, const PackingConfig& confi
             for (std::size_t d = 0; d < Ndim; ++d) rot[i * Ndim * Ndim + d * Ndim + d] = 1.0;
     }
     ContactScale out;
+    double pair_stats[3] = {0.0, 0.0, 0.0};
     out.scale = sh.kind != 0
-        ? rod_min_contact_scale(N, sh, f.x.data(), f.D.data(), rot.data(), f.box, f.walls, out.pair_i, out.pair_j, out.n_overlapping, pairs, &out.z)
+        ? rod_min_contact_scale(N, sh, f.x.data(), f.D.data(), rot.data(), f.box, f.walls, out.pair_i, out.pair_j, out.n_overlapping, pairs, &out.z, pair_stats)
         : ell_min_contact_scale(N, sh, f.x.data(), f.D.data(), rot.data(), f.box, f.walls, out.pair_i,
-                                      out.pair_j, out.n_overlapping, pairs, &out.z);
+                                      out.pair_j, out.n_overlapping, pairs, &out.z, pair_stats);
+    out.pair_count = pair_stats[0]; out.pair_overlap_sum = pair_stats[1]; out.pair_overlap_max = pair_stats[2];
     double vol = 0.0;
     for (double dv : f.D) vol += sphere_volume(0.5 * dv, Ndim);
     out.particle_volume = vol * sh.vol_factor;
@@ -5910,10 +5912,11 @@ std::pair<PackingResult, PackingTrace> run_packing_observed(
     int q_status = 0; long q_unjam_streak = 0, q_stall_ref_iter = 0; double q_stall_ref = -1.0; bool q_any_held = false;
     std::vector<double> q_wall_s; std::vector<int> q_wall_n;
     std::vector<double> q_log; std::vector<double> q_held_force(Ndim, 0.0); std::vector<double> q_minv;
-    // adaptive quench (spheres): the sizes are free and follow the pressure quench_aq_mu, applied in the force pass
-    const bool aq_on = quench_on && config.quench_aq != 0 && !ell_on;
+    // adaptive quench (every shape): the sizes are free and follow the pressure quench_aq_mu, applied in the force pass
+    const bool aq_on = quench_on && config.quench_aq != 0;
     const double aq_mu = aq_on ? config.quench_aq_mu : 0.0;
     std::vector<double> aq_log;
+    std::vector<int> q_zout;   // per particle, at the quench's last force pass: pair contacts plus wall contacts
     bool morph_armed = false;               // reference captured at the first update step
     double morph_lambda = 0.0, morph_rate = config.morph_rate0, morph_ref_maxov = 0.0, morph_vol0 = 0.0;
     long morph_ok_streak = 0, morph_updates = 0, morph_holds = 0;
@@ -8553,12 +8556,30 @@ std::pair<PackingResult, PackingTrace> run_packing_observed(
                 q_log.push_back(U); q_log.push_back(static_cast<double>(nback)); q_log.push_back(q_dt);
             }
             const bool q_armed = (q_iter >= 1) || (config.quench_kappa_mult == 1.0);
-            if (q_armed && nback > 0 && q_res <= config.quench_tol) q_status = 1;
+            // adaptive quench, as in the sphere block below: the size scale follows the pressure with drag. D is the
+            // bounding diameter here, so k_s (the drag's stiffness scale) is an upper estimate for elongated shapes:
+            // the size then follows a little more slowly, never faster. Converged when forces AND torques balance
+            // (global residual) and the contacts carry the pressure mu.
+            bool aq_done_ok = true;
+            if (aq_on) {
+                double sumD = 0.0, ks = 0.0, zbb = 0.0;
+                for (std::size_t k = 0; k < N; ++k) { sumD += D[k]; ks += 0.5 * static_cast<double>(z[k]) * D[k] * D[k]; }
+                for (std::size_t k = 0; k < N; ++k) if (!q_held[k] && qZ(k) >= q_zmin && qS(k) >= s_floor) zbb += static_cast<double>(qZ(k));
+                const double G = mu_eff * sumD - dkappa;
+                aq_done_ok = std::abs(dkappa) <= 1e-6 * std::max(std::abs(G), 1e-300);
+                if (q_iter % std::max<long>(1, config.quench_report_every) == 0) {
+                    aq_log.push_back(static_cast<double>(q_iter)); aq_log.push_back(mu_eff); aq_log.push_back(kappa);
+                    aq_log.push_back(q_gres); aq_log.push_back(static_cast<double>(nback)); aq_log.push_back(nback ? zbb / static_cast<double>(nback) : 0.0);
+                }
+                if (ks > 0.0) kappa *= std::exp(config.quench_aq_gamma * q_dt * dkappa / ks);
+                else kappa *= 1.0 + 2e-4;
+            }
+            if (q_armed && nback > 0 && (aq_on ? q_gres : q_res) <= config.quench_tol && aq_done_ok) q_status = 1;
             else if (!std::isfinite(q_res) || !std::isfinite(U) || !std::isfinite(q_gres)) q_status = 6;
-            else if (q_armed && nback == 0 && (U == 0.0 || ++q_unjam_streak >= 50)) q_status = 4;
+            else if (!aq_on && q_armed && nback == 0 && (U == 0.0 || ++q_unjam_streak >= 50)) q_status = 4;
             else if (q_iter >= config.quench_max_iter) q_status = 2;
             if (nback > 0) q_unjam_streak = 0;
-            if (q_status == 0 && q_armed && nback > 0) {
+            if (q_status == 0 && q_armed && nback > 0 && !aq_on) {
                 // progress = the residual halved (as for spheres) OR the energy fell by more than 0.1 % since the
                 // reference point: ellipsoid packings rearrange slowly, lowering U for tens of thousands of
                 // iterations while the largest per-particle residual wanders
@@ -8567,6 +8588,7 @@ std::pair<PackingResult, PackingTrace> run_packing_observed(
                 if (q_status == 0 && config.quench_dt_min > 0.0 && q_dt < config.quench_dt_min) q_status = 5;
             }
             if (q_status != 0) {
+                q_zout.assign(N, 0); for (std::size_t k = 0; k < N; ++k) q_zout[k] = static_cast<int>(qZ(k));   // contacts as the quench counted them
                 q_converged = (q_status == 1); steps = step; g_t_position.end(); break;
             }
             if (config.quench_mass_scaled && (q_iter % 200 == 0 || q_minv.size() != N)) {
@@ -8756,6 +8778,7 @@ std::pair<PackingResult, PackingTrace> run_packing_observed(
                 if (q_status == 0 && config.quench_dt_min > 0.0 && q_dt < config.quench_dt_min) q_status = 5;
             }
             if (q_status != 0) {
+                q_zout.assign(N, 0); for (std::size_t k = 0; k < N; ++k) q_zout[k] = static_cast<int>(qZ(k));   // contacts as the quench counted them
                 q_converged = (q_status == 1); steps = step; g_t_position.end(); break;
             }
             // [223] two-level classification by load: heavy = caged (z >= Ndim + 1) AND load >= light_frac x typical; refreshed
@@ -9257,6 +9280,7 @@ std::pair<PackingResult, PackingTrace> run_packing_observed(
     result.quench_residual = q_res; result.quench_global_residual = q_gres; result.quench_iters = q_iter;
     result.quench_converged = q_converged ? 1 : 0; result.quench_log = std::move(q_log); result.quench_held_force = q_held_force;
     result.quench_aq_log = std::move(aq_log);
+    result.quench_z = std::move(q_zout);
     if (quench_on && q_status == 0) q_status = 2;   // [225] the step loop ended before any stopping rule: report it as the cap
     result.quench_status = q_status;
     result.swap_geo_trades = static_cast<long>(swap_engine.geo_trades_);

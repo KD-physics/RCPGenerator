@@ -127,7 +127,8 @@ void rod_forces(const std::uint32_t* pairs_data, const std::uint64_t* pair_offse
 double rod_min_contact_scale(std::size_t N, const EllShape& sh, const double* x, const double* Db,
                              const double* Rot, const std::vector<double>& box,
                              const std::vector<std::int8_t>& walls, std::size_t& pair_i, std::size_t& pair_j,
-                             std::size_t& n_overlapping, int mode = PAIRS_AUTO, std::vector<int>* zout = nullptr);
+                             std::size_t& n_overlapping, int mode = PAIRS_AUTO, std::vector<int>* zout = nullptr,
+                             double* pair_stats = nullptr);
 
 // ---- rounded rods (the quench) ---------------------------------------------------------------------------------------
 // A sharp rod's contact energy has kinks exactly where rod packings like to sit: two flat sides or ends resting on

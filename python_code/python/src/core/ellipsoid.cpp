@@ -1255,9 +1255,11 @@ void PairGrid::later_neighbours(std::size_t i, std::vector<std::uint32_t>& out) 
 double ell_min_contact_scale(std::size_t N, const EllShape& sh, const double* x, const double* Db,
                              const double* Rot, const std::vector<double>& box,
                              const std::vector<std::int8_t>& walls, std::size_t& pair_i, std::size_t& pair_j,
-                             std::size_t& n_overlapping, int mode, std::vector<int>* zout) {
+                             std::size_t& n_overlapping, int mode, std::vector<int>* zout,
+                             double* pair_stats) {
     const std::size_t n = sh.Ndim, nn = n * n;
     if (zout) zout->assign(N, 0);
+    double ps_n = 0.0, ps_sum = 0.0, ps_max = 0.0;
     std::vector<double> Amat(N * nn);
     ell_shape_matrices(N, sh, Db, Rot, Amat.data());
     const PairGrid grid(N, n, x, Db, box, walls, mode);
@@ -1271,6 +1273,7 @@ double ell_min_contact_scale(std::size_t N, const EllShape& sh, const double* x,
         double tbest = 1.0;
         std::size_t tbi = N, tbj = N, tn = 0;
         std::vector<int> tz;                 // this thread's contact counts (a pair touches two particles)
+        double tps_n = 0.0, tps_sum = 0.0, tps_max = 0.0;
         if (zout) tz.assign(N, 0);
         std::vector<std::uint32_t> later;
         #pragma omp for schedule(dynamic, 16)
@@ -1295,6 +1298,7 @@ double ell_min_contact_scale(std::size_t N, const EllShape& sh, const double* x,
                     ++tn;
                     if (zout) { ++tz[i]; ++tz[j]; }
                     const double s = std::sqrt(s2);
+                    tps_n += 1.0; tps_sum += 1.0 - s; if (1.0 - s > tps_max) tps_max = 1.0 - s;
                     if (s < tbest || (s == tbest && (i < tbi || (i == tbi && j < tbj)))) { tbest = s; tbi = i; tbj = j; }
                 }
             }
@@ -1324,12 +1328,14 @@ double ell_min_contact_scale(std::size_t N, const EllShape& sh, const double* x,
         {
             nover += tn;
             if (zout) for (std::size_t k = 0; k < N; ++k) (*zout)[k] += tz[k];
+            ps_n += tps_n; ps_sum += tps_sum; if (tps_max > ps_max) ps_max = tps_max;
             if (tbest < best || (tbest == best && tbi < bi)) { best = tbest; bi = tbi; bj = tbj; }
         }
     }
     pair_i = bi;
     pair_j = bj;
     n_overlapping = nover;
+    if (pair_stats) { pair_stats[0] = ps_n; pair_stats[1] = ps_sum; pair_stats[2] = ps_max; }
     return best;
 }
 

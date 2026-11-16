@@ -172,7 +172,7 @@ def run_case(geometry: str, arm: str) -> dict:
     scale = same_multiset_up_to_scale(pk.diameters, d_packed)
     assert abs(scale - FIXTURE_KAPPA) < 1e-12, f"diameters rescaled by {scale}, expected {FIXTURE_KAPPA} once"
     # Every fixture diameter is unique, so matching each scaled diameter in place is a direct
-    # particle-identity check.  Do not infer identity from displacement: a converged quench may
+    # particle-identity check. Do not infer identity from displacement: a converged quench may
     # legitimately move an individual particle by an architecture-sensitive amount.
     assert np.allclose(np.asarray(pk.diameters) / np.asarray(d_packed), FIXTURE_KAPPA, rtol=0, atol=1e-12)
     assert (pk.permute_passes, pk.permute_exchanges, list(pk.permute_counts)) == (passes, exchanges, counts)

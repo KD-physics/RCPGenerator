@@ -121,6 +121,10 @@ def main() -> None:
     # 2 * Ndim contacts on average
     assert adaptive.z_mean_no_rattlers >= 2 * adaptive.Ndim, adaptive.z_mean_no_rattlers
 
+    # Mean and largest relative overlap of the pair contacts.
+    assert 0.0 < adaptive.mean_overlap <= adaptive.max_overlap < 0.01
+    assert adaptive.max_overlap <= 1.0 - adaptive.shrink_factor + 1e-9
+
     # They are not saved; loading a packed state recomputes them from the state.
     loaded = rcpgenerator.Packing.from_dict(json.loads(json.dumps(adaptive.to_dict())))
     assert loaded.mu_final == adaptive.mu_final
@@ -129,6 +133,8 @@ def main() -> None:
     assert loaded.n_rattlers == adaptive.n_rattlers
     assert loaded.z_mean == adaptive.z_mean
     assert loaded.z_mean_no_rattlers == adaptive.z_mean_no_rattlers
+    assert abs(loaded.mean_overlap - adaptive.mean_overlap) <= 1e-12
+    assert loaded.max_overlap == adaptive.max_overlap
 
     # Malformed walls must fail clearly.
     try:

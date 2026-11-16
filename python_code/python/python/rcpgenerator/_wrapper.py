@@ -88,7 +88,7 @@ class Packing:
     order of ``positions``; a wall the particle touches counts as one), ``z_mean``, ``n_rattlers`` (fewer than
     Ndim + 1 contacts) and ``z_mean_no_rattlers``. ``mu_final`` is the pressure term a packing run ended on.
     ``extend=x`` lengthens the first stage of the packing run by the factor x (see ``pack``);
-    ``adaptive_quench()`` balances a sphere packing at a pressure with the diameters free.
+    ``adaptive_quench()`` balances a packing (any shape) at a pressure with the sizes free.
     """
 
     _INIT_KEYS = {"phi", "N", "Ndim", "box", "walls", "fix_height", "dist", "aspect_ratios",
@@ -231,7 +231,7 @@ class Packing:
             # cannot be computed (an old or partial state must still load).
             try:
                 shrunk = obj.shrink_to_contact()
-                obj._set_contact_numbers(shrunk["z"])
+                obj._set_contact_numbers(shrunk["z"]); obj.mean_overlap = shrunk["mean_overlap"]; obj.max_overlap = shrunk["max_overlap"]
                 if obj.phi_contact is None or obj.shrink_factor is None:
                     obj.shrink_factor = shrunk["scale"]
                     obj.phi_contact = shrunk["phi"]
@@ -528,7 +528,9 @@ class Packing:
             scale *= (1.0 - 1e-12)
         return {"scale": scale, "phi": self._current_phi() * scale ** int(self.Ndim),
                 "n_overlapping": int(cs["n_overlapping"]), "pair": (int(cs["pair_i"]), int(cs["pair_j"])),
-                "z": [int(v) for v in cs["z"]]}
+                "z": [int(v) for v in cs["z"]],
+                "mean_overlap": (float(cs["pair_overlap_sum"]) / float(cs["pair_count"])) if float(cs["pair_count"]) > 0 else 0.0,
+                "max_overlap": float(cs["pair_overlap_max"]), "n_pair_contacts": int(cs["pair_count"])}
 
     def _set_contact_numbers(self, z) -> None:
         """Fill ``z`` (contacts per particle, in the order of ``positions``; a wall the particle touches counts as
@@ -537,6 +539,7 @@ class Packing:
         available."""
         if z is None:
             self.z = None; self.z_mean = None; self.n_rattlers = None; self.z_mean_no_rattlers = None
+            self.mean_overlap = None; self.max_overlap = None
             return
         z = [int(v) for v in z]
         need = int(self.Ndim) + 1
@@ -978,7 +981,16 @@ class Packing:
                 shrunk = self.shrink_to_contact()
                 self.shrink_factor = shrunk["scale"]
                 self.phi_contact = shrunk["phi"]
-                self._set_contact_numbers(shrunk["z"])
+                self._set_contact_numbers(shrunk["z"]); self.mean_overlap = shrunk["mean_overlap"]; self.max_overlap = shrunk["max_overlap"]
+                # Rods after a quench: the quench balances slightly ROUNDED rods (rod_round), which contain the true
+                # rod, so two rods can press on each other there while the true shapes do not quite touch. The
+                # contact numbers are then the ones the quench itself counted.
+                qz = result.get("quench_z")
+                if self.is_rod and int(getattr(self, "quench_mode", 0)) and qz is not None and len(qz) == len(self.diameters) \
+                        and float(getattr(self, "quench_rod_round", 0.0)) > 0.0:
+                    mo, xo = self.mean_overlap, self.max_overlap   # the overlaps stay those of the true shapes
+                    self._set_contact_numbers(qz)
+                    self.mean_overlap, self.max_overlap = mo, xo
             elif int(self.Ndim) <= 8:
                 # Spheres: an extra, computed after the run. A sphere run that packed must not fail because of it,
                 # so a failure of the shrink itself leaves both values None and says so. Above 8 dimensions the
@@ -987,7 +999,7 @@ class Packing:
                     shrunk = self.shrink_to_contact()
                     self.shrink_factor = shrunk["scale"]
                     self.phi_contact = shrunk["phi"]
-                    self._set_contact_numbers(shrunk["z"])
+                    self._set_contact_numbers(shrunk["z"]); self.mean_overlap = shrunk["mean_overlap"]; self.max_overlap = shrunk["max_overlap"]
                 except RuntimeError as exc:
                     warnings.warn("phi_contact and shrink_factor were not computed for this sphere packing "
                                   f"(they stay None; phi_final is unaffected): {exc}", UserWarning, stacklevel=2)
@@ -1520,12 +1532,13 @@ class Packing:
         gamma: float = 0.05,
         mass_scaled: bool = True,
         dt0: float = 0.05,
-        dt_max: float = 0.5,
+        dt_max: float | None = None,
         alpha0: float = 0.03,
         mix_mode: int = 1,
         report_every: int = 500,
+        rod_round: float | None = None,
     ) -> dict[str, Any]:
-        """Balance the packing at a pressure ``mu``, with the diameters free. Spheres only.
+        """Balance the packing at a pressure ``mu``, with the diameters free. Spheres, ellipsoids and rods.
 
         ``quench()`` freezes the diameters and balances the forces. ``adaptive_quench()`` balances the forces
         while one common scale factor on all diameters adapts to the pressure term ``mu`` (the same ``mu`` that
@@ -1555,9 +1568,13 @@ class Packing:
             Rate at which the size scale follows the pressure. Lower it if the sizes oscillate.
         verbose : bool, optional
             Print the outcome (defaults to the packing's ``verbose``).
+        rod_round : float, optional
+            Rods only, as in ``quench()``: the rounding (default 0.01) of the rods that are balanced. The rounded
+            body is slightly larger than the rod, so with the sizes free the rods shrink by a fraction of a
+            percent and the true rods end just short of touching; ``z`` is then counted on the rounded bodies.
         mass_scaled, dt0, dt_max, alpha0, mix_mode, report_every
-            FIRE settings, as in ``quench()``. A lower ``dt_max`` is the first thing to try when a call does
-            not converge.
+            FIRE settings, as in ``quench()`` (``dt_max`` defaults to 0.5 for spheres, 0.2 for ellipsoids and
+            rods). A lower ``dt_max`` is the first thing to try when a call does not converge.
 
         Returns
         -------
@@ -1572,9 +1589,12 @@ class Packing:
         """
         if self._needs_initialize or not self._initialized or not self.positions:
             raise RuntimeError("adaptive_quench() needs a realized state: call pack() first")
-        if self._nonsphere:
-            raise NotImplementedError("adaptive_quench() is implemented for spheres only; use quench() for ellipsoids "
-                                      "and rods")
+        ell_shaped = bool(self.is_rod or (self.aspect_ratios and not self._all_ratios_one()))
+        if dt_max is None:   # as in quench(): 0.5 for spheres, 0.2 for ellipsoids and rods
+            dt_max = 0.2 if ell_shaped else 0.5
+        if self.is_rod and int(self.Ndim) > 3 and (0.01 if rod_round is None else float(rod_round)) > 0.0:
+            raise NotImplementedError("adaptive_quench() of rods uses the rounded-rod contact, which is implemented in "
+                                      "2D and 3D only")
         if mu is None:
             mu = getattr(self, "mu_final", None)
             if mu is None:
@@ -1612,6 +1632,7 @@ class Packing:
             self.quench_mix_mode = int(mix_mode)
             self.quench_stall_window = 0
             self.quench_dt_min = 0.0
+            self.quench_rod_round = (0.01 if rod_round is None else float(rod_round)) if self.is_rod else 0.0
             self.quench_held = []
             self.diameter_permute = False
             self.swap = 0.0

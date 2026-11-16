@@ -297,6 +297,7 @@ struct PackingResult {
                                               //       5 step collapse, 6 non-finite force or energy
     std::vector<double> quench_log;           // 6 per report: iter, residual, global, U, n_backbone, dt
     std::vector<double> quench_aq_log;        // adaptive quench, 6 per report: iter, mu, kappa, global residual, n_backbone, mean z of the backbone
+    std::vector<int> quench_z;                // per particle (final order): contacts at the quench's last force pass, walls included
     std::vector<double> quench_held_force;    // Ndim doubles: net contact force on the held set at exit
     // Cycle 18: per-particle aggregate stats over the LAST window of the
     // run (window length controlled by RCP_PP_WINDOW env var, default 5000
@@ -423,6 +424,7 @@ struct ContactScale {
     std::size_t n_overlapping = 0;  // contacts with s < 1 before the shrink
     double particle_volume = 0.0;   // total particle volume before the shrink
     std::vector<int> z;             // per particle: its overlapping contacts (pairs, plus one per wall it overlaps)
+    double pair_count = 0.0, pair_overlap_sum = 0.0, pair_overlap_max = 0.0;   // overlapping pair contacts: 1 - s
 };
 // pairs: -1 a cell grid when that is cheaper (the default), 0 always the grid, 1 every pair (ellipsoid.hpp, PairGrid)
 ContactScale contact_scale(const struct PackingInput& input, const struct PackingConfig& config, int pairs = -1);
