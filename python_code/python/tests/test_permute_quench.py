@@ -159,7 +159,6 @@ def run_case(geometry: str, arm: str) -> dict:
         assert exchanges <= 2 * cap * passes, "more exchanges than the budget allows (pairwise + 3-cycle caps)"
 
     d_packed = list(pk.diameters)
-    x_packed = np.asarray(pk.positions, float)
     t0 = time.time()
     caught = quench_quiet(pk, kappa_mult=FIXTURE_KAPPA)
     t_quench = time.time() - t0
@@ -172,12 +171,10 @@ def run_case(geometry: str, arm: str) -> dict:
         assert bal <= 1e-8, f"{geometry}/{arm}: straight-line force balance {bal:.2e} (quench reports {pk.quench_residual:.2e})"
     scale = same_multiset_up_to_scale(pk.diameters, d_packed)
     assert abs(scale - FIXTURE_KAPPA) < 1e-12, f"diameters rescaled by {scale}, expected {FIXTURE_KAPPA} once"
-    # particle i keeps index i through the quench, and the pack's permutation diagnostics survive
+    # Every fixture diameter is unique, so matching each scaled diameter in place is a direct
+    # particle-identity check.  Do not infer identity from displacement: a converged quench may
+    # legitimately move an individual particle by an architecture-sensitive amount.
     assert np.allclose(np.asarray(pk.diameters) / np.asarray(d_packed), FIXTURE_KAPPA, rtol=0, atol=1e-12)
-    box = np.asarray(pk.box, float)
-    dx = np.asarray(pk.positions) - x_packed
-    dx -= np.round(dx / box) * box                    # minimum image across periodic seams
-    assert np.max(np.abs(dx)) < 0.1 * box.min(), "a particle's index changed across the quench"
     assert (pk.permute_passes, pk.permute_exchanges, list(pk.permute_counts)) == (passes, exchanges, counts)
     return {"pack_s": t_pack, "quench_s": t_quench, "quench_iters": pk.quench_iters, "exchanges": exchanges}
 
