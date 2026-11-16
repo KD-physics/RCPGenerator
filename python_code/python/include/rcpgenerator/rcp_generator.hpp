@@ -83,6 +83,10 @@ struct PackingConfig {
     long   mu_hold_steps = 0;            // hold length in steps (0 = off)
     double mu_hold_mult = 1.0;           // mu_eff = mult * mu_1 (initial rung-1 mu) during the hold
     int    mu_hold_shift_deadline = 1;   // 1: a hold that starts in rung 1 delays the deadline by its length
+    // Length of rung 1 as a multiple of the standard ("quick") length; only rung 1 changes, the schedule after it keeps
+    // the lengths of a standard run. 0 = not set: the RCP_SPEED preset decides (immediate 0.5, quick 1, patient 4,
+    // forever 10). Python: Packing(extend=...) / pack(extend=...).
+    double rung1_extend = 0.0;
     int    record_visibility = 0;        // 1: per-step visibility P(z>=1) and mu_eff histories
     // ---- visibility controller prototype (stage 2b Part 5 [log 073]; labeled, default off) ----
     // Rides on the mu_hold window: within [mu_hold_start, +mu_hold_steps) the
@@ -182,6 +186,17 @@ struct PackingConfig {
     long   quench_stall_window = 0;     // stop as "stalled" when the best residual has not fallen by quench_stall_factor
     double quench_stall_factor = 0.5;   //   within this many iterations
     double quench_dt_min = 0.0;         // stop as "step collapse" when FIRE's time step falls below this
+    // 1: a particle that loses its last contact keeps its velocity (and spin) until FIRE's next reset, instead of
+    // stopping where the contact ended (where the next small motion closes the contact again). Python: coast=.
+    int    quench_coast = 0;
+    // Adaptive quench (Python: Packing.adaptive_quench). Spheres only. 1: the diameters are NOT frozen during the
+    // quench: the common size scale kappa follows the pressure mu (quench_aq_mu) with drag,
+    //     kappa <- kappa * exp(gamma * dt * (mu sum D - G) / k_s),  G = sum over contacts r (r - d),  k_s = 1/2 sum_i z_i D_i^2
+    // so the packing settles where its contact forces carry mu. Converged when the global residual is under
+    // quench_tol and the pressure is carried to 1e-6.
+    int    quench_aq = 0;
+    double quench_aq_gamma = 0.05;
+    double quench_aq_mu = 0.0;
     // Ellipsoids (additive; rcpgenerator/ellipsoid.hpp). Empty -> spheres, the code path is untouched.
     // Ndim-1 numbers in decreasing order, 1 >= ratio_2 >= ... > 0: axis k (k = 2..Ndim) has length D x ratio_k;
     // D is the first and LONGEST axis. One shape for every particle; for a shape per particle use
@@ -281,6 +296,7 @@ struct PackingResult {
     int    quench_status = 0;                 // [225] 0 not run, 1 converged, 2 max_iter, 3 stalled, 4 unjammed,
                                               //       5 step collapse, 6 non-finite force or energy
     std::vector<double> quench_log;           // 6 per report: iter, residual, global, U, n_backbone, dt
+    std::vector<double> quench_aq_log;        // adaptive quench, 6 per report: iter, mu, kappa, global residual, n_backbone, mean z of the backbone
     std::vector<double> quench_held_force;    // Ndim doubles: net contact force on the held set at exit
     // Cycle 18: per-particle aggregate stats over the LAST window of the
     // run (window length controlled by RCP_PP_WINDOW env var, default 5000
@@ -406,8 +422,10 @@ struct ContactScale {
     std::size_t pair_i = 0, pair_j = 0;   // the tightest pair (pair_j == N: a wall)
     std::size_t n_overlapping = 0;  // contacts with s < 1 before the shrink
     double particle_volume = 0.0;   // total particle volume before the shrink
+    std::vector<int> z;             // per particle: its overlapping contacts (pairs, plus one per wall it overlaps)
 };
-ContactScale contact_scale(const struct PackingInput& input, const struct PackingConfig& config);
+// pairs: -1 a cell grid when that is cheaper (the default), 0 always the grid, 1 every pair (ellipsoid.hpp, PairGrid)
+ContactScale contact_scale(const struct PackingInput& input, const struct PackingConfig& config, int pairs = -1);
 
 // Ellipsoid permutation outside a run (tests and inspection). The state is the input's; all pairs are listed.
 struct PermuteOnce {

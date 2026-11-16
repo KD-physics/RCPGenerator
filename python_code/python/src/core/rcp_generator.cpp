@@ -257,6 +257,26 @@ static double rcp_bneck_kick_frac() {
     }();
     return v;
 }
+// Length of rung 1 as a multiple of the standard ("quick") length. An explicit PackingConfig::rung1_extend wins;
+// otherwise the RCP_SPEED preset: immediate 0.5, quick (default) 1, patient 4, forever 10. The presets differ in
+// nothing else: the schedule after rung 1 is quick's for all of them.
+static double rcp_rung1_extend(const rcpgenerator::PackingConfig& config) {
+    if (config.rung1_extend > 0.0) return config.rung1_extend;
+    const char* s = std::getenv("RCP_SPEED");
+    if (!s || !s[0]) return 1.0;
+    const std::string v(s);
+    if (v == "immediate") return 0.5;
+    if (v == "patient") return 4.0;
+    if (v == "forever") return 10.0;
+    return 1.0;
+}
+// The step after which rung 1 ends, given the standard deadline and the factor (factor 1: the deadline itself).
+static std::size_t rcp_rung1_end(std::size_t deadline, double factor) {
+    if (factor == 1.0) return deadline;
+    double e = static_cast<double>(deadline) * factor;
+    if (e < 1500.0) e = std::min(1500.0, static_cast<double>(deadline));
+    return static_cast<std::size_t>(e);
+}
 static double rcp_mu1_boost() {
     static const double v = []() {
         const char* s = std::getenv("RCP_MU1_BOOST");
@@ -5106,7 +5126,7 @@ SingleEvaluation evaluate_once(const PackingInput& input, const PackingConfig& c
     return out;
 }
 
-ContactScale contact_scale(const PackingInput& input, const PackingConfig& config) {
+ContactScale contact_scale(const PackingInput& input, const PackingConfig& config, int pairs) {
     FlatInput f = flatten_input(input, config);
     const std::size_t N = f.N, Ndim = f.Ndim;
     const bool ell = ell_input_present(input, config);
@@ -5125,9 +5145,9 @@ ContactScale contact_scale(const PackingInput& input, const PackingConfig& confi
     }
     ContactScale out;
     out.scale = sh.kind != 0
-        ? rod_min_contact_scale(N, sh, f.x.data(), f.D.data(), rot.data(), f.box, f.walls, out.pair_i, out.pair_j, out.n_overlapping)
+        ? rod_min_contact_scale(N, sh, f.x.data(), f.D.data(), rot.data(), f.box, f.walls, out.pair_i, out.pair_j, out.n_overlapping, pairs, &out.z)
         : ell_min_contact_scale(N, sh, f.x.data(), f.D.data(), rot.data(), f.box, f.walls, out.pair_i,
-                                      out.pair_j, out.n_overlapping);
+                                      out.pair_j, out.n_overlapping, pairs, &out.z);
     double vol = 0.0;
     for (double dv : f.D) vol += sphere_volume(0.5 * dv, Ndim);
     out.particle_volume = vol * sh.vol_factor;
@@ -5417,7 +5437,8 @@ std::pair<PackingResult, PackingTrace> run_packing_observed(
     bool update_flag = false;
     int direction_flag = 0;
     double F_magnitude = 0.0;
-    if (!options.fix_diameter) {
+    // adaptive quench: starts from the diameters as given; they are not rescaled to the starting phi
+    if (!options.fix_diameter && !(config.quench_mode != 0 && config.quench_aq != 0)) {
         auto scaled_pair = scale_diameters_nd(D, ell_on ? phi * phi_modifier / ell_vf : phi * phi_modifier, box, Ndim, fix_height);
         auto D_scaled = std::move(scaled_pair.first);
         double factor = scaled_pair.second;
@@ -5683,9 +5704,8 @@ std::pair<PackingResult, PackingTrace> run_packing_observed(
         int Y = 2, X = 9; std::size_t cycles = 2;                   // RCP_SPEED=quick default
         if (const char* sp = std::getenv("RCP_SPEED")) {
             std::string v(sp);
-            if      (v == "immediate") { Y = 1; X = 5;  cycles = 1; }
-            else if (v == "patient")   { Y = 3; X = 24; cycles = 3; }
-            else if (v == "forever")   { Y = 4; X = 49; cycles = 4; }
+            // every preset has quick's schedule; they differ only in the length of rung 1 (rcp_rung1_extend)
+            (void)v;
         }
         if (const char* oc = std::getenv("RCP_OSC_CYCLES")) {
             long v = std::atol(oc); if (v >= 1 && v < 100) cycles = std::size_t(v);
@@ -5699,8 +5719,9 @@ std::pair<PackingResult, PackingTrace> run_packing_observed(
             if (v > 100 && v < 10000000) rung1 = static_cast<double>(v);
         }
         if (rung1 < 1500.0) rung1 = 1500.0;
+        const double ext = rcp_rung1_extend(config);                // 1 unless extend or a preset other than quick
         const std::size_t formula =
-            static_cast<std::size_t>(rung1 * static_cast<double>(cycles + 3));
+            static_cast<std::size_t>(rung1 * static_cast<double>(cycles + 3) + (ext > 1.0 ? rung1 * (ext - 1.0) : 0.0));
         return std::max<std::size_t>(static_cast<std::size_t>(N_steps), formula);
     }();
     const std::size_t hist_size = step_cap + 1;
@@ -5889,6 +5910,10 @@ std::pair<PackingResult, PackingTrace> run_packing_observed(
     int q_status = 0; long q_unjam_streak = 0, q_stall_ref_iter = 0; double q_stall_ref = -1.0; bool q_any_held = false;
     std::vector<double> q_wall_s; std::vector<int> q_wall_n;
     std::vector<double> q_log; std::vector<double> q_held_force(Ndim, 0.0); std::vector<double> q_minv;
+    // adaptive quench (spheres): the sizes are free and follow the pressure quench_aq_mu, applied in the force pass
+    const bool aq_on = quench_on && config.quench_aq != 0 && !ell_on;
+    const double aq_mu = aq_on ? config.quench_aq_mu : 0.0;
+    std::vector<double> aq_log;
     bool morph_armed = false;               // reference captured at the first update step
     double morph_lambda = 0.0, morph_rate = config.morph_rate0, morph_ref_maxov = 0.0, morph_vol0 = 0.0;
     long morph_ok_streak = 0, morph_updates = 0, morph_holds = 0;
@@ -6403,12 +6428,25 @@ std::pair<PackingResult, PackingTrace> run_packing_observed(
             if (v >= 1 && v < 100) return std::size_t(v);
         }
         switch (speed_preset) {
-            case SpeedPreset::Immediate: return std::size_t(1);
-            case SpeedPreset::Quick:     return std::size_t(2);
-            case SpeedPreset::Patient:   return std::size_t(3);
-            case SpeedPreset::Forever:   return std::size_t(4);
+            case SpeedPreset::Immediate: return std::size_t(2);   // all presets: quick's cycles; they differ in the
+            case SpeedPreset::Quick:     return std::size_t(2);   // length of rung 1 only (rcp_rung1_extend)
+            case SpeedPreset::Patient:   return std::size_t(2);
+            case SpeedPreset::Forever:   return std::size_t(2);
         }
         return std::size_t(2);
+    }();
+    const double rung1_extend_eff = rcp_rung1_extend(config);
+    // steps by which rung 1 is lengthened (negative: shortened); 0 at factor 1. The standard deadline here is the
+    // in-loop one (rung1_deadline, below): keep the two in sync.
+    const double rung1_extra = [&]() -> double {
+        if (rung1_extend_eff == 1.0) return 0.0;
+        double dl = 2.0 * 4000.0 + 9.0 * std::sqrt(static_cast<double>(N) * static_cast<double>(Ndim)) - 2000.0;
+        if (dl < 1500.0) dl = 1500.0;
+        if (const char* s = std::getenv("RCP_RUNG1_DEADLINE")) {
+            if (s[0]) { long v = std::atol(s); if (v > 100 && v < 10000000) dl = static_cast<double>(v); }
+        }
+        const std::size_t base = static_cast<std::size_t>(dl);
+        return static_cast<double>(rcp_rung1_end(base, rung1_extend_eff)) - static_cast<double>(base);
     }();
     const double osc_period_factor = [](){
         const char* s = std::getenv("RCP_OSC_PERIOD_FACTOR");
@@ -6987,7 +7025,7 @@ std::pair<PackingResult, PackingTrace> run_packing_observed(
             // Period scales with t_basin (= mu_change here, which is the
             // step at which the rung 1->0 trigger fired).
             osc_period = static_cast<std::size_t>(
-                osc_period_factor * static_cast<double>(mu_change));
+                osc_period_factor * (rung1_extra != 0.0 ? static_cast<double>(mu_change) - rung1_extra : static_cast<double>(mu_change)));
             if (osc_period < 1000) osc_period = 1000;
             osc_phase = OscPhase::ACTIVE;
             mu_flag = -1;
@@ -7481,10 +7519,10 @@ std::pair<PackingResult, PackingTrace> run_packing_observed(
                 }
                 int Y = 2, X = 9;  // quick default
                 switch (speed_preset) {
-                    case SpeedPreset::Immediate: Y = 1; X = 5;  break;
-                    case SpeedPreset::Quick:     Y = 2; X = 9;  break;
-                    case SpeedPreset::Patient:   Y = 3; X = 24; break;
-                    case SpeedPreset::Forever:   Y = 4; X = 49; break;
+                    case SpeedPreset::Immediate: Y = 2; X = 9;  break;   // all presets: quick's base length;
+                    case SpeedPreset::Quick:     Y = 2; X = 9;  break;   // the preset's factor is applied below
+                    case SpeedPreset::Patient:   Y = 2; X = 9;  break;   // (rung1_end)
+                    case SpeedPreset::Forever:   Y = 2; X = 9;  break;
                 }
                 const double s_term = static_cast<double>(X) *
                     std::sqrt(static_cast<double>(N) *
@@ -7518,7 +7556,11 @@ std::pair<PackingResult, PackingTrace> run_packing_observed(
                  config.mu_hold_start >= 0 &&
                  static_cast<std::size_t>(config.mu_hold_start) <= rung1_deadline)
                 ? static_cast<std::size_t>(config.mu_hold_steps) : 0;
-            if (!mu_pinned && step > static_cast<int>(rung1_deadline + mu_hold_shift)) {   // [219] suspended under mu_pin
+            // extend (or a preset other than quick): rung 1 ends at factor x the standard deadline; rung1_extra, the
+            // steps added (negative when shortened), is taken out again where the later schedule takes its lengths
+            // from the step at which rung 1 ended, so that only rung 1 changes. Factor 1: the same numbers as before.
+            const std::size_t rung1_end = rcp_rung1_end(rung1_deadline, rung1_extend_eff);
+            if (!mu_pinned && step > static_cast<int>(rung1_end + mu_hold_shift)) {   // [219] suspended under mu_pin
                 // Cycle 19 Step 2: arm adaptive feedback mu decay.
                 // mu / 10 (= mu_1 / 10): empirically the winning ratio.
                 // Keeps mu_1 → mu_0 a decade decay, so t_relax measured
@@ -7849,7 +7891,8 @@ std::pair<PackingResult, PackingTrace> run_packing_observed(
             mu_ctrl_mult = std::min(config.mu_ctrl_max_mult, std::max(config.mu_ctrl_min_mult, mu_ctrl_mult));
         }
         const double mu_hold_mult_now = config.swap_mu_ctrl ? mu_ctrl_mult : config.mu_hold_mult;
-        const double mu_eff = mu_pinned ? config.mu_pin :             // [219] absolute mu pin
+        const double mu_eff = aq_on ? aq_mu :                         // adaptive quench: its own fixed mu
+            mu_pinned ? config.mu_pin :             // [219] absolute mu pin
             mu_hold_now ? mu_hold_mult_now * mu1_ref :
             (mu_flag == 1 && rcp_mu1_boost() > 1.0)
             ? mu * (1.0 + (rcp_mu1_boost() - 1.0) *
@@ -8558,8 +8601,10 @@ std::pair<PackingResult, PackingTrace> run_packing_observed(
             double vnew2 = 0.0; std::size_t nact = 0;
             for (std::size_t i = 0; i < N; ++i) {
                 if (!q_free(i)) {
-                    for (std::size_t d = 0; d < Ndim; ++d) q_v[i * Ndim + d] = 0.0;
-                    for (std::size_t c = 0; c < nrot; ++c) ell_qw[i * nrot + c] = 0.0;
+                    if (!(config.quench_coast && !q_held[i])) {   // quench_coast: a particle without contacts keeps velocity and spin
+                        for (std::size_t d = 0; d < Ndim; ++d) q_v[i * Ndim + d] = 0.0;
+                        for (std::size_t c = 0; c < nrot; ++c) ell_qw[i * nrot + c] = 0.0;
+                    }
                     continue;
                 }
                 const double mi = config.quench_mass_scaled ? q_minv[i] : 1.0, ia = 1.0 / qA(i); ++nact;
@@ -8684,12 +8729,28 @@ std::pair<PackingResult, PackingTrace> run_packing_observed(
             // non-finite, unjammed (no overlap at all, or an empty backbone for 50 consecutive iterations), iteration
             // cap, stall (best residual not reduced by stall_factor within stall_window iterations), step collapse
             // (FIRE dt below dt_min while a backbone exists: FIRE finds no step it can follow downhill)
-            if (q_armed && nback > 0 && q_res <= config.quench_tol) q_status = 1;
+            // adaptive quench: the size scale follows the pressure with drag (takes effect at the next D = D0 * kappa).
+            // It is converged when the forces balance (global residual) AND the contacts carry the pressure mu.
+            bool aq_done_ok = true;
+            if (aq_on) {
+                double sumD = 0.0, ks = 0.0, zbb = 0.0;
+                for (std::size_t k = 0; k < N; ++k) { sumD += D[k]; ks += 0.5 * static_cast<double>(z[k]) * D[k] * D[k]; }
+                for (std::size_t k = 0; k < N; ++k) if (!q_held[k] && qZ(k) >= q_zmin && qS(k) >= s_floor) zbb += static_cast<double>(qZ(k));
+                const double G = mu_eff * sumD - dkappa;                    // sum over contacts r (r - d)
+                aq_done_ok = std::abs(dkappa) <= 1e-6 * std::max(G, 1e-300);
+                if (q_iter % std::max<long>(1, config.quench_report_every) == 0) {
+                    aq_log.push_back(static_cast<double>(q_iter)); aq_log.push_back(mu_eff); aq_log.push_back(kappa);
+                    aq_log.push_back(q_gres); aq_log.push_back(static_cast<double>(nback)); aq_log.push_back(nback ? zbb / static_cast<double>(nback) : 0.0);
+                }
+                if (ks > 0.0) kappa *= std::exp(config.quench_aq_gamma * q_dt * dkappa / ks);
+                else kappa *= 1.0 + 2e-4;                                   // nothing touches yet: swell until something does
+            }
+            if (q_armed && nback > 0 && (aq_on ? q_gres : q_res) <= config.quench_tol && aq_done_ok) q_status = 1;
             else if (!std::isfinite(q_res) || !std::isfinite(U) || !std::isfinite(q_gres)) q_status = 6;
-            else if (q_armed && nback == 0 && (U == 0.0 || ++q_unjam_streak >= 50)) q_status = 4;
+            else if (!aq_on && q_armed && nback == 0 && (U == 0.0 || ++q_unjam_streak >= 50)) q_status = 4;
             else if (q_iter >= config.quench_max_iter) q_status = 2;
             if (nback > 0) q_unjam_streak = 0;
-            if (q_status == 0 && q_armed && nback > 0) {
+            if (q_status == 0 && q_armed && nback > 0 && !aq_on) {
                 if (q_stall_ref < 0.0 || q_res <= config.quench_stall_factor * q_stall_ref) { q_stall_ref = q_res; q_stall_ref_iter = q_iter; }
                 else if (config.quench_stall_window > 0 && q_iter - q_stall_ref_iter >= config.quench_stall_window) q_status = 3;
                 if (q_status == 0 && config.quench_dt_min > 0.0 && q_dt < config.quench_dt_min) q_status = 5;
@@ -8736,7 +8797,12 @@ std::pair<PackingResult, PackingTrace> run_packing_observed(
             // pass 1: v <- v + dt a (held / force-free particles carry no velocity); accumulate |v| after the update
             double vnew2 = 0.0; std::size_t nact = 0;
             for (std::size_t i = 0; i < N; ++i) {
-                if (q_held[i] || q_light[i] || qS(i) <= 0.0) { for (std::size_t d = 0; d < Ndim; ++d) q_v[i * Ndim + d] = 0.0; continue; }
+                if (q_held[i] || q_light[i] || qS(i) <= 0.0) {
+                    // quench_coast: a free particle that has lost its last contact drifts on (until the next reset zeroes
+                    // every velocity) instead of stopping where the contact ended
+                    if (!(config.quench_coast && !q_held[i] && !q_light[i])) for (std::size_t d = 0; d < Ndim; ++d) q_v[i * Ndim + d] = 0.0;
+                    continue;
+                }
                 const double mi = config.quench_mass_scaled ? q_minv[i] : 1.0; ++nact;
                 for (std::size_t d = 0; d < Ndim; ++d) { const double vv = q_v[i * Ndim + d] + q_dt * F[i * Ndim + d] * mi; q_v[i * Ndim + d] = vv; vnew2 += vv * vv; }
             }
@@ -9190,6 +9256,7 @@ std::pair<PackingResult, PackingTrace> run_packing_observed(
     result.morph_rate_ceiling = morph_rate_ceiling;
     result.quench_residual = q_res; result.quench_global_residual = q_gres; result.quench_iters = q_iter;
     result.quench_converged = q_converged ? 1 : 0; result.quench_log = std::move(q_log); result.quench_held_force = q_held_force;
+    result.quench_aq_log = std::move(aq_log);
     if (quench_on && q_status == 0) q_status = 2;   // [225] the step loop ended before any stopping rule: report it as the cap
     result.quench_status = q_status;
     result.swap_geo_trades = static_cast<long>(swap_engine.geo_trades_);

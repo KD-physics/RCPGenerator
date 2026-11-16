@@ -1147,13 +1147,120 @@ std::size_t ell_permute_pass(const std::uint32_t* pairs_data, const std::uint64_
     return examined;
 }
 
+PairGrid::PairGrid(std::size_t N, std::size_t n, const double* x, const double* Db, const std::vector<double>& box,
+                   const std::vector<std::int8_t>& walls, int mode)
+    : N_(N), n_(n) {
+    if (mode == PAIRS_ALL || N < 2) return;
+    double dmax = 0.0;
+    for (std::size_t i = 0; i < N; ++i) dmax = std::max(dmax, Db[i]);
+    if (!(dmax > 0.0)) return;
+    // Periodic axes: cells over [0, box), positions taken modulo the box. Other axes: cells over the range the
+    // particles occupy (nothing is assumed about where a wall or a curved container keeps them).
+    double lo[MD], width[MD];
+    double cells = 1.0;
+    for (std::size_t d = 0; d < n; ++d) {
+        periodic_[d] = walls[d] == 0;
+        double extent = box[d];
+        lo[d] = 0.0;
+        if (!periodic_[d]) {
+            double a = x[d], b = x[d];
+            for (std::size_t i = 1; i < N; ++i) { a = std::min(a, x[i * n + d]); b = std::max(b, x[i * n + d]); }
+            lo[d] = a;
+            extent = b - a;
+        }
+        double c = std::floor(extent / dmax);
+        if (!(c >= 1.0)) c = 1.0;
+        if (c > 1.0e6) c = 1.0e6;
+        ncell_[d] = static_cast<std::size_t>(c);
+        cells *= c;
+        width[d] = extent;
+    }
+    // No more cells than about two per particle: wider cells are still exact, only less selective.
+    const double cap = 2.0 * static_cast<double>(N) + 1.0;
+    if (cells > cap) {
+        const double f = std::pow(cap / cells, 1.0 / static_cast<double>(n));
+        for (std::size_t d = 0; d < n; ++d)
+            ncell_[d] = std::max<std::size_t>(1, static_cast<std::size_t>(std::floor(static_cast<double>(ncell_[d]) * f)));
+    }
+    // A periodic axis needs three cells for "the cell on the left" and "the cell on the right" to be different
+    // cells; with fewer, the whole axis is one cell.
+    double total = 1.0, per_particle = 1.0;
+    for (std::size_t d = 0; d < n; ++d) {
+        if (periodic_[d] && ncell_[d] < 3) ncell_[d] = 1;
+        total *= static_cast<double>(ncell_[d]);
+        per_particle *= static_cast<double>(std::min<std::size_t>(3, ncell_[d]));
+        width[d] = width[d] > 0.0 ? width[d] / static_cast<double>(ncell_[d]) : 1.0;
+    }
+    // Expected candidates per particle: N x (cells looked at) / (all cells). All pairs look at N/2.
+    if (mode == PAIRS_AUTO && !(per_particle / total < 0.25 && N >= 2000)) return;
+    grid_ = true;
+    std::size_t s = 1;
+    for (std::size_t d = 0; d < n; ++d) { stride_[d] = s; s *= ncell_[d]; }
+    const std::size_t ncells = s;
+    coord_.resize(N * n);
+    cell_of_.resize(N);
+    start_.assign(ncells + 1, 0);
+    for (std::size_t i = 0; i < N; ++i) {
+        std::size_t c = 0;
+        for (std::size_t d = 0; d < n; ++d) {
+            const double nc = static_cast<double>(ncell_[d]);
+            double q = std::floor((x[i * n + d] - lo[d]) / width[d]);
+            if (periodic_[d]) { q = std::fmod(q, nc); if (q < 0.0) q += nc; }
+            if (!(q >= 0.0)) q = 0.0;
+            if (q > nc - 1.0) q = nc - 1.0;
+            const std::size_t k = static_cast<std::size_t>(q);
+            coord_[i * n + d] = static_cast<std::uint32_t>(k);
+            c += k * stride_[d];
+        }
+        cell_of_[i] = static_cast<std::uint32_t>(c);
+        ++start_[c + 1];
+    }
+    for (std::size_t c = 0; c < ncells; ++c) start_[c + 1] += start_[c];
+    items_.resize(N);
+    std::vector<std::uint32_t> fill(start_.begin(), start_.end() - 1);
+    for (std::size_t i = 0; i < N; ++i) items_[fill[cell_of_[i]]++] = static_cast<std::uint32_t>(i);   // ascending in a cell
+}
+
+void PairGrid::later_neighbours(std::size_t i, std::vector<std::uint32_t>& out) const {
+    out.clear();
+    if (!grid_) {
+        for (std::size_t j = i + 1; j < N_; ++j) out.push_back(static_cast<std::uint32_t>(j));
+        return;
+    }
+    // The distinct cells within one step of i's cell on every axis (wrapped on periodic axes, cut off elsewhere).
+    std::size_t opt[MD][3], nopt[MD], pick[MD];
+    for (std::size_t d = 0; d < n_; ++d) {
+        const std::size_t k = coord_[i * n_ + d], nc = ncell_[d];
+        nopt[d] = 0;
+        opt[d][nopt[d]++] = k;
+        if (nc > 1) {
+            if (k > 0) opt[d][nopt[d]++] = k - 1;
+            else if (periodic_[d]) opt[d][nopt[d]++] = nc - 1;
+            if (k + 1 < nc) opt[d][nopt[d]++] = k + 1;
+            else if (periodic_[d]) opt[d][nopt[d]++] = 0;
+        }
+        pick[d] = 0;
+    }
+    for (;;) {
+        std::size_t c = 0;
+        for (std::size_t d = 0; d < n_; ++d) c += opt[d][pick[d]] * stride_[d];
+        for (std::uint32_t p = start_[c]; p < start_[c + 1]; ++p)
+            if (items_[p] > i) out.push_back(items_[p]);
+        std::size_t d = 0;
+        while (d < n_ && ++pick[d] == nopt[d]) { pick[d] = 0; ++d; }
+        if (d == n_) break;
+    }
+}
+
 double ell_min_contact_scale(std::size_t N, const EllShape& sh, const double* x, const double* Db,
                              const double* Rot, const std::vector<double>& box,
                              const std::vector<std::int8_t>& walls, std::size_t& pair_i, std::size_t& pair_j,
-                             std::size_t& n_overlapping) {
+                             std::size_t& n_overlapping, int mode, std::vector<int>* zout) {
     const std::size_t n = sh.Ndim, nn = n * n;
+    if (zout) zout->assign(N, 0);
     std::vector<double> Amat(N * nn);
     ell_shape_matrices(N, sh, Db, Rot, Amat.data());
+    const PairGrid grid(N, n, x, Db, box, walls, mode);
     double inv_box[MD] = {0.0};
     for (std::size_t d = 0; d < n; ++d) inv_box[d] = walls[d] == 0 ? 1.0 / box[d] : 0.0;
 
@@ -1163,11 +1270,16 @@ double ell_min_contact_scale(std::size_t N, const EllShape& sh, const double* x,
     {
         double tbest = 1.0;
         std::size_t tbi = N, tbj = N, tn = 0;
+        std::vector<int> tz;                 // this thread's contact counts (a pair touches two particles)
+        if (zout) tz.assign(N, 0);
+        std::vector<std::uint32_t> later;
         #pragma omp for schedule(dynamic, 16)
         for (std::size_t i = 0; i < N; ++i) {
             const double* xi = x + i * n;
             const double* Ai = Amat.data() + i * nn;
-            for (std::size_t j = i + 1; j < N; ++j) {
+            grid.later_neighbours(i, later);
+            for (const std::uint32_t j32 : later) {
+                const std::size_t j = j32;
                 const double rb = 0.5 * (Db[i] + Db[j]);
                 double r[MD];
                 double d2 = 0.0;
@@ -1181,8 +1293,9 @@ double ell_min_contact_scale(std::size_t N, const EllShape& sh, const double* x,
                 const double s2 = ell_pair_s2_exact(Ai, Amat.data() + j * nn, r, n);
                 if (s2 < 1.0) {
                     ++tn;
+                    if (zout) { ++tz[i]; ++tz[j]; }
                     const double s = std::sqrt(s2);
-                    if (s < tbest) { tbest = s; tbi = i; tbj = j; }
+                    if (s < tbest || (s == tbest && (i < tbi || (i == tbi && j < tbj)))) { tbest = s; tbi = i; tbj = j; }
                 }
             }
             for (std::size_t d = 0; d < n; ++d) {
@@ -1192,6 +1305,7 @@ double ell_min_contact_scale(std::size_t N, const EllShape& sh, const double* x,
                     const double dist = std::abs(box[d] * static_cast<double>(wall) - xi[d]);
                     if (dist < h) {
                         ++tn;
+                        if (zout) ++tz[i];
                         const double s = dist / h;
                         if (s < tbest) { tbest = s; tbi = i; tbj = N; }
                     }
@@ -1203,12 +1317,13 @@ double ell_min_contact_scale(std::size_t N, const EllShape& sh, const double* x,
                 double xc[MD];
                 for (std::size_t k = 0; k < n; ++k) xc[k] = k < t ? xi[k] - Rc : 0.0;
                 const double s = ell_wall_scale(n, t, Ai, xc, Rc, 1.0);
-                if (s < 1.0) { ++tn; if (s < tbest) { tbest = s; tbi = i; tbj = N; } }
+                if (s < 1.0) { ++tn; if (zout) ++tz[i]; if (s < tbest) { tbest = s; tbi = i; tbj = N; } }
             }
         }
         #pragma omp critical
         {
             nover += tn;
+            if (zout) for (std::size_t k = 0; k < N; ++k) (*zout)[k] += tz[k];
             if (tbest < best || (tbest == best && tbi < bi)) { best = tbest; bi = tbi; bj = tbj; }
         }
     }

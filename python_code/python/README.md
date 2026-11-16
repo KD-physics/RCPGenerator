@@ -25,7 +25,7 @@ Project resources: [repository](https://github.com/KD-physics/RCPGenerator) ·
 pip install rcpgenerator
 ```
 
-The version 1.2.0 wheel workflow builds and tests CPython 3.10–3.14 on:
+The version 1.2.1 wheel workflow builds and tests CPython 3.10–3.14 on:
 
 - Windows x86-64
 - Linux x86-64
@@ -291,6 +291,7 @@ result = packing.pack(
     progress_interval=1000,
     capture_trajectory=False,
     trajectory_interval=1000,
+    extend=None,
 )
 ```
 
@@ -300,6 +301,7 @@ result = packing.pack(
 | `progress_interval` | Step interval between printed updates when verbose output is enabled. |
 | `capture_trajectory` | Record sampled positions, diameters, and scalar diagnostics for animation or analysis. |
 | `trajectory_interval` | Step interval between captured trajectory samples. |
+| `extend` | Lengthen the first stage of the run by this factor; see below. Not set (the default): the standard run. Also a constructor keyword, `Packing(extend=...)`. |
 
 `pack()` returns the raw result dictionary and also updates the corresponding
 `Packing` attributes. Trajectory capture consumes additional memory roughly in
@@ -308,6 +310,36 @@ proportion to the number of samples times `N * Ndim`.
 A run stops when both the largest pair overlap and the net force on the particles are small (or
 at the step cap). Results can differ slightly from versions 1.0.0 and 1.1.0: in rare cases
 (a box too small for its largest particles, very elongated shapes) a run takes more steps.
+
+#### A longer first stage: `extend`
+
+A run has two parts. In the first, the pressure term `mu` that swells the particles is held at its
+starting value and the packing compacts; its length is `6000 + 9 * sqrt(N * Ndim)` steps. In the
+second, `mu` is lowered and the overlaps are worked out; it takes about 10,000 steps. `extend=x`
+multiplies the length of the first part by `x` and leaves the second part as it is. A longer first part
+gives a denser packing at the cost of the added steps:
+
+```python
+packing = rcpgenerator.Packing(N=5000, Ndim=3, box=[1.0, 1.0, 1.0], walls=[0, 0, 0],
+                               dist={"type": "powerlaw", "d_min": 1.0, "d_max": 10.0, "exponent": -3.0})
+packing.pack(extend=3)        # first part three times as long; the same as Packing(..., extend=3)
+```
+
+Measured on that packing (5,000 spheres, size ratio 10, one seed, one thread):
+
+| `extend` | steps | `phi_contact` |
+| --- | --- | --- |
+| not set | 17,821 | 0.7372 |
+| `3` | 32,145 | 0.7405 |
+| `8.04` | 67,843 | 0.7426 |
+
+`extend` works for every shape and container. Values below 1 shorten the first part. The setting stays
+on the packing for later runs; set `packing.extend = None` to return to the standard run.
+
+The environment variable `RCP_SPEED` selects the same thing by name when `extend` is not set:
+`immediate` is `extend=0.5`, `quick` (the default) is the standard run, `patient` is `extend=4` and
+`forever` is `extend=10`. An explicit `extend` takes precedence. (In 1.0.0 and 1.1.0 `immediate`,
+`patient` and `forever` also changed the second part of the run; they no longer do.)
 
 ### `Packing.relax()`
 
@@ -365,12 +397,15 @@ After `pack()` or `relax()`, the most commonly used attributes are:
 | `energy_history` | Energy history. |
 | `max_overlap_history` | Maximum pair-overlap history. |
 | `mu_history` | Chemical-potential value by step. |
+| `z` | Contacts per particle, in the particle order of `positions`: the neighbours it overlaps, plus one for each wall it overlaps. Filled by `pack()`, `quench()` and `adaptive_quench()` and on loading a packed state; it describes the state those left. `None` before a run and for spheres above 8 dimensions. |
+| `z_mean`, `n_rattlers`, `z_mean_no_rattlers` | The mean of `z` over all particles; the number of rattlers (particles with fewer than `Ndim + 1` contacts, which cannot be held in place); the mean of `z` over the particles that are not rattlers. A packing straight from `pack()` is not in force balance, so there these count the pairs that happen to overlap at the stop; after a quench they are the contact numbers of the balanced network. |
+| `mu_final` | The pressure term `mu` the run ended on; the default `mu` of [`adaptive_quench()`](#adaptive-quench-balance-at-a-pressure). `None` for a state that was not packed by this version. |
 | `alpha_history` | Learning-rate value by step. |
 | `mu_flag_history` | Chemical-potential rung indicator (`-1`, `0`, or `1`) by step. |
 | `orientations` | Ellipsoids and rods: final rotation matrices, shape `(N, Ndim, Ndim)`, in the particle order of `positions`; columns are the body axes, column 0 the longest axis or the rod's axis. Empty for spheres. |
 | `aspect_ratios`, `rod_length`, `rod_radius` | The shape. When given per particle, the table or list in the particle order of `positions`. |
-| `phi_contact` | Ellipsoids and rods: packing fraction after the exact shrink to zero overlap; the value to report. `None` for spheres. See [Reading the result](#reading-the-result-phi_contact-and-phi_final). |
-| `shrink_factor` | Ellipsoids and rods: the common factor of that shrink; multiply every diameter by it. `None` for spheres. |
+| `phi_contact` | Packing fraction after the exact shrink to zero overlap; the value to report for ellipsoids and rods. Filled for spheres too (`None` above 8 dimensions). See [Reading the result](#reading-the-result-phi_contact-and-phi_final). |
+| `shrink_factor` | The common factor of that shrink; multiply every diameter by it. Filled for every shape (`None` for spheres above 8 dimensions). |
 | `shrink_to_contact()` | Method: the same shrink computed on the current state, for spheres too (periodic boxes, flat walls and curved containers). Returns `scale`, `phi`, `n_overlapping`, `pair`; does not modify the packing. |
 
 The step histories have length `steps`; they are not padded to a requested
@@ -434,7 +469,7 @@ They are cleared at the start of every new packing execution.
 | `update_height(height)` | Convenience form of `update_box()` for the final dimension. |
 | `copy()` / `clone()` | Deep-copy the serializable state into an independent `Packing`. |
 | `to_dict()` | Return initialization config, packing config, realized state, principal final results, trajectory, and status flags. |
-| `Packing.from_dict(data)` | Reconstruct a `Packing` without running initialization. |
+| `Packing.from_dict(data)` | Reconstruct a `Packing` without running initialization. States saved by earlier versions load: what they lack is filled in (see below). |
 | `reset()` | Clear realized state, results, and trajectory; the next run reinitializes. |
 | `summary()` | Return a concise human-readable state summary. |
 
@@ -457,6 +492,12 @@ their shape and orientation fields.
 `to_dict()` preserves the principal histories and captured trajectory, but not
 every advanced raw diagnostic listed above. Save the raw result separately if
 those fields are required.
+
+**States saved by earlier versions.** `from_dict()` loads a state written by 1.0.0 or 1.1.0. A loaded
+packing has every attribute a freshly built one has. Values the old state does not carry are computed
+on loading when the state determines them (`phi_contact` and `shrink_factor`, by the exact shrink of
+the stored configuration) and are `None` when it does not (`mu_final`); histories and run diagnostics
+that are not saved are empty.
 
 State flags are available as read-only properties:
 
@@ -561,23 +602,26 @@ schedule is suspended and no permutation runs.
 ```python
 packing.pack()
 start = packing.copy()                  # optional: keep the packed state
-packing.quench()                        # compress 0.3 %, then balance to a residual of 1e-10
+packing.quench(kappa_mult=1.003)        # compress 0.3 %, then balance to a residual of 1e-10
 print(packing.quench_status)            # "converged", or why it stopped
 print(packing.quench_message)
 
 # tighten in stages: a quick first pass, then continue from where it stopped
 packing = start.copy()
-packing.quench(tol=1e-4)
+packing.quench(tol=1e-4, kappa_mult=1.003)
 packing.quench(tol=1e-10, resume=True)
 ```
 
 **The small compression.** A packing run stops at the edge of jamming. At exactly its own
 diameters the particles barely touch, a quench relaxes the remaining overlaps away, and
 nothing is left to balance. `kappa_mult` multiplies every diameter once before the quench
-(default 1.003, i.e. 0.3 % larger; 1.01 in 4D and above, where broad size distributions need
-the larger compression to converge reliably), which gives a load-bearing contact network with small
-overlaps. The quenched packing is therefore slightly compressed: in 3D its packing
-fraction is about 0.9 % above the run's. `resume=True` continues from the previous
+(recommended: 1.003, i.e. 0.3 % larger, for spheres in 2D and 3D; 1.01 in 4D and above, where
+broad size distributions need the larger compression to converge reliably, and for ellipsoids
+and rods), which gives a load-bearing contact network with small
+overlaps. The quenched packing is therefore slightly compressed: at 1.003 in 3D its packing
+fraction is about 0.9 % above the run's. The default is 1.0: `quench()` does not expand the
+diameters unless `kappa_mult` is passed, and the quench of a packing straight from `pack()`
+then usually ends as `"unjammed"`. `resume=True` continues from the previous
 quench's state without rescaling again; combining it with `kappa_mult` is an error.
 
 **Convergence measure.** Each particle's residual is |Σ f| / Σ |f| over its contacts (wall
@@ -595,7 +639,7 @@ residual, energy, load-bearing count, time step]`.
 | `"converged"` | Max residual ≤ `tol`. | — |
 | `"max_iter"` | Iteration cap reached while still improving. | `quench(resume=True)` |
 | `"stalled"` | The best residual has not halved within `stall_window` iterations. | Quench the packed state again with a lower `dt_max` or a slightly larger `kappa_mult` (see below); `quench(resume=True)` only if the residual was still falling. Below about 1e-8 the stop is the floating-point floor (roughly 6e-14 divided by the mean relative overlap), and the state is balanced as far as it can be. |
-| `"unjammed"` | No load-bearing particles remain: the diameters are too small for the structure to carry load. | A larger `kappa_mult`. |
+| `"unjammed"` | No load-bearing particles remain: the diameters are too small for the structure to carry load. | Pass `kappa_mult` (the default, 1.0, does not expand), or a larger one. |
 | `"step_collapse"` | FIRE's time step collapsed: it found no step it could follow downhill (typical of loose, under-compressed states). | Quench the packed state again with a lower `dt_max`, or a larger `kappa_mult`. |
 | `"non_finite"` | A non-finite force or energy appeared. | Report it; do not use the state. |
 
@@ -607,8 +651,8 @@ state the quench stopped in, and particle `i` keeps index `i` (positions, diamet
 **If a quench stalls or fails, retry it from the packed state** with either a lower `dt_max`
 or slightly more compression (`kappa_mult`). `dt_max` is the largest time step the minimiser
 may take (default 0.5 for spheres, 0.2 for ellipsoids and rods); `kappa_mult` is the factor
-applied once to every diameter before the minimisation (default 1.003, and 1.01 for
-ellipsoids, rods and 4D and above). A quench changes the packing in place, so keep a copy of
+applied once to every diameter before the minimisation (default 1.0, no expansion; recommended
+1.003, and 1.01 for ellipsoids, rods and 4D and above). A quench changes the packing in place, so keep a copy of
 the packed state:
 
 ```python
@@ -620,23 +664,23 @@ packing.pack()
 packed = packing.copy()                # the packed state, before the first quench
 with warnings.catch_warnings():
     warnings.simplefilter("ignore", RuntimeWarning)   # a quench that does not converge warns
-    packing.quench()
+    packing.quench(kappa_mult=1.01)
     if packing.quench_status != "converged":
         packing = packed.copy()
-        packing.quench(dt_max=0.1)     # or: packing.quench(kappa_mult=1.02)
+        packing.quench(kappa_mult=1.01, dt_max=0.1)     # or: packing.quench(kappa_mult=1.02)
 print(packing.quench_status, packing.quench_iters)
 ```
 
 An example from the development runs: 400 ellipses of elongation 4 (`aspect_ratios=[0.25]`),
-whose quench at the defaults (`kappa_mult=1.01`, `dt_max=0.2`) was still at a residual of 0.4
+whose quench at `kappa_mult=1.01` and the default `dt_max=0.2` was still at a residual of 0.4
 after 200,000 iterations.
 
 | Retry of the packed state | Outcome | Iterations |
 | --- | --- | --- |
-| `quench(dt_max=0.1)` | converged | 35,248 |
-| `quench(dt_max=0.05)` | converged | 157,347 |
+| `quench(kappa_mult=1.01, dt_max=0.1)` | converged | 35,248 |
+| `quench(kappa_mult=1.01, dt_max=0.05)` | converged | 157,347 |
 | `quench(kappa_mult=1.02)` | converged | 15,830 |
-| default settings, then `quench(resume=True)` | not converged | 200,000 more |
+| the same settings, then `quench(resume=True)` | not converged | 200,000 more |
 
 What to take from it:
 
@@ -654,20 +698,21 @@ What to take from it:
 A second example: **flat-ended rods in 3D inside a curved container often need a retry.** A
 flat end standing on a curved wall is held by many points of its rim at once, a much stiffer
 contact than any other in the packing. In a survey of 150 flat-ended rods (`rod_length=1.5`,
-three seeds per container):
+three seeds per container, all at `kappa_mult=1.01` unless stated):
 
-| Container | Converged at the defaults | After a retry with `dt_max=0.1` | The remaining case |
+| Container | Converged at the default `dt_max` | After a retry with `dt_max=0.1` | The remaining case |
 | --- | --- | --- | --- |
 | periodic box | 3 of 3 | | |
 | sphere | 1 of 3 | 3 of 3 | |
 | cylinder | 2 of 3 | 2 of 3 | `dt_max=0.05`: not converged after 200,000 iterations; `kappa_mult=1.02`: converged in 10,275 |
 
-Ellipsoids, capped rods and 2D rectangles in curved containers converged at the defaults in
-the cases tested.
+Ellipsoids, capped rods and 2D rectangles in curved containers converged at `kappa_mult=1.01`
+and the default `dt_max` in the cases tested.
 
-The defaults for ellipsoids and rods are already gentler than for spheres for this reason.
+The default `dt_max` for ellipsoids and rods is already lower than for spheres, and the
+recommended `kappa_mult` larger, for this reason.
 
-**Where it works.** On 3-D power-law packings with the default settings the quench converges
+**Where it works.** On 3-D power-law packings with `kappa_mult=1.003` and otherwise default settings the quench converges
 to 1e-10 for size ratios up to about 10 (N = 4000: 40 000–56 000 iterations, about 1 ms per
 iteration per 4000 particles at one thread). It also converges in 2D, with hard walls in
 one, two or three directions, and in disk, cylinder and sphere containers (N = 500, size
@@ -675,7 +720,7 @@ ratio 5). The iteration count grows with N, and steeply for compressions close t
 jamming point. A small fraction of runs stop early as `"stalled"` while still converging,
 and `quench(resume=True)` usually finishes them. Each new seed or machine is a different
 realisation and can land either way. With N = 500 and size ratio 5 this happened for 2 of
-40 seeds in 3D periodic boxes at the default compression, and for 2 of 660 runs across all
+40 seeds in 3D periodic boxes at `kappa_mult=1.003`, and for 2 of 660 runs across all
 2D/3D geometries at `kappa_mult=1.01`. In 4D with hard walls and size ratio 5 it is about 1
 call in 6 (33 of 40 seeds converged in one call; 30 of 30 at size ratio 2).
 Above a size ratio of about 20 the method usually cannot
@@ -684,7 +729,7 @@ small particles with only two or three contacts, and the quench converges only a
 substantial compression (S = 25 converges with `kappa_mult=1.01`; at S = 40 even the
 smallest compression that can be balanced, about 2.5 % in diameter, raises the packing
 fraction from 0.79 to 0.85). That is a compressed packing, not force balance of the
-original; at the default setting the quench gives up with a message rather than run on. Gradient,
+original; at `kappa_mult=1.003` the quench gives up with a message rather than run on. Gradient,
 quasi-Newton, Newton and active-set minimisers were also tried on these states and none
 finished faster than FIRE: the last stage of convergence is a sequence of contact changes,
 which only the dynamics resolve efficiently.
@@ -704,15 +749,93 @@ forces in the ratio 1 : 2.00 : 2.99, equal and opposite on the two slabs to five
 | --- | --- | --- |
 | `tol` | `1e-10` | Stop when the max residual is at or below this. |
 | `max_iter` | `200000` | Iteration cap for this call. |
-| `kappa_mult` | `1.003` (2D/3D), `1.01` (4D+) | One-time rescaling of all diameters before the quench. Not applied with `resume=True`. |
+| `kappa_mult` | `1.0` (no expansion) | One-time rescaling of all diameters before the quench. A packing straight from `pack()` needs a small one to carry load: `1.003` for spheres in 2D/3D, `1.01` in 4D and above and for ellipsoids and rods. Not applied with `resume=True`. |
 | `resume` | `False` | Continue from the previous quench's state (no rescaling). |
 | `held` | `None` | Indices of particles that must not move. |
+| `coast` | `True` for spheres, `False` for ellipsoids and rods | `True`: a particle that loses its last contact keeps its velocity (and spin) until the minimiser next resets, and drifts clear. `False`: it stops where the contact ended, as in 1.1.0. See below. |
 | `stall_window` | `max(20000, 20·N)` | Give up when the best residual has not halved in this many iterations; `0` disables. |
 | `verbose` | packing's `verbose` | Print the outcome. |
 | `mass_scaled`, `dt0`, `dt_max`, `alpha0`, `mix_mode`, `report_every` | `True`, `0.05`, `0.5`, `0.03`, `1`, `500` | Advanced FIRE settings; the defaults are the measured best. `mix_mode=0` uses global velocity mixing as in the original FIRE, `1` per-particle mixing. |
 
-With ellipsoids and rods the defaults of `kappa_mult` and `dt_max` are `1.01` and `0.2`, and rods take
+With ellipsoids and rods the default of `dt_max` is `0.2` and the recommended `kappa_mult` is `1.01`, and rods take
 one more argument, `rod_round`; see [Quench](#quench-with-ellipsoids-and-rods) under Ellipsoids and rods.
+
+**Coasting.** Measured on one thread, the same packed state quenched with and without it
+(`kappa_mult=1.003`; 1.01 in 4D and for shapes):
+
+| Packing | Iterations without | Iterations with |
+| --- | --- | --- |
+| 3D spheres, two sizes, N = 1,000 (4 seeds) | 14,182 / 16,695 / 5,503 / 24,053 | 39,178 / 15,018 / 4,307 / 11,873 |
+| 3D spheres, size ratio 10, N = 2,000 (4 seeds) | 18,662 / 42,266 / gave up / gave up | 11,062 / 30,457 / 39,980 / 18,286 |
+| 3D spheres, size ratio 10, N = 5,000 | 90,688 | 51,108 |
+| 2D spheres, size ratio 5, N = 2,000 | 3,701 | 3,269 |
+| 4D spheres, size ratio 3, N = 2,000 | 35,164 | 24,064 |
+| 2D ellipses 2:1; 2D capped rods | 15,082; 5,894 | 15,082; 5,894 |
+| 3D prolate ellipsoids, N = 600; 3D capped rods, N = 500 | 11,065; 5,956 | 22,421; 5,979 |
+
+For spheres it is faster in 11 of 12 packings, and the two quenches that gave up without it converged
+with it. For ellipsoids and rods it gave no gain, so it is off by default for them.
+
+## Adaptive quench: balance at a pressure
+
+`quench()` freezes the diameters and balances the forces. `packing.adaptive_quench()` balances the
+forces while the diameters adapt: one common scale factor on all diameters follows the pressure term
+`mu`, the same `mu` that drives the swelling in `pack()`. The particles swell while their contacts
+carry less than `mu` and shrink while they carry more, so the call ends in the force-balanced packing
+whose contact forces carry `mu`. The mean overlap of that packing is proportional to `mu`. One value
+of `mu` is used throughout; there is no schedule. Spheres only.
+
+```python
+packing.pack()
+packing.adaptive_quench()               # mu = packing.mu_final, the value pack() ended on
+print(packing.quench_status, packing.quench_iters, packing.quench_global_residual)
+print(packing.phi_final, packing.phi_contact)      # the balanced state, and the same state shrunk to contact
+```
+
+A packing from `pack()` is close to contact but not in force balance, so its contact network is not
+resolved. After `adaptive_quench()` it is: every particle's forces cancel to the tolerance, and on the
+periodic packings tested the particles that are not rattlers have a mean contact number at or just
+above `2 * Ndim`. Read it from `packing.z` (per particle), `packing.z_mean`, `packing.n_rattlers` and
+`packing.z_mean_no_rattlers`.
+
+| Argument | Default | Meaning |
+| --- | --- | --- |
+| `mu` | `packing.mu_final` | The pressure term. A larger `mu` gives a more compressed packing with larger overlaps; a smaller one a packing closer to contact. Must be given when the state has no `mu_final`. |
+| `tol` | `1e-9` | Converged when the global residual (root-mean-square net force over the load-bearing particles divided by the mean contact force) is at or below this and the contact forces carry `mu` to one part in 1e6. |
+| `max_iter` | `200000` | Iteration cap for this call. Calling again continues from the state reached. |
+| `coast` | `True` | A particle that loses its last contact keeps its velocity until the minimiser next resets. `False`: it stops where the contact ended. (On one packing of 600 spheres with a size ratio of 5: 41,235 iterations with it, 77,501 without.) |
+| `gamma` | `0.05` | Rate at which the size scale follows the pressure. Lower it if the sizes oscillate. |
+| `verbose` | packing's `verbose` | Print the outcome. |
+| `mass_scaled`, `dt0`, `dt_max`, `alpha0`, `mix_mode`, `report_every` | `True`, `0.05`, `0.5`, `0.03`, `1`, `500` | FIRE settings, as in `quench()`. |
+
+After the call, `quench_status` is `"converged"`, `"max_iter"` or `"non_finite"` and `quench_message`
+explains it; anything other than `"converged"` also raises a `RuntimeWarning`. `phi_final`,
+`phi_contact` and `shrink_factor` describe the new state, `mu_final` is the `mu` used, and
+`quench_aq_log` holds the course of the call (per report: iteration, `mu`, size scale relative to the
+start, global residual, load-bearing count, mean contact number of the load-bearing particles). The
+packing is modified in place, whether or not the call converges, and particle `i` keeps index `i`.
+
+**Cost.** The number of iterations depends strongly on the packing. Measured on one thread: 500
+bidisperse spheres in 3D converge in about 40,000 iterations (6 s); 5,000 spheres with a size ratio of
+10 were not yet balanced after 150,000 (5 minutes). In 5D (600 spheres, size ratio 2) the call at the default
+`mu` was still compacting after 150,000 iterations, with the sizes creeping up, and converged in 82,000 at five
+times that `mu` (`adaptive_quench(mu=5 * packing.mu_final)`). When a call stops at `max_iter`, call it again to continue; when the
+residual is no longer falling, the settings to change are a lower `dt_max`, a larger `mu`, or a looser
+`tol`.
+
+**Using the three calls together.**
+
+| Goal | Calls |
+| --- | --- |
+| A dense packing, quickly | `pack()`, or `pack(extend=...)` for a denser one. Report `phi_contact`. |
+| The contact network resolved | `pack()`, then `adaptive_quench()`. |
+| A compressed, force-balanced packing at fixed diameters | `pack()`, then `quench(kappa_mult=1.003)` (the expansion sets the compression). |
+| Balance kept through a deformation | `adaptive_quench()`, then `quench()`; move or hold particles; `quench()` again after each change. `quench()` never changes the diameters unless `kappa_mult` is passed. |
+
+After an adaptive quench at a small `mu` the overlaps are small, and the tightest residual `quench()`
+can reach is limited by floating-point rounding of the positions (roughly 6e-14 divided by the mean
+relative overlap, so about 1e-9 at the `mu` a standard run ends on). Use `tol=1e-8` there, or a larger
+`mu`.
 
 ## Ellipsoids and rods
 
@@ -918,8 +1041,9 @@ An ellipsoid or rod packing carries two packing fractions:
 | `shrink_factor` | That common factor (at most 1). Multiply every diameter by it to obtain the non-overlapping configuration. |
 
 Both fractions use the true particle volume (ellipsoid or rod, not the bounding sphere).
-`pack()` fills `phi_contact` and `shrink_factor` for ellipsoids and rods; for spheres they stay
-`None`.
+`pack()` fills `phi_contact` and `shrink_factor` for every shape, spheres included (for spheres above 8
+dimensions they stay `None`). For spheres `phi_final` is still the value 1.0 and 1.1 reported; `phi_contact` is
+slightly lower, by the overlap left at the stop (about 0.1 %).
 
 `packing.shrink_to_contact()` computes the same shrink on the current state at any time, for spheres
 as well, in periodic boxes, with flat walls and in curved containers. It returns a dictionary with `scale` (the factor, with a
@@ -1012,7 +1136,7 @@ at the wall.
 | Research inputs of the core: the distribution morph (`morph_target`), fixed particles, the internal `swap_*` settings and swap injection, the quench's two-level, activity-damping, warm-up and per-particle-reset variants | error | error | Undocumented research features that work from sphere quantities; only the public `diameter_permute` and `quench()` are extended. |
 
 Not a refusal, but a limit to know: **the quench of 3D flat-ended rods in a curved container often needs
-a retry** at the default settings (lower `dt_max`, then slightly more compression); see
+a retry** after a quench at `kappa_mult=1.01` (lower `dt_max`, then slightly more compression); see
 [Quench to force balance](#quench-to-force-balance).
 
 #### Permutation with ellipsoids and rods
@@ -1067,12 +1191,13 @@ and the pass has not been optimised.
 torque** balance. The residual of a particle combines its net force and its net torque (divided by
 the particle's bounding radius) relative to the sum of its contact forces. Statuses, `resume`, `held` and the
 other arguments are as described under [Quench to force balance](#quench-to-force-balance). Two
-defaults differ from spheres:
+settings differ from spheres: the recommended `kappa_mult` (its default is `1.0`, no expansion, for
+every shape) and the default `dt_max`:
 
 | Argument | Spheres | Ellipsoids and rods | Why |
 | --- | --- | --- | --- |
-| `kappa_mult` | `1.003` (2D/3D) | `1.01` | At 0.3 % compression the quench did not converge for the more elongated or flattened ellipsoids (2D at 4:1, 3D prolate and oblate at 3:1, and the three-axis shape `[0.8, 0.64]`); at 1 % all converged. |
-| `dt_max` | `0.5` | `0.2` | At 0.5 the time step keeps overshooting and being cut back on elongated or flattened shapes: in an earlier survey 50 of 56 cases converged and 2D ellipses at 4:1 never did, where 0.2 brought all 56 to balance. With an exact contact solution in both cases, 0.5 still failed on 4 of 6 of the hardest cases and took 7 to 29 times the iterations on the other 2. |
+| `kappa_mult` (recommended) | `1.003` (2D/3D) | `1.01` | At 0.3 % compression the quench did not converge for the more elongated or flattened ellipsoids (2D at 4:1, 3D prolate and oblate at 3:1, and the three-axis shape `[0.8, 0.64]`); at 1 % all converged. |
+| `dt_max` (default) | `0.5` | `0.2` | At 0.5 the time step keeps overshooting and being cut back on elongated or flattened shapes: in an earlier survey 50 of 56 cases converged and 2D ellipses at 4:1 never did, where 0.2 brought all 56 to balance. With an exact contact solution in both cases, 0.5 still failed on 4 of 6 of the hardest cases and took 7 to 29 times the iterations on the other 2. |
 
 **If a quench of ellipsoids or rods stalls or fails, quench the packed state again with a lower
 `dt_max` (0.1, say) or slightly more compression (`kappa_mult=1.02`)**, as shown with measured
@@ -1090,10 +1215,10 @@ packing.pack()
 packed = packing.copy()                # keep the packed state
 with warnings.catch_warnings():
     warnings.simplefilter("ignore", RuntimeWarning)
-    packing.quench()                   # kappa_mult=1.01, dt_max=0.2 for this shape
+    packing.quench(kappa_mult=1.01)    # 1 % expansion; dt_max defaults to 0.2 for this shape
     if packing.quench_status != "converged":
         packing = packed.copy()        # start again from the packed state
-        packing.quench(dt_max=0.1)     # retry the packed state: lower dt_max, or kappa_mult=1.02
+        packing.quench(kappa_mult=1.01, dt_max=0.1)   # retry the packed state: lower dt_max, or kappa_mult=1.02
 print(packing.quench_status, packing.quench_residual, packing.quench_iters)
 ```
 
@@ -1101,11 +1226,11 @@ print(packing.quench_status, packing.quench_residual, packing.quench_iters)
 contact energy of a sharp rod has a kink and a minimiser finds no balance point: trial quenches of
 sharp rods stalled in 4 of 4 cases. For the quench each rod is therefore replaced by a rod whose edges
 are rounded by 1 % (`rod_round=0.01`, an argument of `quench()` for rods). The balanced state is that
-of the rounded rods at 1 % compression. The packing itself is always made with the sharp shape.
+of the rounded rods at the compression passed (1 % with `kappa_mult=1.01`). The packing itself is always made with the sharp shape.
 `rod_round=0` quenches the sharp rods and usually stalls. The rounded contact exists in 2D and 3D, so
 rods cannot be quenched in 4D and above.
 
-**Where it has been run.** With the defaults, 52 of 53 ellipsoid cases converged to a residual of
+**Where it has been run.** With `kappa_mult=1.01` and the default `dt_max`, 52 of 53 ellipsoid cases converged to a residual of
 1e-10 (the one that did not, 2D ellipses at 4:1, is the retry example under
 [Quench to force balance](#quench-to-force-balance)): 2D ellipses from nearly round to 4:1, 3D prolate and oblate shapes to 3:1 and a three-axis
 shape, hard walls, two size distributions, 4D, and N up to 2000, with two or three seeds each. The

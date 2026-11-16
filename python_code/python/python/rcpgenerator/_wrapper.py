@@ -73,14 +73,22 @@ class Packing:
     axis); pass ``orientations=`` to supply your own. After ``pack()``: ``orientations`` holds the final
     rotations, ``phi_final`` the raw (slightly overlapping) packing fraction as for spheres, and
     ``phi_contact`` the packing fraction after the exact uniform shrink to zero overlap (``shrink_factor``):
-    the value to report. Without ``aspect_ratios`` or the rod keywords nothing changes. Available with both
+    the value to report. (Sphere packings get ``phi_contact`` and ``shrink_factor`` as well.) Without
+    ``aspect_ratios`` or the rod keywords the sphere code runs. Available with both
     shapes: periodic boxes, flat hard walls, curved containers and ``fix_height``; ``diameter_permute=True`` (an exchange trades diameter and
     shape; orientations stay in place by default, ``ell_permute_orient=1`` makes them travel); ``quench()``
-    (force and torque balance; defaults ``kappa_mult=1.01`` and ``dt_max=0.2``; rods are balanced as slightly
+    (force and torque balance; pass ``kappa_mult=1.01``, since quench() expands nothing by default; ``dt_max``
+    defaults to 0.2; rods are balanced as slightly
     rounded rods, ``rod_round=0.01``, in 2D and 3D only); ``render`` / ``savefig`` / ``show_packing`` /
     ``animate_2d``, which draw the true shapes and orientations. Not available with either shape (each
     raises): the research inputs (distribution morph, fixed particles, internal ``swap_*`` settings). Flat-ended
     rods and the quench of rods are 2D and 3D only. See README "Ellipsoids and rods".
+
+    Every shape, after ``pack()``, ``quench()`` or ``adaptive_quench()``: ``z`` (contacts per particle, in the
+    order of ``positions``; a wall the particle touches counts as one), ``z_mean``, ``n_rattlers`` (fewer than
+    Ndim + 1 contacts) and ``z_mean_no_rattlers``. ``mu_final`` is the pressure term a packing run ended on.
+    ``extend=x`` lengthens the first stage of the packing run by the factor x (see ``pack``);
+    ``adaptive_quench()`` balances a sphere packing at a pressure with the diameters free.
     """
 
     _INIT_KEYS = {"phi", "N", "Ndim", "box", "walls", "fix_height", "dist", "aspect_ratios",
@@ -101,7 +109,7 @@ class Packing:
                        "mu_pin": 0.0}
     # [221] quench to force balance: core fields behind Packing.quench() (inert when quench_mode == 0). The public
     # interface is the quench() method; these fields are internal, kept for checkpoint-path runs and the research record.
-    _QUENCH_DEFAULTS = {"quench_stall_window": 0, "quench_stall_factor": 0.5, "quench_dt_min": 0.0, "quench_mode": 0, "quench_tol": 1e-10, "quench_max_iter": 200000, "quench_dt0": 0.05, "quench_dt_max": 0.5,
+    _QUENCH_DEFAULTS = {"quench_stall_window": 0, "quench_stall_factor": 0.5, "quench_dt_min": 0.0, "quench_coast": 0, "quench_aq": 0, "quench_aq_gamma": 0.05, "quench_aq_mu": 0.0, "quench_mode": 0, "quench_tol": 1e-10, "quench_max_iter": 200000, "quench_dt0": 0.05, "quench_dt_max": 0.5,
                         "quench_alpha0": 0.1, "quench_mass_scaled": 0, "quench_report_every": 500, "quench_kappa_mult": 1.0, "quench_mix_mode": 0, "quench_two_level": 0, "quench_light_frac": 0.3, "quench_light_omega": 1.0, "quench_warm_steps": 0, "quench_warm_amp": 0.1, "quench_freeze_damp": 0.0, "quench_freeze_frac": 0.1, "quench_class_every": 100, "quench_held": [], "quench_rod_round": 0.0}
     # Internal diameter-permutation fields (legacy ``swap_`` prefix, not public API); all
     # inert at swap == 0. They travel in the pack config so they reach the core through
@@ -120,8 +128,14 @@ class Packing:
         "swap_event_log_stride": 0, "swap_event_log_cap": 1000000, "swap_event_log_geom": 0,
         "swap_sweeps_off": 0, "swap_inject": [],
     }
-    _PACK_KEYS = {"box", "walls", "neighbor_max", "seed", "fix_height"} | set(_ELL_DEFAULTS) | set(_SWAP_DEFAULTS) | set(_PERMUTE_DEFAULTS) | set(_MORPH_DEFAULTS) | set(_QUENCH_DEFAULTS)
+    _PACK_KEYS = {"box", "walls", "neighbor_max", "seed", "fix_height", "extend"} | set(_ELL_DEFAULTS) | set(_SWAP_DEFAULTS) | set(_PERMUTE_DEFAULTS) | set(_MORPH_DEFAULTS) | set(_QUENCH_DEFAULTS)
     _REALIZED_STATE_KEYS = {"positions", "diameters", "orientations"}
+    # Diagnostics that only a run sets (in _apply_packing_result). from_dict gives a loaded state the same
+    # attributes with these empty values, so code written for a freshly packed object works on a loaded one.
+    _RUN_ATTR_DEFAULTS = {"zpos_history": [], "mu_eff_history": [], "mu_hold_applied": 0, "mu_ctrl_final_mult": 0.0,
+                          "swap_geo_trades": 0, "swap_geo_passes": 0, "swap_geo_reopens": 0, "swap_geo_cycle_trades": 0,
+                          "swap_geo_cycle4_trades": 0, "swap_geo_capk_trades": 0, "swap_geo_cage_trades": 0,
+                          "swap_geo_bottleneck_trades": 0}
     _RESULT_KEYS = {
         "steps",
         "phi_final",
@@ -158,6 +172,7 @@ class Packing:
         obj.dist = deepcopy(init_config.get("dist", {}))
         obj.neighbor_max = pack_config.get("neighbor_max", 0)
         obj.seed = pack_config.get("seed", 0)
+        obj.extend = cls._checked_extend(pack_config.get("extend"))
         obj._init_extension_state(pack_config, consume=False)
         obj._init_ellipsoid_state(init_config.get("aspect_ratios", pack_config.get("aspect_ratios", [])),
                                   pack_config)
@@ -190,9 +205,38 @@ class Packing:
         obj.trajectory_energy = deepcopy(trajectory.get("energy", []))
         obj.trajectory_max_min_dist = deepcopy(trajectory.get("max_min_dist", []))
         obj.trajectory_origin = deepcopy(trajectory.get("origins", []))
+        # A state saved by an earlier version lacks what was added since. Everything a freshly built packing has
+        # exists on a loaded one too: histories that are not saved are empty, and a value the saved state does not
+        # carry is computed here when the state determines it (phi_contact, shrink_factor), else None (mu_final).
+        obj.max_overlap_history = deepcopy(final_result.get("max_overlap_history", []))
+        obj.mu_flag_history = deepcopy(final_result.get("mu_flag_history", []))
+        obj.mu_history = deepcopy(final_result.get("mu_history", []))
+        obj.alpha_history = deepcopy(final_result.get("alpha_history", []))
+        obj.mu_final = final_result.get("mu_final")
+        obj.quench_aq_log = []
+        for k, v in cls._RUN_ATTR_DEFAULTS.items():       # diagnostics a run sets and a saved state does not carry
+            if not hasattr(obj, k):
+                setattr(obj, k, deepcopy(v))
+        if obj._nonsphere:
+            for k, v in (("ell_capture_record", None), ("ell_permute_candidates", 0)):
+                if not hasattr(obj, k):
+                    setattr(obj, k, v)
 
         object.__setattr__(obj, "_initialized", bool(status.get("initialized", bool(obj.positions) and bool(obj.diameters))))
         object.__setattr__(obj, "_packed", bool(status.get("packed", bool(obj.steps))))
+        obj._set_contact_numbers(None)
+        if obj._packed and obj.positions and obj.diameters and (obj._nonsphere or int(obj.Ndim) <= 8):
+            # One pass over the stored state's contacts; it changes nothing in it. It gives the contact numbers
+            # (never saved) and, for a state that lacks them, phi_contact and shrink_factor. Left None if it
+            # cannot be computed (an old or partial state must still load).
+            try:
+                shrunk = obj.shrink_to_contact()
+                obj._set_contact_numbers(shrunk["z"])
+                if obj.phi_contact is None or obj.shrink_factor is None:
+                    obj.shrink_factor = shrunk["scale"]
+                    obj.phi_contact = shrunk["phi"]
+            except Exception:   # noqa: BLE001
+                pass
         object.__setattr__(obj, "_needs_initialize", bool(status.get("needs_initialize", not obj._initialized)))
         object.__setattr__(obj, "_needs_pack", bool(status.get("needs_pack", not obj._packed)))
         object.__setattr__(obj, "_mutating_internal_state", False)
@@ -216,6 +260,7 @@ class Packing:
         self.dist = deepcopy(kwargs.pop("dist", {"type": "mono", "d": 1.0}))
         self.neighbor_max = kwargs.pop("neighbor_max", 0)
         self.seed = kwargs.pop("seed", 0)
+        self.extend = self._checked_extend(kwargs.pop("extend", None))
         self._init_extension_state(kwargs, consume=True)
         self._init_ellipsoid_state(kwargs.pop("aspect_ratios", None),
                                    {k: kwargs.pop(k) for k in list(self._ELL_DEFAULTS) if k in kwargs})
@@ -250,6 +295,9 @@ class Packing:
         self.trajectory_energy = []
         self.trajectory_max_min_dist = []
         self.trajectory_origin = []
+        self.mu_final = None        # the pressure term mu at the end of the last pack() (or adaptive_quench())
+        self._set_contact_numbers(None)   # z, z_mean, n_rattlers, z_mean_no_rattlers: filled by pack() and the quenches
+        self.quench_aq_log = []
 
         if kwargs:
             unknown = ", ".join(sorted(kwargs))
@@ -278,7 +326,7 @@ class Packing:
         for k, v in self._ELL_DEFAULTS.items():
             setattr(self, k, type(v)(config.get(k, v)))
         self.orientations = []
-        self.phi_contact = None       # packing fraction after the exact shrink to zero overlap (ellipsoid packs)
+        self.phi_contact = None       # packing fraction after the exact shrink to zero overlap (set by pack(), every shape)
         self.shrink_factor = None     # the uniform factor of that shrink (multiply every diameter by it)
         self.torque_magnitude = None
         self.trajectory_orientations = []
@@ -454,8 +502,20 @@ class Packing:
         if self.morph_target:
             refuse("the distribution morph (morph_target)")
 
+    @staticmethod
+    def _checked_extend(value):
+        """``extend``: None (not set) or a positive number, the length of rung 1 in units of its standard length."""
+        if value is None:
+            return None
+        v = float(value)
+        if not (v > 0.0) or v != v or v > 1000.0:
+            raise ValueError("extend must be a positive number (at most 1000): the factor by which the first stage "
+                             "of the packing run is lengthened (1 = the standard length)")
+        return v
+
     def shrink_to_contact(self) -> dict[str, Any]:
-        """Exact shrink-to-contact of the current configuration (spheres or ellipsoids; flat or periodic box).
+        """Exact shrink-to-contact of the current configuration (spheres, ellipsoids or rods; periodic boxes, flat
+        walls and curved containers).
 
         Returns ``scale`` (the largest uniform factor <= 1 by which every particle can be scaled about its
         centre so that no pair and no wall overlaps, computed from the converged contact function over all
@@ -467,7 +527,24 @@ class Packing:
         if scale < 1.0:
             scale *= (1.0 - 1e-12)
         return {"scale": scale, "phi": self._current_phi() * scale ** int(self.Ndim),
-                "n_overlapping": int(cs["n_overlapping"]), "pair": (int(cs["pair_i"]), int(cs["pair_j"]))}
+                "n_overlapping": int(cs["n_overlapping"]), "pair": (int(cs["pair_i"]), int(cs["pair_j"])),
+                "z": [int(v) for v in cs["z"]]}
+
+    def _set_contact_numbers(self, z) -> None:
+        """Fill ``z`` (contacts per particle, in the order of ``positions``; a wall the particle touches counts as
+        one), ``z_mean`` (over all particles), ``n_rattlers`` (particles with fewer than Ndim + 1 contacts, which
+        cannot be held in place) and ``z_mean_no_rattlers`` (the mean of ``z`` over the other particles). None: not
+        available."""
+        if z is None:
+            self.z = None; self.z_mean = None; self.n_rattlers = None; self.z_mean_no_rattlers = None
+            return
+        z = [int(v) for v in z]
+        need = int(self.Ndim) + 1
+        held = [v for v in z if v >= need]
+        self.z = z
+        self.z_mean = (sum(z) / len(z)) if z else None
+        self.n_rattlers = len(z) - len(held)
+        self.z_mean_no_rattlers = (sum(held) / len(held)) if held else None
 
     def _init_extension_state(self, config: dict[str, Any], *, consume: bool) -> None:
         """Set the fields added after v1.0 (diameter permutation, morph, quench, internal permutation fields)
@@ -538,6 +615,8 @@ class Packing:
         return self._packed
 
     def __setattr__(self, name: str, value: Any) -> None:
+        if name == "extend":   # checked before it is stored: a refused value leaves the setting as it was
+            value = self._checked_extend(value)
         object.__setattr__(self, name, value)
         if name.startswith("_"):
             return
@@ -609,6 +688,10 @@ class Packing:
             **{k: deepcopy(getattr(self, k)) for k in self._MORPH_DEFAULTS},
             **{k: deepcopy(getattr(self, k)) for k in self._QUENCH_DEFAULTS},
         }
+        if getattr(self, "extend", None) is not None:   # only when set: a pack config without it is what it always was
+            cfg["extend"] = float(self.extend)
+            if translate:
+                cfg["rung1_extend"] = float(self.extend)
         if self.aspect_ratios:   # ellipsoids only: a sphere pack config is exactly what it always was
             if not self.has_shape_table:   # one shape for all travels in the config, a table in the input
                 cfg["aspect_ratios"] = list(self.aspect_ratios)
@@ -702,6 +785,7 @@ class Packing:
         self.phi_contact = None
         self.shrink_factor = None
         self.torque_magnitude = None
+        self._set_contact_numbers(None)
 
     def _clear_trajectory(self) -> None:
         self.trajectory_positions = []
@@ -750,6 +834,7 @@ class Packing:
         self.positions = []
         self.diameters = []
         self.orientations = []
+        self.mu_final = None
         self._clear_results()
         self._clear_trajectory()
 
@@ -804,6 +889,7 @@ class Packing:
             else:
                 self.orientations = []
             self._clear_results()
+            self.mu_final = None
         finally:
             object.__setattr__(self, "_mutating_internal_state", False)
 
@@ -843,6 +929,10 @@ class Packing:
             self.swap_geo_bottleneck_trades = int(result.get("swap_geo_bottleneck_trades", 0))
             self.mu_history = result.get("mu_history", [])
             self.alpha_history = result.get("alpha_history", [])
+            self.quench_aq_log = list(result.get("quench_aq_log", []))
+            if not int(getattr(self, "quench_mode", 0)):   # a packing run: the mu it ended on (a quench leaves it alone)
+                n_mu = min(int(self.steps), len(self.mu_history))
+                self.mu_final = float(self.mu_history[n_mu - 1]) if n_mu > 0 else None
             self.swap_log = result.get("reorder_log", [])
             self.particle_origin = result.get("particle_origin", [])
             self.swap_counts = result.get("spike_log", [])   # per-particle accepted swaps when swap > 0
@@ -881,9 +971,26 @@ class Packing:
                 self.torque_magnitude = float(result.get("torque_magnitude", 0.0))
                 self.ell_capture_record = result.get("ell_capture")
                 self.ell_permute_candidates = int(result.get("ell_permute_candidates", 0))
+            # every shape, spheres included: the reported phi after the exact shrink to zero overlap. It is computed
+            # from the final state and changes nothing in it.
+            self._set_contact_numbers(None)
+            if self._nonsphere:
                 shrunk = self.shrink_to_contact()
                 self.shrink_factor = shrunk["scale"]
                 self.phi_contact = shrunk["phi"]
+                self._set_contact_numbers(shrunk["z"])
+            elif int(self.Ndim) <= 8:
+                # Spheres: an extra, computed after the run. A sphere run that packed must not fail because of it,
+                # so a failure of the shrink itself leaves both values None and says so. Above 8 dimensions the
+                # shrink is not available (the pair routine it uses has fixed arrays up to 8): None, no message.
+                try:
+                    shrunk = self.shrink_to_contact()
+                    self.shrink_factor = shrunk["scale"]
+                    self.phi_contact = shrunk["phi"]
+                    self._set_contact_numbers(shrunk["z"])
+                except RuntimeError as exc:
+                    warnings.warn("phi_contact and shrink_factor were not computed for this sphere packing "
+                                  f"(they stay None; phi_final is unaffected): {exc}", UserWarning, stacklevel=2)
         finally:
             object.__setattr__(self, "_mutating_internal_state", False)
 
@@ -1046,8 +1153,14 @@ class Packing:
         trajectory_interval: int = 1000,
         trajectory_spacing: str = "linear",
         trajectory_per_decade: int = 20,
+        extend: float | None = None,
     ) -> dict[str, Any]:
-        """Run the packing. ``capture_trajectory=True`` records frames for ``animate_2d``: every
+        """Run the packing. ``extend=x`` lengthens the first stage of the run (the stage at the starting pressure
+        ``mu``, about half of a standard run) by the factor ``x``; the stages after it keep their standard length.
+        ``extend=3`` therefore adds about one standard run's worth of steps. It is the same setting as
+        ``Packing(extend=x)`` and stays set for later runs; not set (the default) is the standard run.
+
+        ``capture_trajectory=True`` records frames for ``animate_2d``: every
         ``trajectory_interval`` steps (``trajectory_spacing="linear"``), or evenly in the LOGARITHM of the step,
         ``trajectory_per_decade`` frames per factor of 10 in steps (``trajectory_spacing="log"``). Most of the
         motion happens in the first few hundred steps of some 16,000, so log spacing gives a movie in which
@@ -1057,6 +1170,8 @@ class Packing:
         if trajectory_spacing == "log" and int(trajectory_per_decade) < 1:
             raise ValueError("trajectory_per_decade must be at least 1")
         effective_verbose = self.verbose if verbose is None else verbose
+        if extend is not None:
+            self.extend = extend
         if self._needs_initialize or not self._initialized:
             if effective_verbose:
                 print("rcpgenerator: initialization required before packing")
@@ -1112,7 +1227,7 @@ class Packing:
         *,
         tol: float = 1e-10,
         max_iter: int = 200000,
-        kappa_mult: float | None = None,
+        kappa_mult: float = 1.0,
         resume: bool = False,
         held=None,
         stall_window: int | None = None,
@@ -1124,15 +1239,19 @@ class Packing:
         mix_mode: int = 1,
         report_every: int = 500,
         rod_round: float | None = None,
+        coast: bool | None = None,
     ) -> dict[str, Any]:
         """Drive the current packing to mechanical force balance at fixed diameters.
+
+        The diameters are used as they are: nothing is expanded unless ``kappa_mult`` is passed. (For a balance
+        in which the diameters adjust to a pressure, see ``adaptive_quench()``.)
 
         With ``aspect_ratios`` (ellipsoids) the same minimisation moves positions and orientations together and
         the residual measures force and torque balance: |(Σf, Στ/a)| / Σ|f| per load-bearing particle, with ``a``
         the particle's largest semi-axis. ``orientations`` come back in the caller's order like the positions.
 
-        A FIRE minimisation of the overlap energy replaces the packing update: every
-        diameter is first multiplied once by ``kappa_mult`` and then frozen, the μ schedule
+        A FIRE minimisation of the overlap energy replaces the packing update: the diameters
+        are frozen (after one multiplication by ``kappa_mult`` when that is passed), the μ schedule
         is suspended and no diameter permutation runs. The packing is modified in place,
         whether or not the quench converges, so the state it stopped in is always
         available afterwards; particle ``i`` keeps index ``i`` (positions, diameters,
@@ -1146,15 +1265,18 @@ class Packing:
             included, and at least 1 % of the typical contact load).
         max_iter : int
             Iteration cap for this call.
-        kappa_mult : float, optional
-            One-time rescaling of all diameters before the quench. A packing run ends at
-            the edge of jamming; at exactly its own diameters it carries no load and cannot
-            be balanced, so a small compression is needed. Default for a fresh quench: 1.003
-            (0.3 % larger diameters) in 2D and 3D, which converges for size ratios up to
-            about 10; 1.01 in 4D and above, where broad size distributions need the larger
-            compression to converge reliably, and 1.01 for ellipsoids in any dimension (their
-            packings have fewer contacts than degrees of freedom and are held stable by the
-            compression itself). Not applied when ``resume=True``.
+        kappa_mult : float
+            One-time rescaling of all diameters before the quench. Default 1.0: no rescaling, so
+            repeated calls (for example after each step of a shear) never change the diameters.
+            A packing straight from ``pack()`` ends at the edge of jamming: at exactly its own
+            diameters its small overlaps can relax away and the quench then ends as
+            ``"unjammed"``. To quench such a state, pass a small expansion. Values that
+            converge reliably: 1.003 (0.3 % larger diameters) for spheres in 2D and 3D with
+            size ratios up to about 10; 1.01 for spheres in 4D and above, and for ellipsoids
+            and rods in any dimension (their packings have fewer contacts than degrees of
+            freedom and are held stable by the compression itself). A state left by
+            ``adaptive_quench()`` carries load already and needs none. Not applied when
+            ``resume=True``.
         resume : bool
             Continue from the state a previous ``quench()`` left (for example with a
             tighter ``tol`` or after a stop): the diameters are not rescaled again.
@@ -1174,6 +1296,12 @@ class Packing:
             lower the energy for tens of thousands of iterations before the residual drops).
         verbose : bool, optional
             Print the outcome (defaults to the packing's ``verbose``).
+        coast : bool, optional
+            True: a particle that loses its last contact keeps its velocity (and spin) until the minimiser
+            next resets, and drifts clear. False: it stops where the contact ended, as in 1.1.0, where the
+            next small motion can close the contact again. Default: True for spheres (measured: fewer
+            iterations in 11 of 12 packings, and two that stalled without it converged), False for
+            ellipsoids and rods (measured: no gain).
         mass_scaled, dt0, dt_max, alpha0, mix_mode, report_every
             Advanced FIRE settings; the defaults are the measured best. ``mix_mode`` 0 uses
             global velocity mixing (Bitzek et al.), 1 per-particle mixing.
@@ -1193,23 +1321,22 @@ class Packing:
         """
         if self._needs_initialize or not self._initialized or not self.positions:
             raise RuntimeError("quench() needs a realized state: call pack() first")
-        if resume and kappa_mult is not None and float(kappa_mult) != 1.0:
+        if kappa_mult is None:   # accepted as "no rescaling" (it meant "the default" before the default became 1.0)
+            kappa_mult = 1.0
+        if resume and float(kappa_mult) != 1.0:
             raise ValueError("quench(resume=True) continues at the current diameters; kappa_mult cannot be applied "
                              "(call quench(kappa_mult=...) without resume to rescale)")
-        default_kmult = 1.003 if int(self.Ndim) <= 3 else 1.01   # [228] 4D+: x1.003 gives up in ~40 % of broad-distribution runs
-        if self.is_rod or (self.aspect_ratios and not self._all_ratios_one()):
-            # ellipsoids: x1.003 leaves 2D ratio 3, 3D ratio 1.05 and the 1.25:1:0.8 shape wandering at a residual
-            # of 1e-3 to 1e-2 for 200,000 iterations; x1.01 converges them (EllipsoidalPacking LOG [020], [021])
-            default_kmult = 1.01
-            ell_shaped = True
-        else:
-            ell_shaped = False
+        # No expansion by default (EllipsoidalPacking LOG [049]). What converges reliably when one is passed: 1.003 for
+        # spheres up to 3D; 1.01 in 4D+ ([228]: x1.003 gives up in ~40 % of broad-distribution runs) and for
+        # ellipsoids and rods (x1.003 leaves 2D ratio 3, 3D ratio 1.05 and the 1.25:1:0.8 shape wandering at a
+        # residual of 1e-3 to 1e-2 for 200,000 iterations; LOG [020], [021]).
+        ell_shaped = bool(self.is_rod or (self.aspect_ratios and not self._all_ratios_one()))
         if dt_max is None:
             # spheres 0.5 as before. Ellipsoids 0.2: at 0.5 the step keeps overshooting and being cut back on the
             # more elongated or flattened shapes (2D ratio 4, 3D ratio 3 and 0.33 did not converge); at 0.2 it holds
             # (EllipsoidalPacking LOG [022])
             dt_max = 0.2 if ell_shaped else 0.5
-        kmult = 1.0 if resume else (default_kmult if kappa_mult is None else float(kappa_mult))
+        kmult = 1.0 if resume else float(kappa_mult)
         if not (tol > 0.0) or int(max_iter) < 1 or not (kmult > 0.0):
             raise ValueError("quench(): tol and kappa_mult must be > 0 and max_iter >= 1")
         if int(mix_mode) not in (0, 1):
@@ -1228,6 +1355,7 @@ class Packing:
         # the pack run's permutation diagnostics and particle identity map survive the quench
         kept = {k: deepcopy(getattr(self, k, 0)) for k in ("swap_counts", "particle_origin", "swap_geo_trades",
                                                             "swap_geo_passes", "swap_geo_cycle_trades")}
+        kept["mu_final"] = getattr(self, "mu_final", None)   # a quench at fixed diameters has no mu of its own
         try:
             # the quench acts on the realized state held here, never on a checkpoint: with checkpoint_path set the
             # run would resume the blob (dropping kappa_mult) and overwrite it at exit
@@ -1253,6 +1381,7 @@ class Packing:
             self.quench_mix_mode = int(mix_mode)
             self.quench_stall_window = window
             self.quench_dt_min = 1e-8
+            self.quench_coast = int((not ell_shaped) if coast is None else bool(coast))
             # rods: the quench works on slightly rounded rods (smooth contact; see rod.hpp), default rounding 1 %
             self.quench_rod_round = (0.01 if rod_round is None else float(rod_round)) if self.is_rod else 0.0
             self.quench_held = [float(i) for i in held_idx]
@@ -1302,6 +1431,11 @@ class Packing:
                     dia[i] = self.diameters[k]
                 self.positions, self.diameters = pos, dia
                 result["positions"], result["diameters"] = pos, dia
+                if getattr(self, "z", None) is not None and len(self.z) == n:   # contact numbers follow their particle
+                    zz = [0] * n
+                    for k, i in enumerate(q_origin):
+                        zz[i] = self.z[k]
+                    self.z = zz
                 if self.has_shape_table and len(self.aspect_ratios) == n:   # so does a per-particle shape
                     tab = [None] * n
                     for k in range(n):
@@ -1362,7 +1496,9 @@ class Packing:
                     f"{cause}{size_note}")
         if st == "unjammed":
             return ("unjammed: no load-bearing particles remain, so the diameters are too small for this structure to "
-                    "carry load. Quench the original state with a larger kappa_mult.")
+                    "carry load. quench() does not expand the diameters unless asked: quench the original state with "
+                    "kappa_mult slightly above 1 (for example 1.003 for spheres, 1.01 for ellipsoids, rods and 4D and "
+                    "above), or balance it at a pressure with adaptive_quench() first.")
         if st == "step_collapse":
             return (f"gave up: the minimiser's time step collapsed after {it} iterations (max residual {res:.2e}), so it "
                     f"found no step it could follow downhill. Quench the original (packed) state again with a lower dt_max "
@@ -1372,6 +1508,150 @@ class Packing:
             return (f"failed: a non-finite force or energy appeared after {it} iterations; the stored state may contain "
                     "invalid values and should not be used.")
         return "no quench has been run."
+
+    def adaptive_quench(
+        self,
+        *,
+        mu: float | None = None,
+        tol: float = 1e-9,
+        max_iter: int = 200000,
+        verbose: bool | None = None,
+        coast: bool = True,
+        gamma: float = 0.05,
+        mass_scaled: bool = True,
+        dt0: float = 0.05,
+        dt_max: float = 0.5,
+        alpha0: float = 0.03,
+        mix_mode: int = 1,
+        report_every: int = 500,
+    ) -> dict[str, Any]:
+        """Balance the packing at a pressure ``mu``, with the diameters free. Spheres only.
+
+        ``quench()`` freezes the diameters and balances the forces. ``adaptive_quench()`` balances the forces
+        while one common scale factor on all diameters adapts to the pressure term ``mu`` (the same ``mu`` that
+        drives the swelling in ``pack()``): the particles swell while their contacts carry less than ``mu`` and
+        shrink while they carry more. It ends in the force-balanced packing whose contact forces carry ``mu``;
+        the mean overlap of that packing is proportional to ``mu``. One value of ``mu`` is used throughout
+        (there is no schedule). The packing is modified in place, whether or not the call converges; particle
+        ``i`` keeps index ``i``.
+
+        Parameters
+        ----------
+        mu : float, optional
+            The pressure term. Default: ``mu_final``, the value the last ``pack()`` (or ``adaptive_quench()``)
+            ended on. A larger ``mu`` gives a more compressed packing with larger overlaps, a smaller one a
+            packing closer to contact. Must be given when the state has no ``mu_final`` (for example a state
+            saved by an earlier version).
+        tol : float
+            Convergence threshold on the GLOBAL residual: the root-mean-square net force over the load-bearing
+            particles divided by the mean contact force. (``quench()`` tests the largest per-particle residual.)
+            The call is converged when this is met and the contact forces carry ``mu`` to one part in 1e6.
+        max_iter : int
+            Iteration cap for this call. Calling again continues from the state reached.
+        coast : bool
+            True (default): a particle that loses its last contact keeps its velocity until the minimiser next
+            resets. False: it stops where the contact ended.
+        gamma : float
+            Rate at which the size scale follows the pressure. Lower it if the sizes oscillate.
+        verbose : bool, optional
+            Print the outcome (defaults to the packing's ``verbose``).
+        mass_scaled, dt0, dt_max, alpha0, mix_mode, report_every
+            FIRE settings, as in ``quench()``. A lower ``dt_max`` is the first thing to try when a call does
+            not converge.
+
+        Returns
+        -------
+        dict
+            The run result, including ``quench_status`` (``"converged"``, ``"max_iter"`` or ``"non_finite"``)
+            and ``quench_message``. Anything other than ``"converged"`` also raises a ``RuntimeWarning``.
+
+        Afterwards ``phi_final``, ``phi_contact``, ``shrink_factor`` and the contact numbers (``z``, ``z_mean``,
+        ``n_rattlers``, ``z_mean_no_rattlers``) describe the new state, ``mu_final`` is the ``mu`` used, ``quench_residual`` / ``quench_global_residual`` / ``quench_iters`` hold the end values, and
+        ``quench_aq_log`` the course (per report: iteration, mu, size scale relative to the start, global
+        residual, load-bearing count, mean contact number of the load-bearing particles).
+        """
+        if self._needs_initialize or not self._initialized or not self.positions:
+            raise RuntimeError("adaptive_quench() needs a realized state: call pack() first")
+        if self._nonsphere:
+            raise NotImplementedError("adaptive_quench() is implemented for spheres only; use quench() for ellipsoids "
+                                      "and rods")
+        if mu is None:
+            mu = getattr(self, "mu_final", None)
+            if mu is None:
+                raise ValueError("adaptive_quench(): this state has no mu_final (it was not produced by pack() in this "
+                                 "version); pass mu=... (a standard pack() ends near 1e-5)")
+        mu = float(mu)
+        if not (mu > 0.0) or not (tol > 0.0) or int(max_iter) < 1 or not (gamma > 0.0):
+            raise ValueError("adaptive_quench(): mu, tol and gamma must be > 0 and max_iter >= 1")
+        if int(mix_mode) not in (0, 1):
+            raise ValueError("adaptive_quench(): mix_mode must be 0 (global mixing) or 1 (per-particle mixing)")
+        saved = {k: deepcopy(getattr(self, k)) for k in self._QUENCH_DEFAULTS}
+        saved["checkpoint_path"] = self.checkpoint_path
+        saved["diameter_permute"] = self.diameter_permute
+        saved["swap"] = self.swap
+        kept = {k: deepcopy(getattr(self, k, 0)) for k in ("swap_counts", "particle_origin", "swap_geo_trades",
+                                                            "swap_geo_passes", "swap_geo_cycle_trades")}
+        kept["mu_final"] = mu
+        try:
+            self.checkpoint_path = ""
+            for k, v in self._QUENCH_DEFAULTS.items():
+                setattr(self, k, deepcopy(v))
+            self.quench_mode = 1
+            self.quench_aq = 1
+            self.quench_aq_mu = mu
+            self.quench_aq_gamma = float(gamma)
+            self.quench_coast = int(bool(coast))
+            self.quench_tol = float(tol)
+            self.quench_max_iter = int(max_iter)
+            self.quench_dt0 = float(dt0)
+            self.quench_dt_max = float(dt_max)
+            self.quench_alpha0 = float(alpha0)
+            self.quench_mass_scaled = int(bool(mass_scaled))
+            self.quench_report_every = int(report_every)
+            self.quench_kappa_mult = 1.0
+            self.quench_mix_mode = int(mix_mode)
+            self.quench_stall_window = 0
+            self.quench_dt_min = 0.0
+            self.quench_held = []
+            self.diameter_permute = False
+            self.swap = 0.0
+            effective_verbose = self.verbose if verbose is None else verbose
+            result = self._execute_packing(
+                verbose=effective_verbose,
+                progress_interval=max(1, int(report_every)),
+                capture_trajectory=False,
+                trajectory_interval=0,
+                options={"max_steps": int(max_iter) + 1, "fix_diameter": False},
+            )
+        finally:
+            object.__setattr__(self, "_mutating_internal_state", True)
+            try:
+                for k, v in saved.items():
+                    setattr(self, k, v)
+            finally:
+                object.__setattr__(self, "_mutating_internal_state", False)
+        self._restore_order_and_diagnostics(kept, result)
+        st, it = self.quench_status, self.quench_iters
+        gres = self.quench_global_residual
+        if st == "converged":
+            message = f"converged: global residual {gres:.2e} <= tol {tol:.0e} at mu = {mu:.3g} after {it} iterations."
+        elif st == "max_iter":
+            message = (f"stopped at max_iter={max_iter} with global residual {gres:.2e} (tol {tol:.0e}) at mu = {mu:.3g}. "
+                       f"Call adaptive_quench() again to continue from here; if the residual is not falling, try a lower "
+                       f"dt_max, a larger mu, or a looser tol.")
+        elif st == "non_finite":
+            message = (f"failed: a non-finite force or energy appeared after {it} iterations; the stored state may contain "
+                       "invalid values and should not be used.")
+        else:
+            message = f"ended with status {st!r} after {it} iterations (global residual {gres:.2e})."
+        object.__setattr__(self, "quench_message", message)
+        result["quench_status"] = self.quench_status
+        result["quench_message"] = message
+        if effective_verbose:
+            print(f"rcpgenerator: adaptive quench {message}")
+        if self.quench_status != "converged":
+            warnings.warn(f"adaptive_quench() did not converge: {message}", RuntimeWarning, stacklevel=2)
+        return result
 
     def render(
         self,
@@ -1520,9 +1800,10 @@ class Packing:
 
     def to_dict(self) -> dict[str, Any]:
         data = self._to_dict_base()
-        if self._nonsphere:   # ellipsoids and rods only: a sphere packing gets none of these keys (its only new key is pack_config.quench_rod_round)
-            data["final_result"].update(phi_contact=self.phi_contact, shrink_factor=self.shrink_factor,
-                                        torque_magnitude=self.torque_magnitude)
+        data["final_result"].update(phi_contact=self.phi_contact, shrink_factor=self.shrink_factor)   # every shape
+        data["final_result"]["mu_final"] = getattr(self, "mu_final", None)
+        if self._nonsphere:   # ellipsoids and rods only: a sphere packing gets none of these keys
+            data["final_result"].update(torque_magnitude=self.torque_magnitude)
             data["trajectory"]["orientations"] = deepcopy(self.trajectory_orientations)
         if self.trajectory_origin:   # only with a captured trajectory: a packing without one serialises exactly as before
             data["trajectory"]["origins"] = deepcopy(self.trajectory_origin)

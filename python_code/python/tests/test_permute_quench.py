@@ -26,12 +26,12 @@ rcpgenerator.set_num_threads(1)   # one thread: bit-reproducible runs (the deter
 N = 500
 QUICK = os.environ.get("RCP_QUICK", "") not in ("", "0")
 
-# Quench fixtures use an explicit compression of x1.01 rather than the 2D/3D default x1.003. A quench gives up when its
+# Quench fixtures use a compression of x1.01 rather than the x1.003 recommended in 2D/3D. A quench gives up when its
 # worst residual has not halved for stall_window iterations; at x1.003 that happens for a few percent of realisations
 # whose minimisation is still converging (3D periodic N=500 S=5: 2 of 40 seeds; resumed, they converge). A different
 # compiler or CPU (FMA contraction, sort tie order) is a different realisation of the same fixture, so these
 # tests must not depend on one realisation. At x1.01 the same fixtures converged in every one of 380 seeded runs
-# (single quench, resume and shear paths). The default value itself is checked where convergence does not matter.
+# (single quench, resume and shear paths). The x1.003 value itself is checked where convergence does not matter.
 FIXTURE_KAPPA = 1.01
 
 # name -> (Ndim, walls). walls[d] = 1: hard walls at 0 and L along d; walls[0] = -t: the first t
@@ -222,11 +222,12 @@ def test_quench_resume_and_give_up():
 
     pk = rcpgenerator.Packing.from_dict(saved)       # a stall window of one iteration gives up at once
     x0 = np.asarray(pk.positions)
-    caught = quench_quiet(pk, stall_window=1)
+    caught = quench_quiet(pk, stall_window=1, kappa_mult=1.003)
     assert pk.quench_status == "stalled" and caught and pk.quench_iters < 10, (pk.quench_status, pk.quench_iters)
     assert not np.array_equal(np.asarray(pk.positions), x0), "the stopped state must be kept"
     assert pk.quench_message.startswith("gave up")
-    # the default compression in 2D/3D is x1.003, applied once (checked here: it does not depend on convergence)
+    # the compression passed (x1.003, the recommended value in 2D/3D) is applied once (checked here: it does not
+    # depend on convergence)
     assert abs(same_multiset_up_to_scale(pk.diameters, d_packed) - 1.003) < 1e-12
 
 
@@ -237,7 +238,7 @@ def test_quench_held_particles():
         x0 = np.asarray(pk.positions, float)
         held = [i for i in range(len(x0)) if x0[i, 0] < 0.15 * pk.box[0]]
         assert held
-        quench_quiet(pk, held=held)
+        quench_quiet(pk, held=held, kappa_mult=1.003)
         x1 = np.asarray(pk.positions, float)
         assert np.array_equal(x1[held], x0[held]), "held particles moved"
         assert len(pk.quench_held_force) == ndim and np.isfinite(pk.quench_held_force).all()
@@ -305,7 +306,7 @@ def test_no_contact_through_walls():
 def test_quench_needs_a_state_and_validates():
     pk = make(n=200)
     # the constructor already places particles: quenching that dilute state is allowed and reports unjammed
-    caught = quench_quiet(pk)
+    caught = quench_quiet(pk, kappa_mult=1.003)
     assert pk.quench_status == "unjammed" and caught
     pk.reset()                                        # no realized state at all
     try:
@@ -379,7 +380,7 @@ def test_copy_and_serialisation():
 # --------------------------------------------------------------------------- runner
 
 def test_quench_high_dimensions():
-    """4D and 5D at the default compression (x1.01 above 3D): a hard-walled 4D quench converges and balances with
+    """4D and 5D at the recommended compression (kappa_mult=1.01 above 3D): a hard-walled 4D quench converges and balances with
     straight-line distances, and a periodic 5D quench keeps every particle in the box (its translation-mean removal
     once overflowed a 3-slot array above 3D). The walled case uses a size ratio of 2: at a size ratio of 5, 4D hard
     walls give up early (the stall rule) in about 1 single quench call in 6 (33/40 seeds converged; 30/30 at ratio 2),
@@ -389,7 +390,7 @@ def test_quench_high_dimensions():
         pk = make(ndim, walls, n=n, size_ratio=ratio)
         pk.pack()
         d_packed = list(pk.diameters)
-        caught = quench_quiet(pk)
+        caught = quench_quiet(pk, kappa_mult=1.01)
         check_state(pk)
         tag = f"{ndim}D walls={walls} ratio={ratio}"
         assert pk.quench_status == "converged" and pk.quench_residual <= 1e-10 and not caught, f"{tag}: {pk.quench_message}"

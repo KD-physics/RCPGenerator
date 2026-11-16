@@ -128,14 +128,39 @@ void ell_rotate_by(std::size_t Ndim, double* R, const double* w);
 void ell_rotation_step(std::size_t N, std::size_t Ndim, const double* Tq, double* m, double* v, double* Rot,
                        const double* Db, double alpha, double beta1, double beta2, double t, double epsilon);
 
-// Exact shrink-to-contact: the smallest converged s over all pairs (minimum image on periodic axes) and all
-// flat-wall contacts, or 1 if nothing overlaps. Scaling every particle by this factor leaves the tightest
-// pair exactly touching. O(N^2) with a bounding-sphere prefilter. pair_i/pair_j receive the tightest pair
-// (pair_j == N for a wall).
+// Which pairs can overlap: a grid of cells at least as wide as the largest bounding diameter. Two particles whose
+// bounding spheres overlap are less than that diameter apart on every axis (minimum image on periodic axes), so
+// they sit in the same cell or in adjacent cells: listing those cells misses no overlapping pair. The grid is the
+// routine's own (it does not use the packing loop's neighbour list), and the work grows with N instead of N^2.
+// mode: PAIRS_AUTO = the grid when it is the cheaper of the two; PAIRS_GRID = always the grid; PAIRS_ALL = every
+// pair (the reference the tests compare the grid with).
+enum { PAIRS_AUTO = -1, PAIRS_GRID = 0, PAIRS_ALL = 1 };
+class PairGrid {
+public:
+    PairGrid(std::size_t N, std::size_t n, const double* x, const double* Db, const std::vector<double>& box,
+             const std::vector<std::int8_t>& walls, int mode);
+    bool uses_grid() const { return grid_; }
+    // The particles j > i that share a cell with i or sit in an adjacent one (every j > i when no grid is used).
+    void later_neighbours(std::size_t i, std::vector<std::uint32_t>& out) const;
+private:
+    std::size_t N_ = 0, n_ = 0;
+    bool grid_ = false;
+    std::size_t ncell_[ELL_MAX_DIM] = {0}, stride_[ELL_MAX_DIM] = {0};
+    bool periodic_[ELL_MAX_DIM] = {false};
+    std::vector<std::uint32_t> cell_of_, start_, items_;
+    std::vector<std::uint32_t> coord_;      // N x n cell coordinates
+};
+
+// Exact shrink-to-contact: the smallest converged s over all pairs whose bounding spheres overlap (minimum image
+// on periodic axes) and all wall contacts, or 1 if nothing overlaps. Scaling every particle by this factor leaves
+// the tightest pair exactly touching. The pairs come from a PairGrid (mode as above). pair_i/pair_j receive the
+// tightest pair (pair_j == N for a wall).
 double ell_min_contact_scale(std::size_t N, const EllShape& sh, const double* x, const double* Db,
                              const double* Rot, const std::vector<double>& box,
                              const std::vector<std::int8_t>& walls, std::size_t& pair_i, std::size_t& pair_j,
-                             std::size_t& n_overlapping);
+                             std::size_t& n_overlapping, int mode = PAIRS_AUTO, std::vector<int>* zout = nullptr);
+// zout (optional): receives, per particle, the number of its overlapping contacts (pairs with s < 1, plus one for
+// each wall it overlaps): the particle's contact number in this configuration.
 
 // ---- diameter permutation with ellipsoids (BUILD.md section 8) -------------------------------------------------
 // The move: two particles trade places. At fixed positions, slot i and slot j exchange diameter (D and D0), shape

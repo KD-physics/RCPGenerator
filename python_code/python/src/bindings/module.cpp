@@ -226,6 +226,11 @@ rcpgenerator::PackingConfig packing_config_from_dict(const py::dict& source) {
     assign_if_present(source, "quench_stall_window", config.quench_stall_window);
     assign_if_present(source, "quench_stall_factor", config.quench_stall_factor);
     assign_if_present(source, "quench_dt_min", config.quench_dt_min);
+    assign_if_present(source, "quench_coast", config.quench_coast);
+    assign_if_present(source, "quench_aq", config.quench_aq);
+    assign_if_present(source, "quench_aq_gamma", config.quench_aq_gamma);
+    assign_if_present(source, "quench_aq_mu", config.quench_aq_mu);
+    assign_if_present(source, "rung1_extend", config.rung1_extend);
     // Ellipsoids (absent -> spheres).
     assign_if_present(source, "aspect_ratios", config.aspect_ratios);
     assign_if_present(source, "ell_iters", config.ell_iters);
@@ -364,6 +369,7 @@ py::dict packing_result_to_dict(const rcpgenerator::PackingResult& result) {
     output["quench_status"] = result.quench_status;
     output["quench_log"] = result.quench_log;
     output["quench_held_force"] = result.quench_held_force;
+    if (!result.quench_aq_log.empty()) output["quench_aq_log"] = result.quench_aq_log;   // adaptive quench only
     // Ellipsoids only: a sphere run's result dict has exactly the keys it always had.
     if (!result.aspect_ratios.empty()) output["aspect_ratios"] = result.aspect_ratios;
     if (!result.rod_length.empty()) { output["rod_length"] = result.rod_length; output["rod_radius"] = result.rod_radius; }
@@ -529,19 +535,22 @@ PYBIND11_MODULE(_rcpgenerator, m) {
 
     m.def(
         "contact_scale",
-        [](const py::dict& input_dict, const py::dict& config_dict) {
+        [](const py::dict& input_dict, const py::dict& config_dict, int pairs) {
             const auto cs = rcpgenerator::contact_scale(
-                packing_input_from_dict(input_dict), packing_config_from_dict(config_dict));
+                packing_input_from_dict(input_dict), packing_config_from_dict(config_dict), pairs);
             py::dict out;
             out["scale"] = cs.scale;
             out["pair_i"] = cs.pair_i;
             out["pair_j"] = cs.pair_j;
             out["n_overlapping"] = cs.n_overlapping;
             out["particle_volume"] = cs.particle_volume;
+            out["z"] = cs.z;
             return out;
         },
-        py::arg("input"), py::arg("config"),
-        "Exact shrink-to-contact factor of a configuration (converged contact function, all pairs).");
+        py::arg("input"), py::arg("config"), py::arg("pairs") = -1,
+        "Exact shrink-to-contact factor of a configuration (converged contact function over every pair whose "
+        "bounding spheres overlap). pairs: -1 list the pairs with a cell grid when that is cheaper (default), "
+        "0 always the grid, 1 every pair.");
 
     auto permute_out = [](const rcpgenerator::PermuteOnce& r) {
         py::dict out;

@@ -106,7 +106,7 @@ import rcpgenerator
 packing = rcpgenerator.Packing(N=1000, Ndim=5, phi=0.05, box=[1.0] * 5, walls=[1] * 5,
                                dist={"type": "powerlaw", "d_min": 1.0, "d_max": 5.0, "exponent": -3.0}, seed=1)
 packing.pack()
-packing.quench()              # above 3D the default compression is kappa_mult=1.01
+packing.quench(kappa_mult=1.01)   # the expansion that lets the packing carry load; above 3D use 1.01
 print(packing.quench_status, packing.quench_iters)
 '''),
     ]),
@@ -167,10 +167,10 @@ packing.pack()
 packed = packing.copy()                   # keep the packed state: a quench changes the packing in place
 with warnings.catch_warnings():
     warnings.simplefilter("ignore", RuntimeWarning)
-    packing.quench()                      # force AND torque balance; defaults here: kappa_mult=1.01, dt_max=0.2
+    packing.quench(kappa_mult=1.01)       # force AND torque balance; 1 % expansion; dt_max defaults to 0.2 here
     if packing.quench_status != "converged":     # retry the PACKED state: lower dt_max, or kappa_mult=1.02
         packing = packed.copy()
-        packing.quench(dt_max=0.1)
+        packing.quench(kappa_mult=1.01, dt_max=0.1)
 print(packing.quench_status, packing.quench_residual, packing.quench_iters)
 '''),
     ]),
@@ -221,10 +221,10 @@ packing.pack()
 packed = packing.copy()                   # keep the packed state: a quench changes the packing in place
 with warnings.catch_warnings():
     warnings.simplefilter("ignore", RuntimeWarning)
-    packing.quench()                      # 2D and 3D; balances slightly rounded rods (rod_round=0.01)
+    packing.quench(kappa_mult=1.01)       # 2D and 3D; balances slightly rounded rods (rod_round=0.01)
     if packing.quench_status != "converged":     # retry the PACKED state: lower dt_max, or kappa_mult=1.02
         packing = packed.copy()
-        packing.quench(dt_max=0.1)
+        packing.quench(kappa_mult=1.01, dt_max=0.1)
 print(packing.quench_status, packing.quench_residual, packing.quench_iters)
 '''),
         ("shapes_in_containers", "ellipsoids, rods in containers", '''\
@@ -429,15 +429,36 @@ import rcpgenerator
 packing = rcpgenerator.Packing(N=1000, Ndim=3, phi=0.05, box=[1.0, 1.0, 1.0], walls=[0, 0, 0],
                                dist={"type": "lognormal", "mu": 0.0, "sigma": 0.3}, seed=1)
 packing.pack()
-packing.quench()          # diameters x 1.003 once, then minimise until every net force < 1e-10 of its load
+packing.quench(kappa_mult=1.003)   # diameters x 1.003 once, then minimise until every net force < 1e-10 of its load
 print(packing.quench_status, packing.quench_residual, packing.quench_iters)
+'''),
+        ("adaptive_quench", "balance at a pressure, diameters free", '''\
+import rcpgenerator
+packing = rcpgenerator.Packing(N=1000, Ndim=3, phi=0.05, box=[1.0, 1.0, 1.0], walls=[0, 0, 0],
+                               dist={"type": "lognormal", "mu": 0.0, "sigma": 0.3}, seed=1)
+packing.pack()
+print("mu at the end of the run:", packing.mu_final)
+packing.adaptive_quench()          # the diameters follow the pressure mu (default: mu_final) until forces balance
+print(packing.quench_status, packing.quench_iters, packing.quench_global_residual)
+print(packing.phi_final, packing.phi_contact)      # the balanced state, and the same state shrunk to contact
+packing.quench(tol=1e-8)           # fixed diameters from here on: quench() never expands them unless asked
+print(packing.quench_status, packing.quench_residual)
+'''),
+        ("extend", "longer first stage, denser packing", '''\
+import rcpgenerator
+kw = dict(N=1000, Ndim=3, phi=0.05, box=[1.0, 1.0, 1.0], walls=[0, 0, 0],
+          dist={"type": "powerlaw", "d_min": 1.0, "d_max": 5.0, "exponent": -3.0}, seed=1)
+standard = rcpgenerator.Packing(**kw); standard.pack()
+longer = rcpgenerator.Packing(**kw);   longer.pack(extend=3)    # first stage three times as long, the rest unchanged
+print(standard.steps, standard.phi_contact)
+print(longer.steps, longer.phi_contact)
 '''),
         ("quench_staged", "loose pass, then tighten", '''\
 import rcpgenerator
 packing = rcpgenerator.Packing(N=1000, Ndim=3, phi=0.05, box=[1.0, 1.0, 1.0], walls=[0, 0, 0],
                                dist={"type": "lognormal", "mu": 0.0, "sigma": 0.3}, seed=1)
 packing.pack()
-packing.quench(tol=1e-4)                  # quick first pass
+packing.quench(tol=1e-4, kappa_mult=1.003)   # quick first pass (diameters x 1.003 once)
 packing.quench(tol=1e-10, resume=True)    # continue from there; resume does not rescale again
 print(packing.quench_status, packing.quench_residual)
 '''),
@@ -449,7 +470,7 @@ packing.pack()
 start = packing.copy()                    # keep the packed state: a failed quench keeps where it stopped
 with warnings.catch_warnings():
     warnings.simplefilter("ignore", RuntimeWarning)
-    packing.quench(max_iter=2000)         # deliberately too few iterations
+    packing.quench(max_iter=2000, kappa_mult=1.003)   # deliberately too few iterations
 if packing.quench_status != "converged":
     print(packing.quench_status, "-", packing.quench_message)   # the reason, and what to try
     packing.quench(resume=True)           # here: continue where it stopped
@@ -462,14 +483,14 @@ packing = rcpgenerator.Packing(N=1000, Ndim=3, phi=0.05, box=[1.0, 1.0, 1.0], wa
 packing.pack()
 x = np.asarray(packing.positions)
 bottom = np.flatnonzero(x[:, 2] < 0.1 * packing.box[2])     # indices into positions, as they are now
-packing.quench(held=bottom.tolist())       # held particles do not move; particle i keeps index i
+packing.quench(kappa_mult=1.003, held=bottom.tolist())   # held particles do not move; particle i keeps index i
 print(packing.quench_status, "net force on the held set:", packing.quench_held_force)
 '''),
         ("quench_shear", "one shear step, stress", '''\
 import numpy as np, rcpgenerator
 p = rcpgenerator.Packing(N=1000, Ndim=3, phi=0.05, box=[1.0, 1.0, 1.0], walls=[0, 0, 0],
                          dist={"type": "lognormal", "mu": 0.0, "sigma": 0.3}, seed=1)
-p.pack(); p.quench()
+p.pack(); p.quench(kappa_mult=1.003)
 x, d = np.asarray(p.positions), np.asarray(p.diameters)
 moved, fixed = np.flatnonzero(x[:, 0] < 0.1), np.flatnonzero((x[:, 0] >= 0.5) & (x[:, 0] < 0.6))  # half a box apart
 x[moved, 1] = (x[moved, 1] + 1e-5) % 1.0; p.positions = x.tolist()      # displace one slab along y
@@ -483,7 +504,7 @@ import numpy as np, rcpgenerator
 from scipy.spatial import cKDTree
 p = rcpgenerator.Packing(N=1000, Ndim=3, phi=0.05, box=[1.0, 1.0, 1.0], walls=[0, 0, 0],
                          dist={"type": "lognormal", "mu": 0.0, "sigma": 0.3}, seed=1)
-p.pack(); p.quench()
+p.pack(); p.quench(kappa_mult=1.003)
 x, d, L = np.asarray(p.positions), np.asarray(p.diameters), np.asarray(p.box)
 i, j = cKDTree(x, boxsize=L).query_pairs(d.max(), output_type="ndarray").T   # periodic box only
 dx = x[j] - x[i]; dx -= np.round(dx / L) * L; r = np.linalg.norm(dx, axis=1)

@@ -55,7 +55,7 @@ jobs:
         working-directory: python_code/python
         run: |
           python -m pip install "matplotlib>=3.10" "numpy>=1.23" "pandas>=1.5" "scipy>=1.9"
-          python -m pip install --no-index --find-links wheelhouse --no-deps "rcpgenerator==1.2.0"
+          python -m pip install --no-index --find-links wheelhouse --no-deps "rcpgenerator==1.2.1"
 
       - name: Run installed-wheel platform tests outside source tree
         working-directory: ${{ runner.temp }}

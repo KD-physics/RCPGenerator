@@ -1348,9 +1348,12 @@ void rod_forces(const std::uint32_t* pairs_data, const std::uint64_t* pair_offse
 double rod_min_contact_scale(std::size_t N, const EllShape& sh, const double* x, const double* Db,
                              const double* Rot, const std::vector<double>& box,
                              const std::vector<std::int8_t>& walls, std::size_t& pair_i, std::size_t& pair_j,
-                             std::size_t& n_overlapping) {
+                             std::size_t& n_overlapping, int mode, std::vector<int>* zout) {
     const std::size_t n = sh.Ndim, nn = n * n;
     const int kind = sh.kind;
+    if (zout) zout->assign(N, 0);
+    const PairGrid grid(N, n, x, Db, box, walls, mode);
+    std::vector<std::uint32_t> later;
     double inv_box[MD] = {0.0};
     for (std::size_t d = 0; d < n; ++d) inv_box[d] = walls[d] == 0 ? 1.0 / box[d] : 0.0;
     std::vector<double> axis(N * n), hl(N), rad(N);
@@ -1362,7 +1365,9 @@ double rod_min_contact_scale(std::size_t N, const EllShape& sh, const double* x,
     double best = 1.0;
     std::size_t bi = N, bj = N, nover = 0;
     for (std::size_t i = 0; i < N; ++i) {
-        for (std::size_t j = i + 1; j < N; ++j) {
+        grid.later_neighbours(i, later);
+        for (const std::uint32_t j32 : later) {
+            const std::size_t j = j32;
             const double rb = 0.5 * (Db[i] + Db[j]);
             double r[MD], d2 = 0.0;
             for (std::size_t d = 0; d < n; ++d) {
@@ -1372,14 +1377,14 @@ double rod_min_contact_scale(std::size_t N, const EllShape& sh, const double* x,
             }
             if (!(d2 < rb * rb)) continue;
             const double s = rod_pair_scale_exact(n, kind, r, axis.data() + i * n, hl[i], rad[i], axis.data() + j * n, hl[j], rad[j]);
-            if (s < 1.0) { ++nover; if (s < best) { best = s; bi = i; bj = j; } }
+            if (s < 1.0) { ++nover; if (zout) { ++(*zout)[i]; ++(*zout)[j]; } if (s < best || (s == best && i == bi && j < bj)) { best = s; bi = i; bj = j; } }
         }
         for (std::size_t d = 0; d < n; ++d) {
             if (walls[d] != 1) continue;
             const double h = rod_half_width(n, kind, Rot + i * nn, hl[i], rad[i], d);
             for (std::size_t wall = 0; wall < 2; ++wall) {
                 const double dist = std::abs(box[d] * static_cast<double>(wall) - x[i * n + d]);
-                if (dist < h) { ++nover; const double s = dist / h; if (s < best) { best = s; bi = i; bj = N; } }
+                if (dist < h) { ++nover; if (zout) ++(*zout)[i]; const double s = dist / h; if (s < best) { best = s; bi = i; bj = N; } }
             }
         }
         if (walls[0] < 0) {   // curved container: the factor that brings the farthest point back onto the wall
@@ -1388,7 +1393,7 @@ double rod_min_contact_scale(std::size_t N, const EllShape& sh, const double* x,
             double xc[MD];
             for (std::size_t k = 0; k < n; ++k) xc[k] = k < t ? x[i * n + k] - Rc : 0.0;
             const double s = rod_wall_scale(n, t, kind, axis.data() + i * n, hl[i], rad[i], xc, Rc, 1.0);
-            if (s < 1.0) { ++nover; if (s < best) { best = s; bi = i; bj = N; } }
+            if (s < 1.0) { ++nover; if (zout) ++(*zout)[i]; if (s < best) { best = s; bi = i; bj = N; } }
         }
     }
     pair_i = bi; pair_j = bj; n_overlapping = nover;

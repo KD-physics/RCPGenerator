@@ -1,6 +1,6 @@
 """Quench to force balance on a 3-D power-law packing.
 
-1. Pack (with diameter permutation on) and quench the result at the default settings.
+1. Pack (with diameter permutation on) and quench the result (diameters x 1.003, otherwise default settings).
 2. Quench the same packed state in two stages: a loose tolerance first, then
    resume=True with a tight one.
 3. One quasi-static shear step: displace a slab of particles, hold it and a second slab
@@ -92,8 +92,8 @@ def run_case(verbose: bool = False) -> dict[str, object]:
     packing.pack()
     packed = packing.copy()                       # keep the packed state for the other demonstrations
 
-    # 1. default quench: diameters x 1.003 once, then FIRE to a residual of 1e-10
-    packing.quench()
+    # 1. standard quench: diameters x 1.003 once (kappa_mult; not applied unless passed), then FIRE to a residual of 1e-10
+    packing.quench(kappa_mult=1.003)
     report("default quench", packing)
     if verbose:
         print("   ", packing.quench_message)
@@ -102,7 +102,7 @@ def run_case(verbose: bool = False) -> dict[str, object]:
     staged = packed.copy()
     with warnings.catch_warnings():
         warnings.simplefilter("ignore", RuntimeWarning)   # stage 1 may stop early; we continue below
-        staged.quench(tol=1e-4)
+        staged.quench(tol=1e-4, kappa_mult=1.003)
     report("stage 1 (tol 1e-4)", staged)
     staged.quench(tol=1e-10, resume=True)
     report("stage 2 (tol 1e-10, resume)", staged)

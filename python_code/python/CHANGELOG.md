@@ -1,5 +1,52 @@
 # Changelog
 
+## 1.2.1
+
+### New
+- **`extend`**: `Packing(extend=x)` or `pack(extend=x)` lengthens the first stage of a run (the stage at the starting
+  pressure `mu`) by the factor `x` and leaves the rest of the run as it is. A longer first stage gives a denser
+  packing: 5,000 spheres with a size ratio of 10 reach `phi_contact` 0.7372 in 17,821 steps without it, 0.7405 in
+  32,145 steps with `extend=3`, 0.7426 in 67,843 steps with `extend=8.04`. Not set: the run is unchanged.
+- **`adaptive_quench(mu=..., tol=..., max_iter=...)`**: force balance with the diameters free. One common scale
+  factor on all diameters follows the pressure term `mu` until the contact forces carry it. Default `mu`: the new
+  attribute `mu_final`, the value the packing run ended on. Spheres only. README, "Adaptive quench".
+- `mu_final`: the `mu` a run ended on. `to_dict()` has one more `final_result` key for it.
+- **Contact numbers**: `z` (contacts per particle, in the order of `positions`; a wall the particle touches counts
+  as one), `z_mean`, `n_rattlers` (fewer than `Ndim + 1` contacts) and `z_mean_no_rattlers`. Filled by `pack()`,
+  `quench()` and `adaptive_quench()` and on loading a packed state, for every shape (`None` for spheres above 8
+  dimensions). They are counted in the pass that computes `phi_contact`, at no extra cost. Not saved by `to_dict()`.
+- **Spheres get `phi_contact` and `shrink_factor` too**: `pack()` fills them for every shape (`None` for spheres
+  above 8 dimensions); `phi_final` is unchanged. A sphere `to_dict()` therefore has two more `final_result` keys.
+- The exact shrink behind them examines only pairs that can overlap (a cell grid) instead of every pair, with the
+  same result bit for bit: 2.5 s for 200,000 equal spheres on one thread.
+- `quench(coast=...)` and `adaptive_quench(coast=...)`: whether a particle that loses its last contact keeps its
+  velocity (see "Changed: quench").
+- `rcpgenerator.example()`: snippets `adaptive_quench` and `extend`.
+
+### Changed: quench
+- **`quench()` no longer expands the diameters by default.** `kappa_mult` now defaults to `1.0`; 1.1.0 and 1.2.0
+  used 1.003 (spheres in 2D and 3D) or 1.01 (4D and above, ellipsoids, rods). Pass the value to get the former
+  behaviour: `quench(kappa_mult=1.003)`. Reason: `quench()` is also the step that restores balance after each change
+  to a packing (particles moved or held, a shear step), and repeated calls must not grow the diameters. A packing
+  straight from `pack()` quenched without an expansion usually ends as `"unjammed"`; the message says what to pass.
+- **Coasting, on by default for spheres.** During a quench a particle that loses its last contact used to stop where
+  the contact ended; it now keeps its velocity until the minimiser next resets. Sphere quenches therefore take a
+  different path than before and usually fewer iterations (11 of 12 packings measured; two that gave up without it
+  converged). `quench(coast=False)` is the former behaviour, bit for bit. For ellipsoids and rods the default is
+  off (no gain measured), so their quench results are unchanged.
+
+### Changed: speed presets
+The environment variable `RCP_SPEED` now changes only the length of the first stage: `immediate` is `extend=0.5`,
+`quick` (the default) is unchanged, `patient` is `extend=4`, `forever` is `extend=10`. Before, the three non-default
+presets also changed the number and length of the later cycles; runs with those presets give different results now.
+Runs with the default preset are not affected.
+
+### Changed: loading saved states
+`Packing.from_dict()` gives a loaded state every attribute a freshly built packing has. A state saved by an earlier
+version gets `phi_contact`, `shrink_factor` and the contact numbers computed on loading; `mu_final` is `None` for
+it. `copy()` goes through the same path, so a copy now also has the history and diagnostic attributes (empty) that
+it lacked before.
+
 ## 1.2.0
 
 ### New
