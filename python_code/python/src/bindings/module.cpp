@@ -231,6 +231,9 @@ rcpgenerator::PackingConfig packing_config_from_dict(const py::dict& source) {
     assign_if_present(source, "quench_aq_gamma", config.quench_aq_gamma);
     assign_if_present(source, "quench_aq_mu", config.quench_aq_mu);
     assign_if_present(source, "rung1_extend", config.rung1_extend);
+    assign_if_present(source, "mu_boost_scale", config.mu_boost_scale);
+    assign_if_present(source, "mu_plateau_scale", config.mu_plateau_scale);
+    assign_if_present(source, "mu_end_scale", config.mu_end_scale);
     // Ellipsoids (absent -> spheres).
     assign_if_present(source, "aspect_ratios", config.aspect_ratios);
     assign_if_present(source, "ell_iters", config.ell_iters);

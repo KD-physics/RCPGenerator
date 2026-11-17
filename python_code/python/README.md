@@ -341,6 +341,30 @@ The environment variable `RCP_SPEED` selects the same thing by name when `extend
 `forever` is `extend=10`. An explicit `extend` takes precedence. (In 1.0.0 and 1.1.0 `immediate`,
 `patient` and `forever` also changed the second part of the run; they no longer do.)
 
+#### Developer settings: the three `mu` levels
+
+These are tools for studying the packing schedule, not settings a user of the package needs. They are constructor
+keywords only (and attributes); `pack()` does not take them and the built-in examples do not use them. Each is a
+scale factor, 1 by default; each acts on its own stage of the run and leaves the other two stages at their
+standard values; with all three at 1 the run is the standard one, bit for bit. The number of steps in each stage
+does not change.
+
+| Keyword | Stage it scales | Standard value of that stage |
+| --- | --- | --- |
+| `mu_boost_scale` | The extra push at the very start, which decays within about 2,000 steps. `0` removes it. | `mu` starts at 1.25e-3 (the plateau plus a push of 1.0e-3) |
+| `mu_plateau_scale` | The `mu` held through the first stage (the stage `extend` lengthens). | 2.5e-4 |
+| `mu_end_scale` | The levels after the first stage: the value `mu` is first lowered to, and the floor the later oscillation decays toward. | 2.5e-5 and 2.5e-6 |
+
+```python
+packing = rcpgenerator.Packing(N=2000, Ndim=3, box=[1.0, 1.0, 1.0], walls=[0, 0, 0], mu_plateau_scale=0.8)
+packing.pack()            # first stage at 2.0e-4 instead of 2.5e-4; start push and later levels unchanged
+```
+
+The standard values were tuned together, so a changed level is an experiment, not an improvement to expect. The
+applied `mu` of every step can be read back with `Packing(..., record_visibility=1)` and `packing.mu_eff_history`.
+With `mu_end_scale` above `10 * mu_plateau_scale` the level after the first stage would lie above the plateau; `mu`
+then steps up to it at the end of the first stage.
+
 ### `Packing.relax()`
 
 `relax()` runs the current realized state with explicit step and growth

@@ -128,7 +128,10 @@ class Packing:
         "swap_event_log_stride": 0, "swap_event_log_cap": 1000000, "swap_event_log_geom": 0,
         "swap_sweeps_off": 0, "swap_inject": [],
     }
-    _PACK_KEYS = {"box", "walls", "neighbor_max", "seed", "fix_height", "extend"} | set(_ELL_DEFAULTS) | set(_SWAP_DEFAULTS) | set(_PERMUTE_DEFAULTS) | set(_MORPH_DEFAULTS) | set(_QUENCH_DEFAULTS)
+    # Developer settings (README, "Developer settings"): scale factors on the three mu levels of the packing schedule.
+    # Each is 1.0 unless set, and travels in the pack config only when it is not 1.0.
+    _DEV_SCALES = ("mu_boost_scale", "mu_plateau_scale", "mu_end_scale")
+    _PACK_KEYS = {"box", "walls", "neighbor_max", "seed", "fix_height", "extend"} | set(_DEV_SCALES) | set(_ELL_DEFAULTS) | set(_SWAP_DEFAULTS) | set(_PERMUTE_DEFAULTS) | set(_MORPH_DEFAULTS) | set(_QUENCH_DEFAULTS)
     _REALIZED_STATE_KEYS = {"positions", "diameters", "orientations"}
     # Diagnostics that only a run sets (in _apply_packing_result). from_dict gives a loaded state the same
     # attributes with these empty values, so code written for a freshly packed object works on a loaded one.
@@ -173,6 +176,8 @@ class Packing:
         obj.neighbor_max = pack_config.get("neighbor_max", 0)
         obj.seed = pack_config.get("seed", 0)
         obj.extend = cls._checked_extend(pack_config.get("extend"))
+        for k in cls._DEV_SCALES:
+            setattr(obj, k, cls._checked_scale(k, pack_config.get(k, 1.0)))
         obj._init_extension_state(pack_config, consume=False)
         obj._init_ellipsoid_state(init_config.get("aspect_ratios", pack_config.get("aspect_ratios", [])),
                                   pack_config)
@@ -261,6 +266,8 @@ class Packing:
         self.neighbor_max = kwargs.pop("neighbor_max", 0)
         self.seed = kwargs.pop("seed", 0)
         self.extend = self._checked_extend(kwargs.pop("extend", None))
+        for k in self._DEV_SCALES:
+            setattr(self, k, self._checked_scale(k, kwargs.pop(k, 1.0)))
         self._init_extension_state(kwargs, consume=True)
         self._init_ellipsoid_state(kwargs.pop("aspect_ratios", None),
                                    {k: kwargs.pop(k) for k in list(self._ELL_DEFAULTS) if k in kwargs})
@@ -513,6 +520,13 @@ class Packing:
                              "of the packing run is lengthened (1 = the standard length)")
         return v
 
+    @staticmethod
+    def _checked_scale(name, value):
+        v = float(value)
+        if not (v >= 0.0) or v > 1000.0 or (v == 0.0 and name != "mu_boost_scale"):
+            raise ValueError(f"{name} must be a positive number (at most 1000); mu_boost_scale may be 0 (no boost)")
+        return v
+
     def shrink_to_contact(self) -> dict[str, Any]:
         """Exact shrink-to-contact of the current configuration (spheres, ellipsoids or rods; periodic boxes, flat
         walls and curved containers).
@@ -620,6 +634,8 @@ class Packing:
     def __setattr__(self, name: str, value: Any) -> None:
         if name == "extend":   # checked before it is stored: a refused value leaves the setting as it was
             value = self._checked_extend(value)
+        elif name in self._DEV_SCALES:
+            value = self._checked_scale(name, value)
         object.__setattr__(self, name, value)
         if name.startswith("_"):
             return
@@ -691,6 +707,9 @@ class Packing:
             **{k: deepcopy(getattr(self, k)) for k in self._MORPH_DEFAULTS},
             **{k: deepcopy(getattr(self, k)) for k in self._QUENCH_DEFAULTS},
         }
+        for k in self._DEV_SCALES:   # developer scales: only when not 1
+            if float(getattr(self, k, 1.0)) != 1.0:
+                cfg[k] = float(getattr(self, k))
         if getattr(self, "extend", None) is not None:   # only when set: a pack config without it is what it always was
             cfg["extend"] = float(self.extend)
             if translate:

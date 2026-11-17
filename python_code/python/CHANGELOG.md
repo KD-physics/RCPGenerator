@@ -26,6 +26,9 @@
 - `quench(coast=...)` and `adaptive_quench(coast=...)`: whether a particle that loses its last contact keeps its
   velocity (see "Changed: quench").
 - `rcpgenerator.example()`: snippets `adaptive_quench` and `extend`.
+- Developer settings, not part of the user-facing interface: `mu_boost_scale`, `mu_plateau_scale`, `mu_end_scale`
+  (constructor keywords; each scales one stage of the `mu` schedule of a packing run; all 1 by default, which is
+  the standard run bit for bit). README, "Developer settings".
 
 ### Changed: quench
 - **`quench()` no longer expands the diameters by default.** `kappa_mult` now defaults to `1.0`; 1.1.0 and 1.2.0

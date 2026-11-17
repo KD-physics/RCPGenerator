@@ -87,6 +87,13 @@ struct PackingConfig {
     // the lengths of a standard run. 0 = not set: the RCP_SPEED preset decides (immediate 0.5, quick 1, patient 4,
     // forever 10). Python: Packing(extend=...) / pack(extend=...).
     double rung1_extend = 0.0;
+    // Developer settings (not part of the user-facing API): scale factors on the three mu levels of the packing
+    // schedule, each acting on its own stage and leaving the other two at their standard absolute values. All 1:
+    // the standard run, bit for bit.
+    //   mu_boost_scale    the extra push at the start (standard: 4 x 2.5e-4, decaying with time constant 350 steps)
+    //   mu_plateau_scale  the mu held through rung 1 (standard 2.5e-4)
+    //   mu_end_scale      the levels after rung 1 (standard 2.5e-5 after the first lowering, 2.5e-6 as the floor)
+    double mu_boost_scale = 1.0, mu_plateau_scale = 1.0, mu_end_scale = 1.0;
     int    record_visibility = 0;        // 1: per-step visibility P(z>=1) and mu_eff histories
     // ---- visibility controller prototype (stage 2b Part 5 [log 073]; labeled, default off) ----
     // Rides on the mu_hold window: within [mu_hold_start, +mu_hold_steps) the

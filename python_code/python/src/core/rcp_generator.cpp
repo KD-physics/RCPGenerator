@@ -5778,6 +5778,10 @@ std::pair<PackingResult, PackingTrace> run_packing_observed(
         return (v > 0.0) ? v : 2.5e-4;
     }();
     double mu = options.has_mu_override ? options.mu_override : initial_mu_default;
+    // developer scales of the schedule's mu levels (PackingConfig::mu_*_scale); all 1 leaves every line below as it was
+    const bool mu_scaled = config.mu_boost_scale != 1.0 || config.mu_plateau_scale != 1.0 || config.mu_end_scale != 1.0;
+    const double mu_plateau_base = mu;                     // the unscaled plateau: the boost and the end levels refer to it
+    if (config.mu_plateau_scale != 1.0 && config.mu_plateau_scale > 0.0) mu *= config.mu_plateau_scale;
     const double mu1_ref = mu;                 // mu-hold reference (rung-1 mu) [log 071]
     long mu_hold_applied = 0;
     double mu_ctrl_mult = config.mu_hold_mult;  // visibility controller state [log 073]
@@ -7574,6 +7578,8 @@ std::pair<PackingResult, PackingTrace> run_packing_observed(
                 // normal convergence runs for ALL modes; mode-3 bneck now engages at the
                 // CONVERGED terminal via the reopen hook below (variant B, user [latest]).
                 mu_decay_target = mu / 10.0;
+                // scaled: the level after rung 1 is its standard absolute value times mu_end_scale, whatever the plateau was
+                if (mu_scaled) mu_decay_target = mu_plateau_base / 10.0 * config.mu_end_scale;
                 mu_decay_active = true;
                 mu_decay_next_tick_step = step + mu_decay_cooldown;
                 alpha /= 2.0;
@@ -7898,9 +7904,13 @@ std::pair<PackingResult, PackingTrace> run_packing_observed(
             mu_pinned ? config.mu_pin :             // [219] absolute mu pin
             mu_hold_now ? mu_hold_mult_now * mu1_ref :
             (mu_flag == 1 && rcp_mu1_boost() > 1.0)
-            ? mu * (1.0 + (rcp_mu1_boost() - 1.0) *
+            ? (mu_scaled
+               // scaled: the push is its standard absolute size times mu_boost_scale, added to the (scaled) plateau
+               ? mu + config.mu_boost_scale * mu_plateau_base * (rcp_mu1_boost() - 1.0) *
+                          std::exp(-static_cast<double>(step) / rcp_mu1_boost_tau())
+               : mu * (1.0 + (rcp_mu1_boost() - 1.0) *
                           std::exp(-static_cast<double>(step) /
-                                   rcp_mu1_boost_tau()))
+                                   rcp_mu1_boost_tau())))
             : mu;
         if (mu_hold_now) ++mu_hold_applied;
         // Cascade: per-particle kappa-radius (fixed -> 0, excluded from dkappa) and
