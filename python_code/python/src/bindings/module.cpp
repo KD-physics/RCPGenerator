@@ -4,6 +4,7 @@
 #include "rcpgenerator/rod.hpp"
 #include "rcpgenerator/curved_wall.hpp"
 
+#include "rcpgenerator/dev_switches.hpp"
 #include <cstdint>
 #include <stdexcept>
 #include <string>
@@ -234,6 +235,39 @@ rcpgenerator::PackingConfig packing_config_from_dict(const py::dict& source) {
     assign_if_present(source, "mu_boost_scale", config.mu_boost_scale);
     assign_if_present(source, "mu_plateau_scale", config.mu_plateau_scale);
     assign_if_present(source, "mu_end_scale", config.mu_end_scale);
+    assign_if_present(source, "adam_alpha_mode", config.adam_alpha_mode);
+    assign_if_present(source, "adam_alpha_a", config.adam_alpha_a);
+    assign_if_present(source, "adam_alpha_b", config.adam_alpha_b);
+    assign_if_present(source, "adam_alpha_c", config.adam_alpha_c);
+    assign_if_present(source, "adam_mu_end", config.adam_mu_end);
+    assign_if_present(source, "adam_beta2", config.adam_beta2);
+    assign_if_present(source, "adam_cool_q", config.adam_cool_q);
+    assign_if_present(source, "quench_local", config.quench_local);
+    assign_if_present(source, "adam_bridge_steps", config.adam_bridge_steps);
+    assign_if_present(source, "adam_bridge_ramp", config.adam_bridge_ramp);
+    assign_if_present(source, "adam_bridge_mu", config.adam_bridge_mu);
+    assign_if_present(source, "adam_bridge_c", config.adam_bridge_c);
+    assign_if_present(source, "adam_bridge_alpha", config.adam_bridge_alpha);
+    assign_if_present(source, "adam_bridge_kalpha", config.adam_bridge_kalpha);
+    assign_if_present(source, "adam_settle_steps", config.adam_settle_steps);
+    assign_if_present(source, "adam_settle_eps", config.adam_settle_eps);
+    assign_if_present(source, "adam_settle_alpha", config.adam_settle_alpha);
+    assign_if_present(source, "adam_settle_mu", config.adam_settle_mu);
+    assign_if_present(source, "adam_settle_fix", config.adam_settle_fix);
+    assign_if_present(source, "adam_hold_steps", config.adam_hold_steps);
+    assign_if_present(source, "adam_cool_steps", config.adam_cool_steps);
+    assign_if_present(source, "sched_osc_cycles", config.sched_osc_cycles);
+    assign_if_present(source, "sched_decay_cooldown", config.sched_decay_cooldown);
+    assign_if_present(source, "sched_decay_factor", config.sched_decay_factor);
+    assign_if_present(source, "adam_beta2_cool", config.adam_beta2_cool);
+    assign_if_present(source, "adam_cool_reset", config.adam_cool_reset);
+    assign_if_present(source, "adam_alpha_gain", config.adam_alpha_gain);
+    assign_if_present(source, "adam_ref_plateau", config.adam_ref_plateau);
+    assign_if_present(source, "adam_mu_swing", config.adam_mu_swing);
+    assign_if_present(source, "adam_mu_cycles", config.adam_mu_cycles);
+    assign_if_present(source, "adam_anneal_steps", config.adam_anneal_steps);
+    assign_if_present(source, "adam_anneal_ctrl", config.adam_anneal_ctrl);
+    assign_if_present(source, "adam_e_end", config.adam_e_end);
     // Ellipsoids (absent -> spheres).
     assign_if_present(source, "aspect_ratios", config.aspect_ratios);
     assign_if_present(source, "ell_iters", config.ell_iters);
@@ -418,6 +452,8 @@ py::dict packing_trace_to_dict(const rcpgenerator::PackingTrace& trace) {
 }  // namespace
 
 PYBIND11_MODULE(_rcpgenerator, m) {
+    m.attr("DEV_BUILD") = rcpgenerator::rcp_dev_build();   // true only when compiled with -DRCP_DEV_SWITCHES=ON
+
     m.doc() = "Thin pybind11 bindings for rcpgenerator";
 
     // Default to single-threaded so behavior matches the legacy serial build
@@ -558,6 +594,31 @@ PYBIND11_MODULE(_rcpgenerator, m) {
         "Exact shrink-to-contact factor of a configuration (converged contact function over every pair whose "
         "bounding spheres overlap). pairs: -1 list the pairs with a cell grid when that is cheaper (default), "
         "0 always the grid, 1 every pair.");
+
+    m.def(
+        "contact_stress",
+        [](const py::dict& input_dict, const py::dict& config_dict, bool pairs) {
+            const auto cs = rcpgenerator::contact_stress(packing_input_from_dict(input_dict), packing_config_from_dict(config_dict), pairs);
+            py::dict out;
+            out["particle_virial"] = cs.particle_virial;
+            out["tensor"] = cs.tensor;
+            out["virial"] = cs.virial;
+            out["volume"] = cs.volume;
+            out["wall_dim"] = cs.wall_dim;
+            out["wall_side"] = cs.wall_side;
+            out["wall_force"] = cs.wall_force;
+            out["wall_area"] = cs.wall_area;
+            out["z"] = cs.z;
+            if (pairs) {
+                out["pair_i"] = cs.pair_i;
+                out["pair_j"] = cs.pair_j;
+                out["bounding"] = cs.bounding;
+            }
+            return out;
+        },
+        py::arg("input"), py::arg("config"), py::arg("pairs") = false,
+        "Contact stress of a configuration at fixed sizes: per-particle virial, the tensor sum, volume, and the "
+        "normal force and area of every boundary.");
 
     auto permute_out = [](const rcpgenerator::PermuteOnce& r) {
         py::dict out;

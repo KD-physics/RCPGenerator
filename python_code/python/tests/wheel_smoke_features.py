@@ -164,6 +164,49 @@ def main() -> None:
         ).pack()
     assert any("periodic box is small" in str(item.message) for item in caught)
 
+    # After 1.2.0, second part: lr_method, pack(jam=...), pressure and stress, the Hessian check, and the build itself.
+    # A wheel must not contain the developer switches (CMake option RCP_DEV_SWITCHES, off by default).
+    import os
+    if not os.environ.get("RCP_ALLOW_DEV_BUILD"):
+        assert rcpgenerator._rcpgenerator.DEV_BUILD is False, "this build has the developer switches compiled in"
+        try:
+            rcpgenerator.Packing(N=10, Ndim=2, adam_alpha_mode=5)
+        except TypeError:
+            pass
+        else:
+            raise AssertionError("a developer keyword must be refused by a normal build")
+    spec = dict(N=300, Ndim=3, box=[1.0] * 3, walls=[0, 0, 1], seed=3,
+                dist={"type": "bidisperse", "d_small": 1.0, "d_large": 1.4, "fraction_small": 0.5})
+    default = rcpgenerator.Packing(**spec)
+    default.pack()
+    named = rcpgenerator.Packing(lr_method="bounded_feedback", **spec)
+    named.pack()
+    assert named.positions == default.positions and named.diameters == default.diameters   # the default by its name
+    active = rcpgenerator.Packing(lr_method="highly_active", **spec)
+    active.pack(jam=5e-4)                                   # no warning suppressed: the quench must converge
+    assert active.lr_method == "highly_active" and active.quench_status == "converged"
+    assert active.positions != default.positions and 0.5 < active.phi_contact < 0.7
+    n = 3
+    assert active.pressure > 0.0 and len(active.particle_virial) == spec["N"] and min(active.particle_virial) >= 0.0
+    assert abs(sum(active.particle_virial) / (n * active.stress_volume) / active.pressure - 1.0) < 1e-12
+    assert abs(sum(active.stress[d][d] for d in range(n)) / n / active.pressure - 1.0) < 1e-12
+    assert active.boundaries == [(2, 0), (2, 1)]            # the two walls of the third axis
+    for wall_pressure in active.boundary_pressure:           # momentum balance: wall pressure = normal stress
+        assert abs(wall_pressure / active.stress[2][2] - 1.0) < 1e-6
+    values = active.eigenvalues()                            # built at the end of the quench; all eigenvalues
+    check = active.jam_check
+    assert len(values) == n * spec["N"] and check["jammed"] and check["n_negative_held"] == 0
+    assert check["n_zero_held"] == check["n_zero_allowed"] == 2      # translations along the two periodic axes
+    assert check["n_held"] + check["n_rattlers"] == spec["N"]
+    matrix = active.hessian()
+    assert matrix.shape == (n * spec["N"], n * spec["N"]) and matrix.nnz > 0
+    reloaded = rcpgenerator.Packing.from_dict(active.to_dict())
+    assert reloaded.lr_method == "highly_active" and abs(reloaded.pressure / active.pressure - 1.0) < 1e-9
+    permuted = rcpgenerator.Packing(N=400, Ndim=3, box=[1.0] * 3, walls=[0] * 3, seed=5, lr_method="highly_active", diameter_permute=True,
+                                    dist={"type": "powerlaw", "d_min": 1.0, "d_max": 3.0, "exponent": -3.0})
+    permuted.pack()
+    assert permuted.permute_exchanges > 0
+
     print("rcpgenerator feature smoke OK")
 
 

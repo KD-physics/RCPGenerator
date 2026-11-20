@@ -4,7 +4,7 @@ build-backend = "scikit_build_core.build"
 
 [project]
 name = "rcpgenerator"
-version = "1.2.2"
+version = "1.3.0"
 description = "Fast random close packing generator for polydisperse spheres, ellipsoids, and rods in N dimensions"
 readme = "README.md"
 authors = [

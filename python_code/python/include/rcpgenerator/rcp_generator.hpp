@@ -94,6 +94,69 @@ struct PackingConfig {
     //   mu_plateau_scale  the mu held through rung 1 (standard 2.5e-4)
     //   mu_end_scale      the levels after rung 1 (standard 2.5e-5 after the first lowering, 2.5e-6 as the floor)
     double mu_boost_scale = 1.0, mu_plateau_scale = 1.0, mu_end_scale = 1.0;
+    // ---- study of section 14 (branch fast-adam): Adam's step size in rung 1, after step 2500. Off (0) by default. ----
+    //   1: fixed at adam_alpha_a.   2: lowered geometrically from adam_alpha_a to adam_alpha_b over rung 1.
+    //   3: adam_alpha_a x (step / 2500)^(-adam_alpha_b).
+    // The standard feedback (grow every step, cut by 1.5 when phi falls, floor alpha_max / 10) is bypassed in rung 1.
+    //   4: held at adam_alpha_a for the first adam_alpha_c (a fraction) of rung 1, then lowered geometrically to
+    //      adam_alpha_b by the end of rung 1.
+    //   5: CONTROLLED. For the first adam_alpha_c of rung 1 the step size is steered so that the packing is held
+    //      expanded by the linear fraction adam_alpha_a relative to the densest state seen so far (raw phi held at
+    //      (1 - adam_alpha_a)^Ndim of its running maximum); then it is lowered geometrically by the factor
+    //      adam_alpha_b by the end of rung 1. No step size is prescribed.
+    int    adam_alpha_mode = 0;
+    double adam_alpha_a = 0.0, adam_alpha_b = 0.0, adam_alpha_c = 0.0;
+    //   6: BUDGET RUN. Needs mu_pin > 0 (the hot pressure; it suspends the standard schedule) and max_steps = T (the
+    //      whole run). From step 1000 to adam_alpha_c x T the expansion controller of mode 5 (expansion adam_alpha_a)
+    //      at the pressure mu_pin; then, to step T, the step size falls geometrically by the factor adam_alpha_b and mu
+    //      falls geometrically from mu_pin to adam_mu_end. The run ends at T.
+    double adam_mu_end = 0.0;
+    // Adam's own memory (study): adam_beta2 > 0 replaces the second-moment constant (0.999) for the whole run;
+    // adam_beta2_cool > 0 replaces it from the start of the cooling of modes 4 to 6; adam_cool_reset = 1 clears both
+    // moments (positions, rotations, size scale) and restarts the bias correction at the start of that cooling.
+    // mode 5 in steps (the fluid engine): > 0 = the hold lasts adam_hold_steps from the controller's start and the
+    // cooling adam_cool_steps after it; rung 1 ends there, whatever the standard deadline and `extend` say.
+    long   adam_hold_steps = 0, adam_cool_steps = 0;
+    // schedule after rung 1, when set (the fluid engine; otherwise the environment or the standard values decide):
+    int    sched_osc_cycles = -1;        // >= 0: number of oscillation cycles (0: none)
+    long   sched_decay_cooldown = 0;     // > 0: steps between two lowerings of mu (standard 250)
+    double sched_decay_factor = 0.0;     // in (0, 1): factor of one lowering (standard 0.85)
+    // SETTLE stage (study of section 14, part 3): when the run would stop, continue for adam_settle_steps with mu held
+    // (at adam_settle_mu if > 0), Adam's step size fixed at adam_settle_alpha and Adam's small constant epsilon raised
+    // to adam_settle_eps. Once the gradients are below epsilon a step is (alpha / epsilon) x the smoothed gradient:
+    // momentum gradient descent, which converges to force balance instead of jittering. adam_settle_fix = 1 freezes
+    // the size scale at its current value during the settle (a jammed state at fixed sizes).
+    long   adam_settle_steps = 0;
+    double adam_settle_eps = 0.0, adam_settle_alpha = 0.0, adam_settle_mu = 0.0;
+    int    adam_settle_fix = 0;
+    // BRIDGE stage (study of section 14, part 3): when rung 1 ends, do not release mu; ramp it geometrically over
+    // adam_bridge_ramp steps to adam_bridge_mu, hold it there, and stop adam_bridge_steps after rung 1's end. Adam's
+    // step size during the bridge: adam_bridge_c > 0: c x the mean net force per particle (the step dies away as
+    // the forces balance), never above its value at the bridge's start; else adam_bridge_alpha > 0: fixed; else the
+    // standard feedback. adam_bridge_kalpha > 0: the size scale keeps this step size of its own.
+    long   adam_bridge_steps = 0, adam_bridge_ramp = 500;
+    double adam_bridge_mu = 0.0, adam_bridge_c = 0.0, adam_bridge_alpha = 0.0, adam_bridge_kalpha = 0.0;
+    // study (section 14, part 3): FIRE's restart made local. 0: standard (when the total power F.v is not positive,
+    // every velocity is set to zero). 1: on that event the time step is still halved, but only the particles moving
+    // against their own force are stopped. 2: as 1, and such particles are stopped at every iteration.
+    int    quench_local = 0;
+    double adam_cool_q = 1.0;   // mode 5: fraction of the cooling over which the step size falls; the rest is held at its end value
+    double adam_beta2 = 0.0, adam_beta2_cool = 0.0;
+    int    adam_cool_reset = 0;
+    double adam_alpha_gain = 0.01;   // modes 5 and 6: the controller's gain (per step, per unit of relative phi error)
+    // mode 6 only: 1 = the controller starts once phi has stopped rising (rise over the last 250 steps under 0.1 %),
+    // and its reference (the densest smoothed phi) is frozen at that moment. 0 = start at step 1000, reference = running max.
+    int    adam_ref_plateau = 0;
+    // mode 6 only: during the anneal mu = (falling level) x adam_mu_swing^(0.5 (1 - cos(2 pi k f))), k = adam_mu_cycles
+    // whole cycles over the anneal (f from 0 to 1): k pressure swings up to adam_mu_swing x the level. 1 or 0 cycles = off.
+    double adam_mu_swing = 1.0;
+    int    adam_mu_cycles = 0;
+    // mode 6: 1 = during the anneal the controller stays on and its target expansion is ramped linearly from
+    //    adam_alpha_a to adam_e_end (negative: denser than the reference, so the step size falls by itself as the
+    //    packing jams). Replaces the geometric fall of the step size (adam_alpha_b is then unused).
+    int    adam_anneal_ctrl = 0;
+    double adam_e_end = -0.03;
+    long   adam_anneal_steps = 0;   // mode 6: > 0 = the anneal is the last this many steps of the run (instead of (1 - c) x T)
     int    record_visibility = 0;        // 1: per-step visibility P(z>=1) and mu_eff histories
     // ---- visibility controller prototype (stage 2b Part 5 [log 073]; labeled, default off) ----
     // Rides on the mu_hold window: within [mu_hold_start, +mu_hold_steps) the
@@ -435,6 +498,23 @@ struct ContactScale {
 };
 // pairs: -1 a cell grid when that is cheaper (the default), 0 always the grid, 1 every pair (ellipsoid.hpp, PairGrid)
 ContactScale contact_scale(const struct PackingInput& input, const struct PackingConfig& config, int pairs = -1);
+
+// Contact stress of a configuration (BUILD.md section 15, Y3), from the forces of the packing's own force law at the
+// state as given (sizes fixed; mu plays no part). Units: the code's (pair stiffness 1, box lengths).
+struct ContactStress {
+    std::vector<double> particle_virial;   // per particle: half the sum over its pair contacts of (force . separation), >= 0
+    std::vector<double> tensor;            // Ndim x Ndim, row-major: sum over pair contacts of force_a x separation_b
+    double virial = 0.0;                   // sum of particle_virial = trace of tensor; pressure = virial / (Ndim x volume)
+    double volume = 0.0;                   // of the box or the container
+    std::vector<int> wall_dim, wall_side;  // per boundary: flat wall of dimension d, side 0 (low) or 1 (high); the curved wall: (-1, 0)
+    std::vector<double> wall_force, wall_area;   // per boundary: total normal force of the particles on it; its area
+    std::size_t n_contacts = 0;            // pair contacts counted
+    std::vector<int> z;                    // per particle: its pair contacts plus one per boundary it presses on (as the quench counts them)
+    // with_pairs: the candidate pairs (i < j, bounding spheres within 5 % of touching) and the bounding diameters
+    std::vector<std::uint32_t> pair_i, pair_j;
+    std::vector<double> bounding;
+};
+ContactStress contact_stress(const struct PackingInput& input, const struct PackingConfig& config, bool with_pairs = false);
 
 // Ellipsoid permutation outside a run (tests and inspection). The state is the input's; all pairs are listed.
 struct PermuteOnce {

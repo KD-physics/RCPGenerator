@@ -13,6 +13,11 @@ from ._rcpgenerator import initialize_particles as _initialize_particles
 from ._rcpgenerator import run_packing_observed as _run_packing_observed
 from ._rcpgenerator import run_packing as _run_packing
 from ._rcpgenerator import contact_scale as _contact_scale
+from ._rcpgenerator import contact_stress as _contact_stress
+from . import _hessian
+from . import _rcpgenerator as _core_module
+
+_DEV_BUILD = bool(getattr(_core_module, "DEV_BUILD", False))   # compiled with RCP_DEV_SWITCHES=ON: study settings and hidden tools
 from ._rcpgenerator import random_orientations as _random_orientations
 
 
@@ -131,7 +136,27 @@ class Packing:
     # Developer settings (README, "Developer settings"): scale factors on the three mu levels of the packing schedule.
     # Each is 1.0 unless set, and travels in the pack config only when it is not 1.0.
     _DEV_SCALES = ("mu_boost_scale", "mu_plateau_scale", "mu_end_scale")
-    _PACK_KEYS = {"box", "walls", "neighbor_max", "seed", "fix_height", "extend"} | set(_DEV_SCALES) | set(_ELL_DEFAULTS) | set(_SWAP_DEFAULTS) | set(_PERMUTE_DEFAULTS) | set(_MORPH_DEFAULTS) | set(_QUENCH_DEFAULTS)
+    # Study settings of BUILD.md section 14 (branch fast-adam): accepted by the constructor, sent to the core only
+    # when they differ from these defaults. Not documented for users.
+    _STUDY_DEFAULTS = {"adam_alpha_mode": 0, "adam_alpha_a": 0.0, "adam_alpha_b": 0.0, "adam_alpha_c": 0.0, "adam_mu_end": 0.0, "adam_beta2": 0.0, "adam_cool_q": 1.0, "adam_bridge_steps": 0, "adam_bridge_ramp": 500, "adam_bridge_mu": 0.0, "adam_bridge_c": 0.0, "adam_bridge_alpha": 0.0, "adam_bridge_kalpha": 0.0, "adam_settle_steps": 0, "adam_settle_eps": 0.0, "adam_settle_alpha": 0.0, "adam_settle_mu": 0.0, "adam_settle_fix": 0, "adam_hold_steps": 0, "adam_cool_steps": 0, "sched_osc_cycles": -1, "sched_decay_cooldown": 0, "sched_decay_factor": 0.0,
+                       "adam_anneal_ctrl": 0, "adam_e_end": -0.03, "adam_ref_plateau": 0, "adam_beta2_cool": 0.0, "adam_cool_reset": 0, "adam_alpha_gain": 0.01, "adam_mu_swing": 1.0, "adam_mu_cycles": 0, "adam_anneal_steps": 0}
+    # How Adam's step size (learning rate) is set during the run: lr_method (BUILD.md sections 14 and 15).
+    # "bounded_feedback" (the default; bit-identical to earlier releases): the step size is kept within bounds by a
+    #   feedback on the packing fraction, so the packing stays dense and moves slowly.
+    # "highly_active" (research/fast_adam/FLUID_ENGINE.md): after the initial compression a controller steers the step
+    #   size so that the packing stays 5 % expanded, at twice the pressure, in vigorous motion; it is then compressed
+    #   at a controlled rate to a jammed packing at that pressure, and mu is released in a few large ticks, with no
+    #   oscillation stage. Lengths in steps: the hold is 3,000 x extend (the density dial); the compression 4,000
+    #   for spheres and 8,000 for ellipsoids and rods (the settling; LOG [056], T2 to T7).
+    # These are names for how an optimiser's step size is controlled, not for a dynamics of the particles.
+    _LR_METHODS = ("bounded_feedback", "highly_active")
+    _LR_LEGACY = {"classic": "bounded_feedback", "fluid": "highly_active"}   # the study's working names (developer builds)
+    _FLUID_RECIPE = {"adam_alpha_mode": 5, "adam_alpha_a": 0.05, "adam_alpha_b": 12.0, "adam_alpha_gain": 0.01, "adam_ref_plateau": 1,
+                     "adam_anneal_ctrl": 1, "adam_e_end": -0.03, "sched_osc_cycles": 0, "sched_decay_cooldown": 100, "sched_decay_factor": 0.5}
+    _FLUID_PRESSURE = 2.0
+    _FLUID_HOLD = 3000
+    _FLUID_COOL = (4000, 8000)   # spheres; ellipsoids and rods
+    _PACK_KEYS = {"box", "walls", "neighbor_max", "seed", "fix_height", "extend", "lr_method", "engine"} | set(_DEV_SCALES) | set(_STUDY_DEFAULTS) | set(_ELL_DEFAULTS) | set(_SWAP_DEFAULTS) | set(_PERMUTE_DEFAULTS) | set(_MORPH_DEFAULTS) | set(_QUENCH_DEFAULTS)
     _REALIZED_STATE_KEYS = {"positions", "diameters", "orientations"}
     # Diagnostics that only a run sets (in _apply_packing_result). from_dict gives a loaded state the same
     # attributes with these empty values, so code written for a freshly packed object works on a loaded one.
@@ -176,8 +201,12 @@ class Packing:
         obj.neighbor_max = pack_config.get("neighbor_max", 0)
         obj.seed = pack_config.get("seed", 0)
         obj.extend = cls._checked_extend(pack_config.get("extend"))
+        obj.lr_method = cls._take_lr_method(pack_config, pop=False)
+        object.__setattr__(obj, "_engine_run", False)   # a loaded state has every attribute a fresh one has
         for k in cls._DEV_SCALES:
             setattr(obj, k, cls._checked_scale(k, pack_config.get(k, 1.0)))
+        for k, v in cls._STUDY_DEFAULTS.items():
+            setattr(obj, k, type(v)(pack_config.get(k, v)))
         obj._init_extension_state(pack_config, consume=False)
         obj._init_ellipsoid_state(init_config.get("aspect_ratios", pack_config.get("aspect_ratios", [])),
                                   pack_config)
@@ -266,8 +295,14 @@ class Packing:
         self.neighbor_max = kwargs.pop("neighbor_max", 0)
         self.seed = kwargs.pop("seed", 0)
         self.extend = self._checked_extend(kwargs.pop("extend", None))
+        self.lr_method = self._take_lr_method(kwargs, pop=True)
+        object.__setattr__(self, "_engine_run", False)
         for k in self._DEV_SCALES:
             setattr(self, k, self._checked_scale(k, kwargs.pop(k, 1.0)))
+        for k, v in self._STUDY_DEFAULTS.items():
+            if k in kwargs and not _DEV_BUILD:
+                raise TypeError(f"'{k}' is a developer setting: it is available only in a build compiled with RCP_DEV_SWITCHES=ON")
+            setattr(self, k, type(v)(kwargs.pop(k, v)))
         self._init_extension_state(kwargs, consume=True)
         self._init_ellipsoid_state(kwargs.pop("aspect_ratios", None),
                                    {k: kwargs.pop(k) for k in list(self._ELL_DEFAULTS) if k in kwargs})
@@ -509,6 +544,24 @@ class Packing:
         if self.morph_target:
             refuse("the distribution morph (morph_target)")
 
+    @classmethod
+    def _checked_lr_method(cls, value):
+        v = "bounded_feedback" if value is None else str(value)
+        if _DEV_BUILD: v = cls._LR_LEGACY.get(v, v)
+        if v not in cls._LR_METHODS:
+            raise ValueError("lr_method must be one of %s" % ", ".join(repr(e) for e in cls._LR_METHODS))
+        return v
+
+    @classmethod
+    def _take_lr_method(cls, source, pop):
+        """lr_method from keyword arguments or a saved config; a developer build also accepts the study's `engine`."""
+        get = source.pop if pop else source.get
+        v = get("lr_method", None)
+        legacy = get("engine", None) if (_DEV_BUILD or not pop) else None
+        if v is None and legacy is not None:
+            v = cls._LR_LEGACY.get(str(legacy), legacy)
+        return cls._checked_lr_method(v)
+
     @staticmethod
     def _checked_extend(value):
         """``extend``: None (not set) or a positive number, the length of rung 1 in units of its standard length."""
@@ -554,7 +607,10 @@ class Packing:
         if z is None:
             self.z = None; self.z_mean = None; self.n_rattlers = None; self.z_mean_no_rattlers = None
             self.mean_overlap = None; self.max_overlap = None
+            self._set_pressure(False)
+            self._hessian_obj = None; self.jam_check = None
             return
+        self._set_pressure(True)
         z = [int(v) for v in z]
         need = int(self.Ndim) + 1
         held = [v for v in z if v >= need]
@@ -562,6 +618,129 @@ class Packing:
         self.z_mean = (sum(z) / len(z)) if z else None
         self.n_rattlers = len(z) - len(held)
         self.z_mean_no_rattlers = (sum(held) / len(held)) if held else None
+
+    def _set_pressure(self, compute: bool, keep_round: bool = False) -> None:
+        """Fill the contact-stress attributes from the state as it is (sizes fixed; ``mu`` plays no part), or clear
+        them. Units: the code's (pair stiffness 1, box lengths).
+
+        ``pressure``: (sum over pair contacts of force . separation) / (Ndim x volume); ``stress``: the tensor
+        (sum of force_a x separation_b) / volume, of which the pressure is the trace / Ndim; ``particle_virial``:
+        per particle, half the sum over ITS pair contacts of force . separation, not divided by any volume (the
+        values add up to pressure x Ndim x volume; divide by a volume of your choice, e.g. a Voronoi cell, for a
+        local pressure); ``boundary_pressure``: per boundary, the normal force of the particles on it / its area,
+        with ``boundaries`` naming them in the same order ((d, 0) and (d, 1): the low and high flat wall of
+        dimension d; "curved": the curved wall of a container). None: not available.
+
+        Rods after a quench: the quench balances slightly ROUNDED rods, and the stress is that of the same contact
+        law (``stress_rod_round`` records the rounding used; 0 after a plain pack or a reload, where the stress is
+        that of the true rods). An ellipsoid or rod touching a wall can make the tensor slightly asymmetric: the
+        wall's contact enters along the wall's normal through the particle's centre."""
+        names = ("pressure", "stress", "particle_virial", "boundary_pressure", "boundaries", "boundary_force", "stress_volume")
+        if not compute:
+            for k in names:
+                setattr(self, k, None)
+            return
+        try:
+            cfg = self._collect_pack_config(translate=False)
+            # Rods after a quench: the quench balanced slightly ROUNDED rods; the stress is that of the same contact law.
+            if not keep_round:
+                in_quench = self.is_rod and int(getattr(self, "quench_mode", 0)) and float(getattr(self, "quench_rod_round", 0.0)) > 0.0
+                self.stress_rod_round = float(self.quench_rod_round) if in_quench else 0.0
+            if self.is_rod and float(getattr(self, "stress_rod_round", 0.0) or 0.0) > 0.0:
+                cfg["rod_round"] = float(self.stress_rod_round)
+            cs = _contact_stress(self._collect_pack_input(), cfg)
+        except Exception:
+            for k in names:
+                setattr(self, k, None)
+            return
+        n = int(self.Ndim); vol = float(cs["volume"])
+        self.stress_volume = vol
+        self.particle_virial = [float(v) for v in cs["particle_virial"]]
+        self.pressure = float(cs["virial"]) / (n * vol)
+        t = cs["tensor"]
+        self.stress = [[float(t[a * n + b]) / vol for b in range(n)] for a in range(n)]
+        self.boundaries = ["curved" if int(d) < 0 else (int(d), int(sd)) for d, sd in zip(cs["wall_dim"], cs["wall_side"])]
+        self.boundary_force = [float(v) for v in cs["wall_force"]]
+        self.boundary_pressure = [float(fv) / float(a) if a > 0 else None for fv, a in zip(cs["wall_force"], cs["wall_area"])]
+
+    # ---- Hessian and its eigenvalues: is a small system jammed? (BUILD.md section 15, Y4) ----
+    auto_hessian = True      # build the Hessian at the end of every quench (skipped above the size limit)
+    _hessian_obj = None
+    jam_check = None         # filled by eigenvalues(): counts of negative and zero eigenvalues, rattlers, verdict
+
+    def _hessian_dof(self) -> int:
+        n = int(self.Ndim)
+        return len(self.diameters) * (n + (n * (n - 1) // 2 if self._nonsphere else 0))
+
+    def hessian(self, force: bool = False, rebuild: bool = False, step: float | None = None):
+        """The Hessian of the contact energy at the state as it is (sizes fixed, no ``mu``), as a sparse matrix
+        (``rcpgenerator._hessian.Hessian``: ``rows``, ``cols``, ``values``, ``to_dense()``), built from force
+        evaluations: every coordinate is displaced by ``step`` both ways and the change of the forces recorded.
+        Coordinates per particle: its position; for ellipsoids and rods also its rotations (as arc length on the
+        bounding sphere). It is built at the end of every quench (``auto_hessian``) and kept; ``rebuild=True``
+        builds it again (after editing positions by hand, say).
+
+        Limit: above 15,000 degrees of freedom in total it is refused unless ``force=True`` (the message says what
+        the eigenvalues of a system that size would need). Not available above 8 dimensions."""
+        _hessian.check_size(self._hessian_dof(), force, "hessian()")
+        if self._hessian_obj is None or rebuild or step is not None:
+            cfg = self._collect_pack_config(translate=False)
+            if self.is_rod and float(getattr(self, "stress_rod_round", 0.0) or 0.0) > 0.0:
+                cfg["rod_round"] = float(self.stress_rod_round)   # after a quench: the rounded rods it balanced
+            self._hessian_obj = _hessian.build(self._collect_pack_input(), cfg, shape=bool(self._nonsphere),
+                                               mean_overlap=getattr(self, "mean_overlap", None), step=step)
+            self.jam_check = None
+        return self._hessian_obj
+
+    def eigenvalues(self, force: bool = False, tol: float = 1e-8):
+        """All eigenvalues of the Hessian (ascending; every particle's coordinates); builds the Hessian if needed.
+        Fills ``jam_check``:
+
+        - ``n_negative``: eigenvalues below ``-tol``, split into ``n_negative_held`` (the mode lies mostly on held
+          particles: the packing is not at a minimum) and ``n_negative_rattlers`` (it lies mostly on rattlers, which
+          the quench does not balance: a rattler squeezed between two neighbours sits on a saddle);
+        - ``n_zero``: eigenvalues within ``tol`` of zero, split into ``n_zero_rattlers`` (free motions of rattlers,
+          which do not count against the packing) and ``n_zero_held`` (zero modes that move held particles);
+        - ``n_zero_allowed``: the zero modes a jammed packing must have: a uniform translation along each periodic
+          direction, a rotation of the whole packing in a curved container, and for every held particle the
+          rotations that leave its shape unchanged (a spheroid or a rod about its axis);
+        - ``n_rattlers``, ``rattlers`` (their indices), ``n_held``: rattlers are taken out one after another (a
+          particle with fewer than Ndim + 1 contacts cannot be held);
+        - ``lowest_nonzero``; ``jammed``: ``n_negative_held == 0`` and ``n_zero_held == n_zero_allowed``.
+
+        Stiffness units (pair stiffness 1). The verdict is about rigidity; whether the forces balance is what
+        ``quench_global_residual`` says. The same size limit as ``hessian()``."""
+        _hessian.check_size(self._hessian_dof(), force, "eigenvalues()")
+        H = self.hessian(force=force)
+        n = int(self.Ndim); N = len(self.diameters)
+        if not self._nonsphere:
+            spin = [0] * N
+        elif self.is_rod:
+            spin = [(n - 1) * (n - 2) // 2] * N
+        elif self.has_shape_table:
+            spin = [_hessian.spin_modes(n, [1.0] + list(r)) for r in self.aspect_ratios]
+        else:
+            spin = [_hessian.spin_modes(n, [1.0] + list(self.aspect_ratios))] * N
+        v = _hessian.verdict(H, n_dim=n, walls=self.walls, spin=spin, tol=tol)
+        ev = v.pop("eigenvalues")
+        self.jam_check = v
+        return ev
+
+    def _auto_hessian(self) -> None:
+        """End of a quench: build the Hessian, unless switched off or above the size limit (then: nothing, no error)."""
+        self._hessian_obj = None; self.jam_check = None
+        if not getattr(self, "auto_hessian", True) or int(self.Ndim) > 8 or self._hessian_dof() > _hessian.HESSIAN_DOF_CAP:
+            return
+        try:
+            self.hessian()
+        except Exception:
+            self._hessian_obj = None
+
+    def update_pressure(self) -> float | None:
+        """Recompute ``pressure``, ``stress``, ``particle_virial`` and ``boundary_pressure`` from the positions,
+        diameters and orientations as they are now (after editing them by hand, say), and return the pressure."""
+        self._set_pressure(True, keep_round=True)
+        return self.pressure
 
     def _init_extension_state(self, config: dict[str, Any], *, consume: bool) -> None:
         """Set the fields added after v1.0 (diameter permutation, morph, quench, internal permutation fields)
@@ -634,6 +813,8 @@ class Packing:
     def __setattr__(self, name: str, value: Any) -> None:
         if name == "extend":   # checked before it is stored: a refused value leaves the setting as it was
             value = self._checked_extend(value)
+        elif name == "lr_method":
+            value = self._checked_lr_method(value)
         elif name in self._DEV_SCALES:
             value = self._checked_scale(name, value)
         object.__setattr__(self, name, value)
@@ -707,6 +888,11 @@ class Packing:
             **{k: deepcopy(getattr(self, k)) for k in self._MORPH_DEFAULTS},
             **{k: deepcopy(getattr(self, k)) for k in self._QUENCH_DEFAULTS},
         }
+        for k, v in self._STUDY_DEFAULTS.items():   # study settings: only when changed, and only in a developer build
+            if getattr(self, k, v) != v:
+                if not _DEV_BUILD:
+                    raise RuntimeError(f"'{k}' is a developer setting: it is available only in a build compiled with RCP_DEV_SWITCHES=ON")
+                cfg[k] = getattr(self, k)
         for k in self._DEV_SCALES:   # developer scales: only when not 1
             if float(getattr(self, k, 1.0)) != 1.0:
                 cfg[k] = float(getattr(self, k))
@@ -714,6 +900,14 @@ class Packing:
             cfg["extend"] = float(self.extend)
             if translate:
                 cfg["rung1_extend"] = float(self.extend)
+        if getattr(self, "lr_method", "bounded_feedback") != "bounded_feedback":   # only when not the default
+            cfg["lr_method"] = self.lr_method
+            if translate and getattr(self, "_engine_run", False):   # a pack() run with lr_method="highly_active"
+                cfg.update(self._FLUID_RECIPE)
+                cfg["mu_plateau_scale"] = self._FLUID_PRESSURE * float(getattr(self, "mu_plateau_scale", 1.0))
+                cfg.pop("rung1_extend", None)   # with this method extend scales the hold, not the standard deadline
+                cfg["adam_hold_steps"] = max(1, int(round(self._FLUID_HOLD * (1.0 if getattr(self, "extend", None) is None else float(self.extend)))))
+                cfg["adam_cool_steps"] = self._FLUID_COOL[1 if self._nonsphere else 0]
         if self.aspect_ratios:   # ellipsoids only: a sphere pack config is exactly what it always was
             if not self.has_shape_table:   # one shape for all travels in the config, a table in the input
                 cfg["aspect_ratios"] = list(self.aspect_ratios)
@@ -1185,8 +1379,19 @@ class Packing:
         trajectory_spacing: str = "linear",
         trajectory_per_decade: int = 20,
         extend: float | None = None,
+        lr_method: str | None = None,
+        jam: bool | float | None = None,
+        jam_max_iter: int = 200000,
     ) -> dict[str, Any]:
-        """Run the packing. ``extend=x`` lengthens the first stage of the run (the stage at the starting pressure
+        """Run the packing. ``jam=True`` (or ``jam=mu``) quenches the result to a jammed state before returning:
+        an ``adaptive_quench`` at the pressure ``mu`` (default: the run's own final ``mu``, ``mu_final``), after
+        which the particle forces balance at the sizes the packing ends with, so the state is jammed at fixed sizes
+        with no ``mu`` acting (a plain ``quench()`` after it has nothing left to do). ``mu`` sets the overlap of
+        that state; the closer to zero, the longer the quench. The same result as calling ``pack()`` and then
+        ``adaptive_quench()``; if the quench stops at ``jam_max_iter`` the packing is returned as it is, with a
+        warning, and ``quench_status`` says so. Off unless passed.
+
+        ``extend=x`` lengthens the first stage of the run (the stage at the starting pressure
         ``mu``, about half of a standard run) by the factor ``x``; the stages after it keep their standard length.
         ``extend=3`` therefore adds about one standard run's worth of steps. It is the same setting as
         ``Packing(extend=x)`` and stays set for later runs; not set (the default) is the standard run.
@@ -1201,8 +1406,25 @@ class Packing:
         if trajectory_spacing == "log" and int(trajectory_per_decade) < 1:
             raise ValueError("trajectory_per_decade must be at least 1")
         effective_verbose = self.verbose if verbose is None else verbose
+        jam_mu = None
+        if jam is not None and jam is not False:
+            if jam is not True:
+                jam_mu = float(jam)
+                if not (math.isfinite(jam_mu) and jam_mu > 0.0):
+                    raise ValueError("jam must be True or a positive mu")
+            if int(jam_max_iter) < 1:
+                raise ValueError("jam_max_iter must be at least 1")
+        want_jam = jam is not None and jam is not False
         if extend is not None:
             self.extend = extend
+        if lr_method is not None:
+            self.lr_method = lr_method
+        if self.lr_method == "highly_active":
+            for bad, what in ((self.morph_target, "the distribution morph (morph_target)"),
+                              (self.checkpoint_path, "checkpoint_path (the controller's state is not checkpointed)"),
+                              (float(self.swap) > 0.0 and not self.diameter_permute, "the internal swap_* settings")):
+                if bad:
+                    raise NotImplementedError(f"lr_method='highly_active' does not support {what} yet; use lr_method='bounded_feedback'")
         if self._needs_initialize or not self._initialized:
             if effective_verbose:
                 print("rcpgenerator: initialization required before packing")
@@ -1210,13 +1432,27 @@ class Packing:
         elif self._needs_pack and effective_verbose:
             print("rcpgenerator: rerunning packing on current realized state")
 
-        return self._execute_packing(
-            verbose=effective_verbose,
-            progress_interval=progress_interval,
-            capture_trajectory=capture_trajectory,
-            trajectory_interval=trajectory_interval,
-            trajectory_per_decade=int(trajectory_per_decade) if (capture_trajectory and trajectory_spacing == "log") else 0,
-        )
+        object.__setattr__(self, "_engine_run", True)
+        try:
+            result = self._execute_packing(
+                verbose=effective_verbose,
+                progress_interval=progress_interval,
+                capture_trajectory=capture_trajectory,
+                trajectory_interval=trajectory_interval,
+                trajectory_per_decade=int(trajectory_per_decade) if (capture_trajectory and trajectory_spacing == "log") else 0,
+            )
+        finally:
+            object.__setattr__(self, "_engine_run", False)
+        if not want_jam:
+            return result
+        result = self.adaptive_quench(mu=jam_mu, max_iter=int(jam_max_iter), verbose=effective_verbose)
+        if self.quench_status != "converged":
+            warnings.warn(
+                f"pack(jam=...): the quench to a jammed state stopped with status '{self.quench_status}' after "
+                f"{int(self.quench_iters)} iterations (global residual {float(self.quench_global_residual):.2e}); the packing is "
+                "returned as it is. Raise jam_max_iter, or use a larger mu (a state further from the jamming point "
+                "is reached sooner), or continue with adaptive_quench().", RuntimeWarning, stacklevel=2)
+        return result
 
     def relax(
         self,
@@ -1437,6 +1673,7 @@ class Packing:
             finally:
                 object.__setattr__(self, "_mutating_internal_state", False)
         self._restore_order_and_diagnostics(kept, result)
+        self._auto_hessian()
         message = self._quench_message(tol=float(tol), max_iter=int(max_iter), window=window)
         object.__setattr__(self, "quench_message", message)
         result["quench_status"] = self.quench_status
@@ -1467,6 +1704,11 @@ class Packing:
                     for k, i in enumerate(q_origin):
                         zz[i] = self.z[k]
                     self.z = zz
+                if getattr(self, "particle_virial", None) is not None and len(self.particle_virial) == n:   # and its share of the virial
+                    pv = [0.0] * n
+                    for k, i in enumerate(q_origin):
+                        pv[i] = self.particle_virial[k]
+                    self.particle_virial = pv
                 if self.has_shape_table and len(self.aspect_ratios) == n:   # so does a per-particle shape
                     tab = [None] * n
                     for k in range(n):
@@ -1671,6 +1913,7 @@ class Packing:
             finally:
                 object.__setattr__(self, "_mutating_internal_state", False)
         self._restore_order_and_diagnostics(kept, result)
+        self._auto_hessian()
         st, it = self.quench_status, self.quench_iters
         gres = self.quench_global_residual
         if st == "converged":

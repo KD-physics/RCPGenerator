@@ -1092,6 +1092,11 @@ void rod_rows(std::size_t n_runtime, int kind, int max_iter, double K, std::size
             for (std::size_t d = 0; d < n; ++d) { F[i * n + d] += po.dEdr[d]; F[j * n + d] -= po.dEdr[d]; }
             z[i]++; z[j]++;
             if (gsum) { gsum[i] += po.f_norm; gsum[j] += po.f_norm; }
+            if (g_virial_sink) {   // contact-stress pass only (single thread)
+                double W = 0.0;
+                for (std::size_t a = 0; a < n; ++a) { W -= po.dEdr[a] * r[a]; for (std::size_t b = 0; b < n; ++b) g_virial_sink->T[a * n + b] -= po.dEdr[a] * r[b]; }
+                g_virial_sink->w[i] += 0.5 * W; g_virial_sink->w[j] += 0.5 * W;
+            }
             acc.U += po.overlap; ++acc.count; acc.L += po.sigma;
             if (po.overlap > acc.mx) acc.mx = po.overlap;
             acc.dk += po.dkappa; acc.Fm += po.F_mag; acc.E += po.energy;
@@ -1266,6 +1271,11 @@ void rod_forces(const std::uint32_t* pairs_data, const std::uint64_t* pair_offse
                     for (std::size_t d = 0; d < n; ++d) { F_t[i * n + d] += po.dEdr[d]; F_t[j * n + d] -= po.dEdr[d]; }
                     z_t[i]++; z_t[j]++;
                     if (g_t) { g_t[i] += po.f_norm; g_t[j] += po.f_norm; }
+                    if (g_virial_sink) {   // contact-stress pass only (single thread)
+                        double W = 0.0;
+                        for (std::size_t a = 0; a < n; ++a) { W -= po.dEdr[a] * r[a]; for (std::size_t b = 0; b < n; ++b) g_virial_sink->T[a * n + b] -= po.dEdr[a] * r[b]; }
+                        g_virial_sink->w[i] += 0.5 * W; g_virial_sink->w[j] += 0.5 * W;
+                    }
                     acc.U += po.overlap; ++acc.count; acc.L += po.sigma;
                     if (po.overlap > acc.mx) acc.mx = po.overlap;
                     acc.dk += po.dkappa; acc.Fm += po.F_mag; acc.E += po.energy;

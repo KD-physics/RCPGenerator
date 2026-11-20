@@ -1,5 +1,6 @@
 #include "rcpgenerator/diameter_permute.hpp"
 
+#include "rcpgenerator/dev_switches.hpp"
 #include <algorithm>
 #include <cmath>
 #include <numeric>
@@ -229,6 +230,36 @@ void SwapEngine::geom_from_edges(std::size_t N, const std::vector<double>& D,
 // are fixed; the inscribed radius c_i = min_k (r_ik - R_k) over the 1.5x shell
 // comes from this step's near-pair edges (rcp_generator widens the collection
 // margin to 0.5 D_max on geo steps). No RNG is consumed at T = 0.
+namespace {
+struct GeoProf {
+    double t[8] = {0, 0, 0, 0, 0, 0, 0, 0}; long passes = 0; bool on = std::getenv("RCP_PROFILE") != nullptr;
+    ~GeoProf() {
+        if (on && passes > 0)
+            std::fprintf(stderr, "permutation passes %ld (ms per pass): pair cmin %.3f, candidates %.3f, sort %.3f, apply %.3f | cycle cmin %.3f, triples %.3f, sort %.3f, apply %.3f | total %.3f\n",
+                         passes, 1e3 * t[0] / passes, 1e3 * t[1] / passes, 1e3 * t[2] / passes, 1e3 * t[3] / passes, 1e3 * t[4] / passes, 1e3 * t[5] / passes, 1e3 * t[6] / passes, 1e3 * t[7] / passes,
+                         1e3 * (t[0] + t[1] + t[2] + t[3] + t[4] + t[5] + t[6] + t[7]) / passes);
+    }
+};
+GeoProf g_geo_prof;
+// The candidate work of a pass is split into chunks of consecutive ranks, done on several threads; the chunks are
+// then read in order, so the candidates come out as the single loop produced them (BUILD.md section 15, Y2).
+// RCP_PERMUTE_CHUNKS forces the number of chunks (tests: the split of several threads on one thread).
+inline std::size_t geo_chunks(std::size_t N) {
+    long c = 0;
+    if (const char* e = rcp_dev_getenv("RCP_PERMUTE_CHUNKS")) c = std::atol(e);
+    if (c <= 0) {
+#ifdef _OPENMP
+        const int nt = omp_get_max_threads();
+        c = nt > 1 ? 4L * nt : 1;
+#else
+        c = 1;
+#endif
+    }
+    return static_cast<std::size_t>(std::max<long>(1, std::min<long>(c, std::min<long>(64, static_cast<long>(N)))));
+}
+inline double geo_now() { return std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count(); }
+}  // namespace
+
 std::uint64_t SwapEngine::geo_pass(std::size_t N, std::vector<double>& D,
                                    std::vector<double>& D0,
                                    const SwapEdgeSink& edges,
@@ -241,6 +272,7 @@ std::uint64_t SwapEngine::geo_pass(std::size_t N, std::vector<double>& D,
     if (anneal && geo_T_cur_ < 0.0) geo_T_cur_ = p_.geo_T;          // lazy init on first pass
     const double Teff = anneal ? geo_T_cur_ : p_.geo_T;
     const double INF = std::numeric_limits<double>::infinity();
+    double tp0 = g_geo_prof.on ? geo_now() : 0.0; ++g_geo_prof.passes;
     std::vector<double> cmin(N, INF);
     for (std::size_t t = 0; t < edges.per_thread.size(); ++t) {
         const SwapEdge* v = edges.per_thread[t].data();
@@ -253,29 +285,50 @@ std::uint64_t SwapEngine::geo_pass(std::size_t N, std::vector<double>& D,
             cmin[ed.j] = std::min(cmin[ed.j], r - 0.5 * D[ed.i]);
         }
     }
+    if (g_geo_prof.on) { const double tn = geo_now(); g_geo_prof.t[0] += tn - tp0; tp0 = tn; }
     std::vector<std::uint32_t> glo, ghi;
     build_window_table_for(p_.geo_w, glo, ghi);
     struct Cand { double gain; std::uint32_t i, j; };
+    // best gain first; equal gains by particle index, so that the order does not depend on how it is produced
+    auto cand_before = [](const Cand& a, const Cand& b) { return a.gain != b.gain ? a.gain > b.gain : (a.i != b.i ? a.i < b.i : a.j < b.j); };
     std::vector<Cand> cands;
-    cands.reserve(N * 8);
     const std::uint32_t* at_rank = at_rank_.data();
     const int cap_p = std::max(1, p_.geo_max_partners);
-    for (std::size_t r = 0; r < N; ++r) {
-        const std::uint32_t i = at_rank[r];
-        if (!(cmin[i] < INF)) continue;
-        const long q0 = static_cast<long>(r) + 1, q1 = static_cast<long>(ghi[r]);
-        if (q1 < q0) continue;
-        const long span = q1 - q0 + 1;
-        const long stride = std::max<long>(1, (span + cap_p - 1) / cap_p);
-        for (long q = q0; q <= q1; q += stride) {
-            const std::uint32_t j = at_rank[q];
-            if (!(cmin[j] < INF)) continue;
-            const double dR = 0.5 * (D[j] - D[i]);
-            if (dR <= 0.0) continue;
-            const double gain = 2.0 * dR * (cmin[i] - cmin[j]);   // = -dM; > 0 improves
-            if (Teff <= 0.0 && gain <= 0.0) continue;
-            cands.push_back({gain, i, j});
+    const bool nonsep_in_window0 = static_cast<long>(current_step_) >= p_.geo_nonsep_start &&
+        (p_.geo_nonsep_stop < 0 || static_cast<long>(current_step_) < p_.geo_nonsep_stop);
+    // fast path (the standard recipe): each chunk sorts its own candidates and the exchange loop merges the chunks
+    // as it goes; it stops at the budget, so most candidates are never merged. Otherwise: one list, as before.
+    const bool merged_apply = Teff <= 0.0 && !((p_.geo_nonsep == 1 && nonsep_in_window0) || (p_.geo_nonsep == 2 && geo_reopen_active_));
+    const std::size_t nchunk = geo_chunks(N);
+    std::vector<std::vector<Cand>> cc(nchunk);
+    #pragma omp parallel for schedule(dynamic, 1)
+    for (std::size_t ch = 0; ch < nchunk; ++ch) {
+        std::vector<Cand>& out = cc[ch];
+        const std::size_t r0 = N * ch / nchunk, r1 = N * (ch + 1) / nchunk;
+        out.reserve((r1 - r0) * 8);
+        for (std::size_t r = r0; r < r1; ++r) {
+            const std::uint32_t i = at_rank[r];
+            if (!(cmin[i] < INF)) continue;
+            const long q0 = static_cast<long>(r) + 1, q1 = static_cast<long>(ghi[r]);
+            if (q1 < q0) continue;
+            const long span = q1 - q0 + 1;
+            const long stride = std::max<long>(1, (span + cap_p - 1) / cap_p);
+            for (long q = q0; q <= q1; q += stride) {
+                const std::uint32_t j = at_rank[q];
+                if (!(cmin[j] < INF)) continue;
+                const double dR = 0.5 * (D[j] - D[i]);
+                if (dR <= 0.0) continue;
+                const double gain = 2.0 * dR * (cmin[i] - cmin[j]);   // = -dM; > 0 improves
+                if (Teff <= 0.0 && gain <= 0.0) continue;
+                out.push_back({gain, i, j});
+            }
         }
+        if (merged_apply) std::sort(out.begin(), out.end(), cand_before);
+    }
+    if (!merged_apply) {   // one list in rank order, exactly as the single loop made it
+        std::size_t tot = 0; for (const auto& v : cc) tot += v.size();
+        cands.reserve(tot);
+        for (auto& v : cc) { cands.insert(cands.end(), v.begin(), v.end()); std::vector<Cand>().swap(v); }
     }
     // ---- H19 [172]: non-separable rescore of the top candidates -------------------
     // Replace each top candidate's separable gain with the TRUE dJ' of the concave-capped
@@ -377,20 +430,38 @@ std::uint64_t SwapEngine::geo_pass(std::size_t N, std::vector<double>& D,
                         [](const Cand& c) { return !(c.gain > 0.0); }), cands.end());
         }
     }
-    if (Teff <= 0.0) {
-        std::sort(cands.begin(), cands.end(),
-                  [](const Cand& a, const Cand& b) { return a.gain > b.gain; });
+    if (g_geo_prof.on) { const double tn = geo_now(); g_geo_prof.t[1] += tn - tp0; tp0 = tn; }
+    if (merged_apply) {
+        // sorted per chunk above; merged in the exchange loop
+    } else if (Teff <= 0.0) {
+        std::sort(cands.begin(), cands.end(), cand_before);
     } else {
         for (std::size_t k = cands.size(); k > 1; --k) {      // Fisher-Yates
             const std::size_t m = static_cast<std::size_t>(next_u64() % k);
             std::swap(cands[k - 1], cands[m]);
         }
     }
+    if (g_geo_prof.on) { const double tn = geo_now(); g_geo_prof.t[2] += tn - tp0; tp0 = tn; }
     std::vector<unsigned char> used(N, 0);
     std::uint64_t acc = 0;
     const std::size_t EW = event_width();
     if (swap_count_.size() != N) swap_count_.assign(N, 0);
-    for (const Cand& c : cands) {
+    std::vector<std::size_t> head(nchunk, 0); std::size_t pos = 0;
+    // the chunks' current candidates in a heap: the best one on top
+    auto heap_after = [&](std::size_t a, std::size_t b) { return cand_before(cc[b][head[b]], cc[a][head[a]]); };
+    std::vector<std::size_t> heap;
+    if (merged_apply) { for (std::size_t ch = 0; ch < nchunk; ++ch) if (!cc[ch].empty()) heap.push_back(ch); std::make_heap(heap.begin(), heap.end(), heap_after); }
+    auto next_cand = [&](Cand& out) -> bool {
+        if (!merged_apply) { if (pos >= cands.size()) return false; out = cands[pos++]; return true; }
+        if (heap.empty()) return false;
+        std::pop_heap(heap.begin(), heap.end(), heap_after);
+        const std::size_t ch = heap.back();
+        out = cc[ch][head[ch]++];
+        if (head[ch] < cc[ch].size()) std::push_heap(heap.begin(), heap.end(), heap_after); else heap.pop_back();
+        return true;
+    };
+    Cand c{0.0, 0, 0};
+    while (next_cand(c)) {
         if (acc >= static_cast<std::uint64_t>(std::max<long>(0, p_.geo_B))) break;
         if (used[c.i] || used[c.j]) continue;
         if (Teff > 0.0 && c.gain <= 0.0 &&
@@ -422,6 +493,7 @@ std::uint64_t SwapEngine::geo_pass(std::size_t N, std::vector<double>& D,
                 event_buf_.push_back(q == 8 ? cmin[i] : q == 9 ? cmin[j] : nan);
         }
     }
+    if (g_geo_prof.on) { const double tn = geo_now(); g_geo_prof.t[3] += tn - tp0; tp0 = tn; }
     geo_trades_ += acc; ++geo_passes_;
     if (anneal) geo_T_cur_ = std::max(p_.geo_T_end, geo_T_cur_ * p_.geo_T_decay);  // [135] cool
     return acc;
@@ -1021,6 +1093,7 @@ std::uint64_t SwapEngine::geo_cycle_pass(std::size_t N, std::vector<double>& D,
     if (N < 3 || !edges.want_edges) return 0;
     if (!ranks_valid_) rebuild_ranks(D0);
     const double INF = std::numeric_limits<double>::infinity();
+    double tp0 = g_geo_prof.on ? geo_now() : 0.0;
     std::vector<double> cmin(N, INF);
     for (std::size_t t = 0; t < edges.per_thread.size(); ++t) {
         const SwapEdge* v = edges.per_thread[t].data();
@@ -1033,55 +1106,78 @@ std::uint64_t SwapEngine::geo_cycle_pass(std::size_t N, std::vector<double>& D,
             cmin[ed.j] = std::min(cmin[ed.j], r - 0.5 * D[ed.i]);
         }
     }
+    if (g_geo_prof.on) { const double tn = geo_now(); g_geo_prof.t[4] += tn - tp0; tp0 = tn; }
     std::vector<std::uint32_t> glo, ghi;
     build_window_table_for(p_.geo_w, glo, ghi);
     struct Tri { double gain; std::uint32_t i, j, k; unsigned char perm; };  // perm: 0=A,1=B
-    std::vector<Tri> cands;
-    cands.reserve(N * 4);
+    auto tri_before = [](const Tri& u, const Tri& w) {
+        return u.gain != w.gain ? u.gain > w.gain : (u.i != w.i ? u.i < w.i : (u.j != w.j ? u.j < w.j : (u.k != w.k ? u.k < w.k : u.perm < w.perm))); };
     const std::uint32_t* at_rank = at_rank_.data();
     const long cap = std::max<long>(1, p_.geo_cycle_cap);
-    for (std::size_t r = 0; r < N; ++r) {
-        const std::uint32_t i = at_rank[r];
-        if (!(cmin[i] < INF)) continue;
-        const long q0 = static_cast<long>(r) + 1, q1 = static_cast<long>(ghi[r]);
-        if (q1 < q0 + 1) continue;                       // need at least two partners above
-        const long span = q1 - q0 + 1;
-        const long stride = std::max<long>(1, (span + cap - 1) / cap);
-        for (long q = q0; q <= q1; q += stride) {
-            const std::uint32_t j = at_rank[q];
-            if (!(cmin[j] < INF)) continue;
-            const long p0 = q + 1, p1 = static_cast<long>(ghi[q]);
-            if (p1 < p0) continue;
-            const long span2 = p1 - p0 + 1;
-            const long stride2 = std::max<long>(1, (span2 + cap - 1) / cap);
-            for (long q2 = p0; q2 <= p1; q2 += stride2) {
-                const std::uint32_t k = at_rank[q2];
-                if (!(cmin[k] < INF)) continue;
-                // ranks ascending => D0_i <= D0_j <= D0_k; use D (=D0*kappa) for J.
-                const double a = D[i], b = D[j], c = D[k];
-                const double x = cmin[i], y = cmin[j], z = cmin[k];
-                // rotations (positions i,j,k receive diameters):
-                const double dJA = (c - a) * x + (a - b) * y + (b - c) * z;  // (c,a,b)
-                const double dJB = (b - a) * x + (c - b) * y + (a - c) * z;  // (b,c,a)
-                // transpositions:
-                const double tij = (b - a) * (x - y);          // swap D at i,j
-                const double tjk = (c - b) * (y - z);          // swap D at j,k
-                const double tik = (c - a) * (x - z);          // swap D at i,k
-                const double best_t = std::max(tij, std::max(tjk, tik));
-                const double best_r = std::max(dJA, dJB);
-                if (best_r <= 0.0 || best_r <= best_t) continue;   // cycle-only, improving
-                cands.push_back({best_r, i, j, k,
-                                 static_cast<unsigned char>(dJA >= dJB ? 0 : 1)});
+    const std::size_t nchunk = geo_chunks(N);
+    std::vector<std::vector<Tri>> cc(nchunk);
+    #pragma omp parallel for schedule(dynamic, 1)
+    for (std::size_t ch = 0; ch < nchunk; ++ch) {
+        std::vector<Tri>& out = cc[ch];
+        const std::size_t r0 = N * ch / nchunk, r1 = N * (ch + 1) / nchunk;
+        out.reserve((r1 - r0) * 4);
+        for (std::size_t r = r0; r < r1; ++r) {
+            const std::uint32_t i = at_rank[r];
+            if (!(cmin[i] < INF)) continue;
+            const long q0 = static_cast<long>(r) + 1, q1 = static_cast<long>(ghi[r]);
+            if (q1 < q0 + 1) continue;                       // need at least two partners above
+            const long span = q1 - q0 + 1;
+            const long stride = std::max<long>(1, (span + cap - 1) / cap);
+            for (long q = q0; q <= q1; q += stride) {
+                const std::uint32_t j = at_rank[q];
+                if (!(cmin[j] < INF)) continue;
+                const long p0 = q + 1, p1 = static_cast<long>(ghi[q]);
+                if (p1 < p0) continue;
+                const long span2 = p1 - p0 + 1;
+                const long stride2 = std::max<long>(1, (span2 + cap - 1) / cap);
+                for (long q2 = p0; q2 <= p1; q2 += stride2) {
+                    const std::uint32_t k = at_rank[q2];
+                    if (!(cmin[k] < INF)) continue;
+                    // ranks ascending => D0_i <= D0_j <= D0_k; use D (=D0*kappa) for J.
+                    const double a = D[i], b = D[j], c = D[k];
+                    const double x = cmin[i], y = cmin[j], z = cmin[k];
+                    // rotations (positions i,j,k receive diameters):
+                    const double dJA = (c - a) * x + (a - b) * y + (b - c) * z;  // (c,a,b)
+                    const double dJB = (b - a) * x + (c - b) * y + (a - c) * z;  // (b,c,a)
+                    // transpositions:
+                    const double tij = (b - a) * (x - y);          // swap D at i,j
+                    const double tjk = (c - b) * (y - z);          // swap D at j,k
+                    const double tik = (c - a) * (x - z);          // swap D at i,k
+                    const double best_t = std::max(tij, std::max(tjk, tik));
+                    const double best_r = std::max(dJA, dJB);
+                    if (best_r <= 0.0 || best_r <= best_t) continue;   // cycle-only, improving
+                    out.push_back({best_r, i, j, k,
+                                     static_cast<unsigned char>(dJA >= dJB ? 0 : 1)});
+                }
             }
         }
+        std::sort(out.begin(), out.end(), tri_before);
     }
-    std::sort(cands.begin(), cands.end(),
-              [](const Tri& u, const Tri& w) { return u.gain > w.gain; });
+    if (g_geo_prof.on) { const double tn = geo_now(); g_geo_prof.t[5] += tn - tp0; tp0 = tn; }
     std::vector<unsigned char> used(N, 0);
     std::uint64_t acc = 0;
     const std::size_t EW = event_width();
     if (swap_count_.size() != N) swap_count_.assign(N, 0);
-    for (const Tri& c : cands) {
+    std::vector<std::size_t> head(nchunk, 0);
+    auto heap_after = [&](std::size_t a, std::size_t b) { return tri_before(cc[b][head[b]], cc[a][head[a]]); };
+    std::vector<std::size_t> heap;
+    for (std::size_t ch = 0; ch < nchunk; ++ch) if (!cc[ch].empty()) heap.push_back(ch);
+    std::make_heap(heap.begin(), heap.end(), heap_after);
+    auto next_tri = [&](Tri& out) -> bool {
+        if (heap.empty()) return false;
+        std::pop_heap(heap.begin(), heap.end(), heap_after);
+        const std::size_t ch = heap.back();
+        out = cc[ch][head[ch]++];
+        if (head[ch] < cc[ch].size()) std::push_heap(heap.begin(), heap.end(), heap_after); else heap.pop_back();
+        return true;
+    };
+    Tri c{0.0, 0, 0, 0, 0};
+    while (next_tri(c)) {
         if (acc >= static_cast<std::uint64_t>(std::max<long>(0, p_.geo_B))) break;
         if (used[c.i] || used[c.j] || used[c.k]) continue;
         used[c.i] = used[c.j] = used[c.k] = 1;
@@ -1117,6 +1213,7 @@ std::uint64_t SwapEngine::geo_cycle_pass(std::size_t N, std::vector<double>& D,
             for (std::size_t q = 8; q < EW; ++q) event_buf_.push_back(nan);
         }
     }
+    if (g_geo_prof.on) { const double tn = geo_now(); g_geo_prof.t[7] += tn - tp0; tp0 = tn; }
     geo_cycle_trades_ += acc;
     return acc;
 }

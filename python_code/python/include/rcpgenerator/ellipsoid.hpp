@@ -135,6 +135,12 @@ void ell_rotation_step(std::size_t N, std::size_t Ndim, const double* Tq, double
 // mode: PAIRS_AUTO = the grid when it is the cheaper of the two; PAIRS_GRID = always the grid; PAIRS_ALL = every
 // pair (the reference the tests compare the grid with).
 enum { PAIRS_AUTO = -1, PAIRS_GRID = 0, PAIRS_ALL = 1 };
+// Contact-stress pass (BUILD.md section 15, Y3): when set, the ellipsoid and rod force kernels add, for every pair
+// contact, the virial W = -f . r (f the force on i, r = x_j - x_i) half to each particle (w, length N) and the tensor
+// -f_a r_b to T (n x n, row-major). The pass that sets it runs the kernel on ONE thread. Null in every other pass.
+struct VirialSink { double* w = nullptr; double* T = nullptr; };
+extern VirialSink* g_virial_sink;
+
 class PairGrid {
 public:
     PairGrid(std::size_t N, std::size_t n, const double* x, const double* Db, const std::vector<double>& box,

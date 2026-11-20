@@ -25,7 +25,7 @@ Project resources: [repository](https://github.com/KD-physics/RCPGenerator) ·
 pip install rcpgenerator
 ```
 
-The version 1.2.2 wheel workflow builds and tests CPython 3.10–3.14 on:
+The version 1.3.0 wheel workflow builds and tests CPython 3.10–3.14 on:
 
 - Windows x86-64
 - Linux x86-64
@@ -130,7 +130,9 @@ The `rcpgenerator` package exports exactly these public names:
 Use `Packing` unless you specifically need the dictionary interface. Ellipsoids and rods add no
 new names: they are selected by `Packing` keywords (`aspect_ratios`, or `rod_length` and `rod_radius`),
 and their results are `Packing` attributes (`orientations`, `phi_contact`, `shrink_factor`) and the method
-`shrink_to_contact()`. See [Ellipsoids and rods](#ellipsoids-and-rods).
+`shrink_to_contact()`. See [Ellipsoids and rods](#ellipsoids-and-rods). The same holds for the jammed state
+(`pack(jam=...)`), the pressure and stress (`pressure`, `stress`, `particle_virial`, `boundary_pressure`) and the
+Hessian check (`hessian()`, `eigenvalues()`, `jam_check`).
 
 ## `Packing` configuration
 
@@ -292,6 +294,9 @@ result = packing.pack(
     capture_trajectory=False,
     trajectory_interval=1000,
     extend=None,
+    lr_method=None,
+    jam=None,
+    jam_max_iter=200000,
 )
 ```
 
@@ -302,6 +307,8 @@ result = packing.pack(
 | `capture_trajectory` | Record sampled positions, diameters, and scalar diagnostics for animation or analysis. |
 | `trajectory_interval` | Step interval between captured trajectory samples. |
 | `extend` | Lengthen the first stage of the run by this factor; see below. Not set (the default): the standard run. Also a constructor keyword, `Packing(extend=...)`. |
+| `lr_method` | How Adam's learning rate is set: `"bounded_feedback"` (the default, unchanged behaviour) or `"highly_active"`. Also a constructor keyword. See [How Adam's learning rate is set](#how-adams-learning-rate-is-set-lr_method). |
+| `jam`, `jam_max_iter` | `True` or a pressure `mu`: quench to a jammed state before returning. See [A jammed state in one call](#a-jammed-state-in-one-call-packjam). |
 
 `pack()` returns the raw result dictionary and also updates the corresponding
 `Packing` attributes. Trajectory capture consumes additional memory roughly in
@@ -871,6 +878,115 @@ After an adaptive quench at a small `mu` the overlaps are small, and the tightes
 can reach is limited by floating-point rounding of the positions (roughly 6e-14 divided by the mean
 relative overlap, so about 1e-9 at the `mu` a standard run ends on). Use `tol=1e-8` there, or a larger
 `mu`.
+
+## A jammed state in one call: `pack(jam=...)`
+
+```python
+p = rcpgenerator.Packing(N=2000, Ndim=3, dist=..., seed=1)
+p.pack(jam=True)            # pack, then quench to a jammed state before returning
+p.pack(jam=2.5e-4)          # the same at a pressure mu of your choice
+```
+
+`jam` runs `adaptive_quench(mu)` right after the pack (default `mu`: the run's own final `mu`, `mu_final`). When it
+has converged the contact forces on every load-bearing particle balance at the sizes the packing ended with. `mu`
+acts only on the common size scale, never on a particle, so that state is jammed at fixed sizes with no `mu`
+acting: a plain `quench()` after it has nothing left to do. `mu` is therefore only the dial for the overlap of the
+final state (the mean overlap is roughly proportional to it).
+
+- The result is identical to `pack()` followed by `adaptive_quench()`; the two calls stay available.
+- If the quench stops at `jam_max_iter` (default 200,000) the packing is returned as it is, with a warning, and
+  `quench_status` says so.
+- **Cost.** A state closer to the jamming point (smaller `mu`, smaller overlap) takes longer, by any route: on a
+  4D ellipsoid test case about 25,000 quench iterations at `mu = 2.5e-4`, 50,000 at `1e-4` and 120,000 at `2.5e-5`.
+  `mu_final` differs from run to run (1e-5 to 8e-5 on the test cases); pass a value for a fixed pressure.
+- Rattlers are left as they are: the quench balances the particles that carry load.
+
+## How Adam's learning rate is set: `lr_method`
+
+```python
+p = rcpgenerator.Packing(..., lr_method="highly_active")     # or p.pack(lr_method="highly_active")
+```
+
+| `lr_method` | what it does |
+|---|---|
+| `"bounded_feedback"` (default) | The behaviour of every earlier release, unchanged. Adam's learning rate (step size) is kept within bounds by a feedback on the packing fraction, so the packing stays dense and moves in small steps. |
+| `"highly_active"` | After the initial compression the learning rate is steered so that the packing stays about 5 % expanded and in vigorous motion (the hold); the packing is then compressed at a controlled rate into a jammed state, and `mu` is released in a few large steps. |
+
+These are two ways of controlling an optimiser's step size. They are not a model of the particles' dynamics.
+
+What to expect from `"highly_active"`, from the test cases (2D to 4D; spheres, ellipsoids, rods; periodic boxes,
+walls and containers):
+
+- fewer Adam steps (25 to 50 % fewer than the default), and a step count that does not grow with `N`;
+- a packing fraction a little above the default's in most cases (by 0.001 to 0.015 in 11 of 12 test cases; for
+  bidisperse 2D ellipses of aspect 0.5 it was the same on average, 0.876 against 0.878 over six seeds, with more
+  scatter between seeds), and an `adaptive_quench()` after it that changes the packing fraction by about 1e-4 or
+  less and converges more reliably;
+- with `diameter_permute=True` it makes more exchanges and ends denser again.
+
+`extend` is its one dial: it scales the length of the hold (3,000 steps at `extend=1`). A longer hold gives a
+denser packing, about +0.002 per doubling. **Single-size spheres in 3D begin to order when pushed**: 1.4 % of the
+particles are crystal-like at 1,000 particles and 3.5 % at 6,859 with the default hold, more with a longer one
+(the default method gives 0.2 %). Use `extend` below 1, or the default method, where that matters.
+
+Not available with `"highly_active"`: the distribution morph and checkpoints.
+
+## Pressure and stress
+
+Filled by `pack()`, `quench()` and `adaptive_quench()` and on loading a state, from the contact forces of the state
+as it is (sizes fixed; `mu` plays no part). Units: pair stiffness 1, box lengths.
+
+| attribute | meaning |
+|---|---|
+| `pressure` | (sum over contacts of force . separation vector) / (`Ndim` x volume) |
+| `stress` | the tensor, (sum of force_a x separation_b) / volume; the pressure is its trace / `Ndim` |
+| `particle_virial` | per particle: half the sum over its pair contacts of force . separation, plus, for a boundary it presses on, force x (distance from its centre to that boundary). A sum, not divided by any volume; the values add up to `pressure x Ndim x stress_volume`. Divide by a volume of your choice (a Voronoi cell, say) for a local pressure. |
+| `boundary_pressure`, `boundaries`, `boundary_force` | per boundary: the normal force of the particles on it / its area; `boundaries` names them in the same order: `(d, 0)` and `(d, 1)` are the low and high flat wall of dimension `d`, `"curved"` the curved wall of a container |
+| `stress_volume` | the volume used (the box, or the container) |
+| `update_pressure()` | recomputes all of it after you edit positions, diameters or orientations by hand |
+
+- At a state balanced at `mu` the pressure equals `mu x (sum of equal-volume diameters) / (Ndim x volume)` up to a
+  term of second order in the overlap.
+- A boundary contact enters the tensor with the distance from the particle's centre to the wall as its
+  separation. With that the normal stress on a wall equals that wall's pressure.
+- Rods after a quench: the quench balances slightly rounded rods, and the stress is that of the same contact law;
+  after a reload it is recomputed for the true rods. Ellipsoids and rods at a wall make the tensor slightly
+  asymmetric (about 1 %), and in a curved container their wall contact is entered along the radial direction
+  through the centre (approximate).
+
+## Hessian and eigenvalues: is it jammed?
+
+```python
+p.pack(jam=True)
+ev = p.eigenvalues()        # all eigenvalues, ascending
+p.jam_check                 # the verdict
+H = p.hessian()             # the sparse matrix: H.rows, H.cols, H.values, H.to_dense()
+```
+
+The Hessian of the contact energy at fixed sizes, built from force evaluations: every coordinate of a particle is
+displaced a little both ways and the change of the forces on it and on its neighbours is recorded. Particles that
+neither touch nor share a neighbour are displaced together, so the build takes a few hundred force evaluations
+whatever `N` is. Coordinates per particle: its position; for ellipsoids and rods also its rotations, measured as
+arc length on the bounding sphere, so that every entry is a stiffness. It is built at the end of every quench
+(`auto_hessian = False` switches that off) and kept; `hessian(rebuild=True)` builds it again.
+
+`jam_check` after `eigenvalues()`:
+
+| key | meaning |
+|---|---|
+| `jammed` | no negative mode on held particles, and exactly the zero modes they must have |
+| `n_rattlers`, `rattlers`, `n_held` | rattlers (count, indices) and the particles that are held; rattlers are taken out one after another: a particle with fewer than `Ndim + 1` contacts (boundary contacts counted) cannot be held |
+| `n_zero`, `n_zero_held`, `n_zero_rattlers` | eigenvalues within `tol` (default 1e-8) of zero; those that move held particles; those that are free motions of rattlers |
+| `n_zero_allowed` | the zero modes a jammed packing must have: a uniform translation along each periodic direction, a rotation of the whole packing in a curved container, and per held particle the rotations that leave its shape unchanged (a spheroid or a rod about its axis) |
+| `n_negative`, `n_negative_held`, `n_negative_rattlers` | eigenvalues below `-tol`, and where the mode lies. The quench does not balance rattlers, so one squeezed between two neighbours sits on a saddle and shows up here; that does not count against the packing |
+| `lowest_nonzero` | the smallest eigenvalue above `tol` |
+
+- **Size limit.** All eigenvalues need the dense matrix: 8 x n^2 bytes for n degrees of freedom, and a time that
+  grows as n^3. Above 15,000 degrees of freedom (particles x coordinates per particle) `hessian()` and
+  `eigenvalues()` refuse, with a message that states what your system would need; `force=True` goes ahead. After a
+  quench the automatic build is skipped above the limit, without an error. Use beyond the limit is your call.
+- The verdict is about rigidity. Whether the forces balance is what `quench_global_residual` says.
+- A pair that exactly touches (a loose particle resting on a neighbour) enters with half its stiffness.
 
 ## Ellipsoids and rods
 
@@ -1716,6 +1832,13 @@ preference; Clang native builds enable `-march=native`. Other compilers emit a
 CMake warning and retain their default architecture. A native-optimized build
 is intended only for the machine on which it is compiled. Do not redistribute
 it as a portable wheel.
+
+### Developer switches
+
+Study settings and hidden tools (an L-BFGS search phase for the quench, diagnostics, the raw settings behind
+`lr_method`) are compiled in only with `-DRCP_DEV_SWITCHES=ON` (with pip: `SKBUILD_CMAKE_DEFINE="RCP_DEV_SWITCHES=ON"`).
+A normal build does not read their environment variables and refuses their keywords;
+`rcpgenerator._rcpgenerator.DEV_BUILD` says which build this is. They are not part of the interface and may change.
 
 ## Method and citation
 

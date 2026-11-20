@@ -4,6 +4,7 @@
 #include "rcpgenerator/ellipsoid.hpp"
 #include "rcpgenerator/rod.hpp"
 
+#include "rcpgenerator/dev_switches.hpp"
 #include <algorithm>
 #include <chrono>
 #include <cmath>
@@ -21,6 +22,9 @@
 #endif
 
 namespace rcpgenerator {
+
+VirialSink* g_virial_sink = nullptr;   // set only during a contact-stress pass (rcp_generator.cpp, contact_stress)
+
 
 namespace {
 
@@ -222,6 +226,7 @@ struct PairPhysics {
     double dkappa;    // K sigma (d - sigma)
     double energy;    // (K/2)(sigma - d)^2
     double f_norm;    // |force on i|
+    double f[ELL_MAX_DIM];   // the force on i
 };
 
 ELL_INLINE PairPhysics pair_physics(const double* r, double d2, std::size_t n, double s2, double lam,
@@ -247,6 +252,7 @@ ELL_INLINE PairPhysics pair_physics(const double* r, double d2, std::size_t n, d
         const double f = c_r * r[k] + c_x * e.x[k];
         Fi[k] += f;
         Fj[k] -= f;
+        out.f[k] = f;
         f2 += f * f;
     }
     out.f_norm = std::sqrt(f2);
@@ -657,6 +663,11 @@ void process_rows(const LoopCtx& c, std::size_t i_begin, std::size_t i_end, doub
             z_t[i]++;
             z_t[j]++;
             if (c.want_gsum) { g_t[i] += ph.f_norm; g_t[j] += ph.f_norm; }
+            if (g_virial_sink) {   // contact-stress pass only (single thread)
+                double W = 0.0;
+                for (std::size_t a = 0; a < n; ++a) { W -= ph.f[a] * r[a]; for (std::size_t b = 0; b < n; ++b) g_virial_sink->T[a * n + b] -= ph.f[a] * r[b]; }
+                g_virial_sink->w[i] += 0.5 * W; g_virial_sink->w[j] += 0.5 * W;
+            }
             acc.U += ph.overlap;
             ++acc.count;
             acc.Lc += ph.sigma;
@@ -982,6 +993,15 @@ bool ell_exchange_admissible(std::size_t Ndim, double Di, const double* qi, doub
     return true;
 }
 
+// Chunks of consecutive ranks for the candidate work of ell_permute_pass (read back in order). RCP_PERMUTE_CHUNKS
+// forces the number (tests: the split of several threads on one thread).
+static std::size_t ell_permute_chunks(std::size_t N) {
+    long c = 0;
+    if (const char* e = rcp_dev_getenv("RCP_PERMUTE_CHUNKS")) c = std::atol(e);
+    if (c <= 0) { const int nt = omp_get_max_threads(); c = nt > 1 ? 4L * nt : 1; }
+    return static_cast<std::size_t>(std::max<long>(1, std::min<long>(c, std::min<long>(64, static_cast<long>(N)))));
+}
+
 std::size_t ell_permute_pass(const std::uint32_t* pairs_data, const std::uint64_t* pair_offsets, const double* x,
                              std::size_t N, std::size_t Ndim, const std::vector<double>& box,
                              const std::vector<std::int8_t>& walls, double* D, double* D0, double* qtab,
@@ -999,7 +1019,14 @@ std::size_t ell_permute_pass(const std::uint32_t* pairs_data, const std::uint64_
     // 1. the cage of every site, from the pairs of the neighbour lists inside the 1.5 shell
     const double shell = 1.5;
     std::vector<std::vector<double>> facets(N);
+    // The solve of every pair runs on several threads into a record of its row (j, normal, room at i, room at j);
+    // the records are then appended in the order the single loop appended them (BUILD.md section 15, Y2: the pass
+    // chooses exactly the exchanges it chose before).
+    const std::size_t rw = n + 3;
+    std::vector<std::vector<double>> rec(N);
+    #pragma omp parallel for schedule(dynamic, 64)
     for (std::size_t i = 0; i < N; ++i) {
+        std::vector<double>& ri = rec[i];
         const std::uint32_t* row = pairs_data + pair_offsets[i];   // row[0] = count, then the neighbours j > i
         const std::size_t cnt = row[0];
         const double* Ai = Amat + i * nn;
@@ -1037,17 +1064,28 @@ std::size_t ell_permute_pass(const std::uint32_t* pairs_data, const std::uint64_
             for (std::size_t d = 0; d < n; ++d) { nv[d] = xv[d] * xn; nr += nv[d] * r[d]; }
             hi = std::sqrt(support2(Ai, nv)); hj = std::sqrt(support2(Aj, nv));
             }
-            std::vector<double>& fi = facets[i];
-            std::vector<double>& fj = facets[j];
-            for (std::size_t d = 0; d < n; ++d) { fi.push_back(nv[d]); fj.push_back(-nv[d]); }
-            fi.push_back(nr - hj);   // room left at site i by neighbour j
-            fj.push_back(nr - hi);
+            ri.push_back(static_cast<double>(j));
+            for (std::size_t d = 0; d < n; ++d) ri.push_back(nv[d]);
+            ri.push_back(nr - hj);   // room left at site i by neighbour j
+            ri.push_back(nr - hi);
         }
     }
+    for (std::size_t i = 0; i < N; ++i) {
+        const std::vector<double>& ri = rec[i];
+        for (std::size_t e = 0; e + rw <= ri.size(); e += rw) {
+            const std::size_t j = static_cast<std::size_t>(ri[e]);
+            std::vector<double>& fi = facets[i];
+            std::vector<double>& fj = facets[j];
+            for (std::size_t d = 0; d < n; ++d) { fi.push_back(ri[e + 1 + d]); fj.push_back(-ri[e + 1 + d]); }
+            fi.push_back(ri[e + 1 + n]);
+            fj.push_back(ri[e + 2 + n]);
+        }
+    }
+    std::vector<std::vector<double>>().swap(rec);
     // room of particle p (shape matrix A, or size and shape placed in the site's orientation) at site a
     const double INF = std::numeric_limits<double>::infinity();
-    double room_overlap = 0.0;   // set by room(): sum over the planes of max(0, h - b)^2
-    auto room = [&](std::size_t a, std::size_t p) {
+    // room_overlap (out): sum over the planes of max(0, h - b)^2
+    auto room = [&](std::size_t a, std::size_t p, double& room_overlap) {
         const std::vector<double>& f = facets[a];
         double best = INF, ov = 0.0;
         if (prm.kind != 0) {   // rods: particle p's length and radius, on its own axis or on the site's
@@ -1093,43 +1131,61 @@ std::size_t ell_permute_pass(const std::uint32_t* pairs_data, const std::uint64_
         return best;
     };
     std::vector<double> self(N, INF), self_ov(N, 0.0);
-    for (std::size_t p = 0; p < N; ++p) if (!facets[p].empty()) { self[p] = room(p, p); self_ov[p] = room_overlap; }
+    #pragma omp parallel for schedule(static)
+    for (std::size_t p = 0; p < N; ++p) if (!facets[p].empty()) { double ov = 0.0; self[p] = room(p, p, ov); self_ov[p] = ov; }
     // 2. candidates: partners in the window, in order of the longest axis D (ties by index: deterministic)
     std::vector<std::uint32_t> order(N);
     for (std::size_t k = 0; k < N; ++k) order[k] = static_cast<std::uint32_t>(k);
     std::sort(order.begin(), order.end(), [&](std::uint32_t a, std::uint32_t b) { return D[a] < D[b] || (D[a] == D[b] && a < b); });
     std::vector<EllExchangeRecord> cands;
     const long cap = std::max(1, prm.max_partners);
-    std::size_t examined = 0, q1 = 0;
-    for (std::size_t r = 0; r < N; ++r) {
+    std::size_t examined = 0;
+    std::vector<std::size_t> q1_of(N);
+    for (std::size_t r = 0, q1 = 0; r < N; ++r) {
         const std::uint32_t i = order[r];
         if (q1 < r) q1 = r;
         while (q1 + 1 < N && D[order[q1 + 1]] <= D[i] * (1.0 + prm.window)) ++q1;
-        if (!(self[i] < INF) || q1 <= r) continue;
-        const long span = static_cast<long>(q1 - r);
-        const long stride = std::max<long>(1, (span + cap - 1) / cap);
-        for (long q = static_cast<long>(r) + 1 + static_cast<long>(prm.pass_index % static_cast<std::uint64_t>(stride));
-             q <= static_cast<long>(q1); q += stride) {
-            const std::uint32_t j = order[q];
-            if (!(self[j] < INF)) continue;
-            if (prm.kind != 0) { if (!rod_exchange_admissible(D[i], qtab + i * n, D[j], qtab + j * n, prm.window)) continue; }
-            else
-            if (!ell_exchange_admissible(n, D[i], qtab + i * n, D[j], qtab + j * n, prm.window)) continue;
-            if (!prm.move_orientations && D[i] == D[j] && std::equal(qtab + i * n, qtab + i * n + n, qtab + j * n)) continue;   // nothing would change
-            ++examined;
-            const double Ri2 = 0.25 * D[i] * D[i], Rj2 = 0.25 * D[j] * D[j];
-            const double tji = room(j, i), oji = room_overlap, tij = room(i, j), oij = room_overlap;
-            const double gain = 2.0 * (Ri2 * tji + Rj2 * tij - Ri2 * self[i] - Rj2 * self[j]);
-            // the guard concerns orientation: for two spheres nothing can stick out differently after the exchange
-            // than the room already measures, and the sphere engine's rule is kept as it is
-            if (prm.overlap_guard && oji + oij > self_ov[i] + self_ov[j]) {
-                bool spheres = true;
-                for (std::size_t k = 1; k < n; ++k) if (qtab[i * n + k] != 1.0 || qtab[j * n + k] != 1.0) spheres = false;
-                if (!spheres) continue;
-            }
-            if (gain > 1e-9 * (Ri2 + Rj2)) cands.push_back({i, j, gain});   // strictly better, clear of rounding
-        }
+        q1_of[r] = q1;
     }
+    const std::size_t nchunk = ell_permute_chunks(N);
+    std::vector<std::vector<EllExchangeRecord>> cc(nchunk);
+    std::vector<std::size_t> ex_of(nchunk, 0);
+    #pragma omp parallel for schedule(dynamic, 1)
+    for (std::size_t ch = 0; ch < nchunk; ++ch) {
+        std::vector<EllExchangeRecord>& out = cc[ch];
+        std::size_t ex = 0;
+        for (std::size_t r = N * ch / nchunk; r < N * (ch + 1) / nchunk; ++r) {
+            const std::uint32_t i = order[r];
+            const std::size_t q1 = q1_of[r];
+            if (!(self[i] < INF) || q1 <= r) continue;
+            const long span = static_cast<long>(q1 - r);
+            const long stride = std::max<long>(1, (span + cap - 1) / cap);
+            for (long q = static_cast<long>(r) + 1 + static_cast<long>(prm.pass_index % static_cast<std::uint64_t>(stride));
+                 q <= static_cast<long>(q1); q += stride) {
+                const std::uint32_t j = order[q];
+                if (!(self[j] < INF)) continue;
+                if (prm.kind != 0) { if (!rod_exchange_admissible(D[i], qtab + i * n, D[j], qtab + j * n, prm.window)) continue; }
+                else
+                if (!ell_exchange_admissible(n, D[i], qtab + i * n, D[j], qtab + j * n, prm.window)) continue;
+                if (!prm.move_orientations && D[i] == D[j] && std::equal(qtab + i * n, qtab + i * n + n, qtab + j * n)) continue;   // nothing would change
+                ++ex;
+                const double Ri2 = 0.25 * D[i] * D[i], Rj2 = 0.25 * D[j] * D[j];
+                double oji = 0.0, oij = 0.0;
+                const double tji = room(j, i, oji), tij = room(i, j, oij);
+                const double gain = 2.0 * (Ri2 * tji + Rj2 * tij - Ri2 * self[i] - Rj2 * self[j]);
+                // the guard concerns orientation: for two spheres nothing can stick out differently after the exchange
+                // than the room already measures, and the sphere engine's rule is kept as it is
+                if (prm.overlap_guard && oji + oij > self_ov[i] + self_ov[j]) {
+                    bool spheres = true;
+                    for (std::size_t k = 1; k < n; ++k) if (qtab[i * n + k] != 1.0 || qtab[j * n + k] != 1.0) spheres = false;
+                    if (!spheres) continue;
+                }
+                if (gain > 1e-9 * (Ri2 + Rj2)) out.push_back({i, j, gain});   // strictly better, clear of rounding
+            }
+        }
+        ex_of[ch] = ex;
+    }
+    for (std::size_t ch = 0; ch < nchunk; ++ch) { examined += ex_of[ch]; cands.insert(cands.end(), cc[ch].begin(), cc[ch].end()); }
     std::sort(cands.begin(), cands.end(), [](const EllExchangeRecord& a, const EllExchangeRecord& b) {
         return a.gain > b.gain || (a.gain == b.gain && (a.i < b.i || (a.i == b.i && a.j < b.j)));
     });

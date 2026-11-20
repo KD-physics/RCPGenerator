@@ -4,6 +4,7 @@
 #include "rcpgenerator/rod.hpp"
 #include "rcpgenerator/curved_wall.hpp"
 
+#include "rcpgenerator/dev_switches.hpp"
 #include <algorithm>
 #include <atomic>
 #include <chrono>
@@ -20,6 +21,7 @@
 #include <string>
 #include <thread>
 #include <utility>
+#include <deque>
 #include <vector>
 
 #if defined(__linux__)
@@ -4826,6 +4828,58 @@ void get_forces_nd_3(
     Fmean = -Fmean / count;
 }
 
+// Study (BUILD.md section 14, part 3, J10): L-BFGS for the search phase of the quench. A state machine around the
+// force pass: advance() is given the gradient at the current point and returns the coefficient a by which the
+// caller moves the coordinates along d (a * d). The line search uses the directional derivative only (the force pass
+// returns no energy): a step whose directional derivative has turned clearly positive is shortened by a secant.
+// Cost per call: one pass of about 4 m vector operations; memory 2 m vectors; no matrix.
+struct QLbfgs {
+    int m = 0; bool have = false; double t = 1.0, gd = 0.0, fprev = 0.0; int ls = 0; long rejects = 0, skips = 0, evals = 0, frejects = 0, nacc = 0; double ratio_sum = 0.0;
+    std::vector<double> d, gprev, rho; std::deque<std::vector<double>> S, Y;
+    static double dot(const std::vector<double>& a, const std::vector<double>& b) { double r = 0.0; const std::size_t n = a.size(); for (std::size_t k = 0; k < n; ++k) r += a[k] * b[k]; return r; }
+    void steepest(const std::vector<double>& g) { S.clear(); Y.clear(); rho.clear(); d.assign(g.size(), 0.0); for (std::size_t k = 0; k < g.size(); ++k) d[k] = -0.25 * g[k]; }
+    // f, has_f: the value of the function being minimised, when the force pass provides it (ellipsoids, rods): then a
+    // step must also lower it (Armijo), which the directional derivative alone does not guarantee.
+    template <class Cap> double advance(const std::vector<double>& g, Cap&& cap, double f = 0.0, bool has_f = false) {
+        ++evals; const std::size_t n = g.size(); bool fresh = false;
+        if (!have || d.size() != n) { steepest(g); have = true; fresh = true; }
+        else {
+            const double gdn = dot(g, d);
+            if (has_f && f > fprev + 1e-4 * t * gd + 1e-13 * std::fabs(fprev) && t > 1e-6 && ls < 20) {   // not downhill: shorten (quadratic fit)
+                double tn = -gd * t * t / (2.0 * (f - fprev - gd * t));
+                tn = std::min(0.5 * t, std::max(0.1 * t, tn));
+                const double a = tn - t; t = tn; ++ls; ++frejects; return a;
+            }
+            if (has_f && gd < 0.0) { ratio_sum += (f - fprev) / (t * gd); ++nacc; }
+            if (gdn > 0.9 * std::fabs(gd) && t > 1e-6 && ls < 20) {
+                double tn = t * gd / (gd - gdn);
+                tn = std::min(0.9 * t, std::max(0.1 * t, tn));
+                const double a = tn - t; t = tn; ++ls; ++rejects; return a;
+            }
+            std::vector<double> sv(n), yv(n); double sy = 0.0, ss = 0.0, yy = 0.0;
+            for (std::size_t k = 0; k < n; ++k) { sv[k] = t * d[k]; yv[k] = g[k] - gprev[k]; sy += sv[k] * yv[k]; ss += sv[k] * sv[k]; yy += yv[k] * yv[k]; }
+            if (sy > 1e-10 * std::sqrt(ss * yy) && yy > 0.0) {
+                S.push_back(std::move(sv)); Y.push_back(std::move(yv)); rho.push_back(1.0 / sy);
+                if (static_cast<int>(S.size()) > m) { S.pop_front(); Y.pop_front(); rho.erase(rho.begin()); }
+            } else ++skips;
+            const std::size_t M = S.size();
+            if (M == 0) steepest(g);
+            else {
+                std::vector<double> qv = g, al(M);
+                for (std::size_t j = M; j-- > 0;) { al[j] = rho[j] * dot(S[j], qv); for (std::size_t k = 0; k < n; ++k) qv[k] -= al[j] * Y[j][k]; }
+                const double gam = 1.0 / (rho[M - 1] * dot(Y[M - 1], Y[M - 1]));
+                for (std::size_t k = 0; k < n; ++k) qv[k] *= gam;
+                for (std::size_t j = 0; j < M; ++j) { const double be = rho[j] * dot(Y[j], qv); for (std::size_t k = 0; k < n; ++k) qv[k] += S[j][k] * (al[j] - be); }
+                d.assign(n, 0.0); for (std::size_t k = 0; k < n; ++k) d[k] = -qv[k];
+                if (!(dot(g, d) < 0.0)) steepest(g);
+            }
+            fresh = true;
+        }
+        if (fresh) { cap(d); gprev = g; fprev = f; t = 1.0; ls = 0; gd = dot(g, d); }
+        return 1.0;
+    }
+};
+
 void adam_update(
     const std::string& method,
     std::size_t N,
@@ -5153,6 +5207,136 @@ ContactScale contact_scale(const PackingInput& input, const PackingConfig& confi
     double vol = 0.0;
     for (double dv : f.D) vol += sphere_volume(0.5 * dv, Ndim);
     out.particle_volume = vol * sh.vol_factor;
+    return out;
+}
+
+ContactStress contact_stress(const PackingInput& input, const PackingConfig& config, bool with_pairs) {
+    FlatInput f = flatten_input(input, config);
+    const std::size_t N = f.N, Ndim = f.Ndim, nn = Ndim * Ndim;
+    const bool ell = ell_input_present(input, config);
+    ContactStress out;
+    out.particle_virial.assign(N, 0.0); out.tensor.assign(nn, 0.0); out.z.assign(N, 0);
+    EllShape sh;
+    std::vector<double> rot, qtab, deq, bfac, amat;
+    if (ell) {
+        sh = ell_resolve_input(input, config, N, Ndim, rot, qtab, deq, bfac);
+        for (std::size_t i = 0; i < N; ++i) f.D[i] *= bfac[i];
+    }
+    // candidate pairs (j > i) from the cell grid, in the force kernels' layout: row = [count, j, j, ...]
+    std::vector<std::uint64_t> offsets(N + 1, 0);
+    std::vector<std::uint32_t> pairs;
+    {
+        const PairGrid grid(N, Ndim, f.x.data(), f.D.data(), f.box, f.walls, PAIRS_AUTO);
+        std::vector<std::uint32_t> later;
+        for (std::size_t i = 0; i < N; ++i) {
+            grid.later_neighbours(i, later);
+            offsets[i] = pairs.size();
+            pairs.push_back(0);
+            std::uint32_t cnt = 0;
+            for (const std::uint32_t j : later) {
+                const double rb = 0.5 * (f.D[i] + f.D[j]) * 1.05;   // a little beyond the bounding spheres: the kernels decide
+                double d2 = 0.0;
+                for (std::size_t d = 0; d < Ndim; ++d) {
+                    double delta = f.x[j * Ndim + d] - f.x[i * Ndim + d];
+                    if (f.walls[d] == 0) delta -= std::nearbyint(delta / f.box[d]) * f.box[d];
+                    d2 += delta * delta;
+                }
+                if (d2 < rb * rb) { pairs.push_back(j); ++cnt; if (with_pairs) { out.pair_i.push_back(static_cast<std::uint32_t>(i)); out.pair_j.push_back(j); } }
+            }
+            pairs[offsets[i]] = cnt;
+        }
+        offsets[N] = pairs.size(); pairs.push_back(0);
+        if (with_pairs) out.bounding = f.D;
+    }
+    const std::size_t tc = f.walls[0] < 0 ? curved_axes(f.walls[0], Ndim) : 0;
+    const double Rc = 0.5 * f.box[0];
+    std::vector<double> wf_lo(Ndim, 0.0), wf_hi(Ndim, 0.0); double wf_curved = 0.0;
+    // A boundary contact enters with the distance from the particle's centre to the wall as its separation, all of it
+    // to that particle (the wall has no other half). With that, the normal stress on a wall equals the wall's pressure.
+    auto wall_virial = [&](std::size_t i, std::size_t d, double fg) { out.particle_virial[i] += fg; out.tensor[d * Ndim + d] += fg; };
+    auto curved_virial = [&](std::size_t i, double fw) {   // along the radial direction through the centre (exact for spheres)
+        double u[8], dc = 0.0;
+        for (std::size_t m = 0; m < tc; ++m) { u[m] = f.x[i * Ndim + m] - Rc; dc += u[m] * u[m]; }
+        dc = std::sqrt(dc); if (!(dc > 0.0)) return;
+        const double gap = std::max(0.0, Rc - dc);
+        out.particle_virial[i] += fw * gap;
+        for (std::size_t a = 0; a < tc; ++a) for (std::size_t b = 0; b < tc; ++b) out.tensor[a * Ndim + b] += fw * gap * u[a] * u[b] / (dc * dc);
+    };
+    if (ell) {
+        // the shape kernels, once, on one thread, with the sink set
+        std::vector<double> F(N * Ndim, 0.0), tq(N * ell_nrot(Ndim), 0.0);
+        std::vector<std::size_t> z; double U = 0.0, mx = 0.0, Lc = 0.0, Fm = 0.0, dk = 0.0, en = 0.0;
+        VirialSink sink; sink.w = out.particle_virial.data(); sink.T = out.tensor.data();
+        const int nt = omp_get_max_threads();
+        omp_set_num_threads(1);
+        g_virial_sink = &sink;
+        try { shape_forces(pairs.data(), offsets.data(), f.x.data(), N, sh, f.D, f.box, f.walls, rot.data(), F.data(), tq.data(), U, mx, Lc, Fm, 0.0, dk, z, en, amat); }
+        catch (...) { g_virial_sink = nullptr; omp_set_num_threads(nt); throw; }
+        g_virial_sink = nullptr; omp_set_num_threads(nt);
+        for (std::size_t i = 0; i < N && i < z.size(); ++i) out.z[i] = static_cast<int>(z[i]);
+        for (std::size_t i = 0; i < N; ++i) {      // boundaries: the same contact laws as the quench's contact sums
+            for (std::size_t d = 0; d < Ndim; ++d) {
+                if (f.walls[d] != 1 || amat.size() < N * nn) continue;
+                const double h = std::sqrt(amat[i * nn + d * Ndim + d]);
+                const double g0 = std::abs(f.x[i * Ndim + d]), g1 = std::abs(f.box[d] - f.x[i * Ndim + d]);
+                if (g0 < h) { const double fw = 2.0 * (h - g0); wf_lo[d] += fw; wall_virial(i, d, fw * g0); ++out.z[i]; }
+                if (g1 < h) { const double fw = 2.0 * (h - g1); wf_hi[d] += fw; wall_virial(i, d, fw * g1); ++out.z[i]; }
+            }
+            if (tc > 0) {
+                CurvedWallSum cw;
+                if (shape_curved_wall(sh, Ndim, tc, Rc, 1.0, f.x.data() + i * Ndim, f.D[i], amat.size() >= N * nn ? amat.data() + i * nn : nullptr,
+                                      rot.data() + i * nn, qtab.data() + i * Ndim, nullptr, nullptr, cw)) { wf_curved += cw.f; curved_virial(i, cw.f); out.z[i] += cw.count; }
+            }
+        }
+    } else {
+        for (std::size_t i = 0; i < N; ++i) {      // spheres: force (r_ij - d) along the line of centres (stiffness 1)
+            const std::uint32_t* row = pairs.data() + offsets[i];
+            for (std::uint32_t k = 1; k <= row[0]; ++k) {
+                const std::size_t j = row[k];
+                double r[8], d2 = 0.0;
+                for (std::size_t d = 0; d < Ndim; ++d) {
+                    double delta = f.x[j * Ndim + d] - f.x[i * Ndim + d];
+                    if (f.walls[d] == 0) delta -= std::nearbyint(delta / f.box[d]) * f.box[d];
+                    r[d] = delta; d2 += delta * delta;
+                }
+                const double rij = 0.5 * (f.D[i] + f.D[j]);
+                if (!(d2 < rij * rij) || d2 <= 0.0) continue;
+                const double dist = std::sqrt(d2), fm = (rij - dist) / dist;   // force on j = fm * r, on i = -fm * r
+                const double W = fm * d2;
+                out.particle_virial[i] += 0.5 * W; out.particle_virial[j] += 0.5 * W; ++out.z[i]; ++out.z[j];
+                for (std::size_t a = 0; a < Ndim; ++a) for (std::size_t b = 0; b < Ndim; ++b) out.tensor[a * Ndim + b] += fm * r[a] * r[b];
+            }
+            const double rad = 0.5 * f.D[i];
+            for (std::size_t d = 0; d < Ndim; ++d) {
+                if (f.walls[d] != 1) continue;
+                const double g0 = std::abs(f.x[i * Ndim + d]), g1 = std::abs(f.box[d] - f.x[i * Ndim + d]);
+                if (g0 < rad) { const double fw = 2.0 * (rad - g0); wf_lo[d] += fw; wall_virial(i, d, fw * g0); ++out.z[i]; }
+                if (g1 < rad) { const double fw = 2.0 * (rad - g1); wf_hi[d] += fw; wall_virial(i, d, fw * g1); ++out.z[i]; }
+            }
+            if (tc > 0) {
+                double dc2 = 0.0;
+                for (std::size_t m = 0; m < tc; ++m) { const double u = f.x[i * Ndim + m] - Rc; dc2 += u * u; }
+                const double gap = Rc - std::sqrt(dc2);
+                if (gap < rad) { const double fw = 2.0 * std::abs(rad - std::abs(gap)); wf_curved += fw; curved_virial(i, fw); ++out.z[i]; }
+            }
+        }
+    }
+    for (std::size_t i = 0; i < N; ++i) out.virial += out.particle_virial[i];
+    // volume and boundary areas: a box, or a container curved in its first tc dimensions (radius Rc) and straight in the rest
+    double straight = 1.0;
+    for (std::size_t d = tc; d < Ndim; ++d) straight *= f.box[d];
+    const double disc = tc > 0 ? sphere_volume(Rc, tc) : 1.0;
+    out.volume = disc * straight;
+    for (std::size_t d = 0; d < Ndim; ++d) {
+        if (f.walls[d] != 1) continue;
+        const double area = out.volume / f.box[d];
+        out.wall_dim.push_back(static_cast<int>(d)); out.wall_side.push_back(0); out.wall_force.push_back(wf_lo[d]); out.wall_area.push_back(area);
+        out.wall_dim.push_back(static_cast<int>(d)); out.wall_side.push_back(1); out.wall_force.push_back(wf_hi[d]); out.wall_area.push_back(area);
+    }
+    if (tc > 0) {
+        out.wall_dim.push_back(-1); out.wall_side.push_back(0); out.wall_force.push_back(wf_curved);
+        out.wall_area.push_back(static_cast<double>(tc) * disc / Rc * straight);
+    }
     return out;
 }
 
@@ -5710,7 +5894,7 @@ std::pair<PackingResult, PackingTrace> run_packing_observed(
             (void)v;
         }
         if (const char* oc = std::getenv("RCP_OSC_CYCLES")) {
-            long v = std::atol(oc); if (v >= 1 && v < 100) cycles = std::size_t(v);
+            long v = std::atol(oc); if (v >= 0 && v < 100) cycles = std::size_t(v);
         }
         double rung1 = static_cast<double>(Y) * 4000.0
             + static_cast<double>(X) * std::sqrt(static_cast<double>(N)
@@ -5909,6 +6093,19 @@ std::pair<PackingResult, PackingTrace> run_packing_observed(
     std::vector<char> q_held(N, 0);
     std::vector<char> q_light(N, 0);    // [223] two-level: 1 = relaxed by the local overdamped step, excluded from FIRE's sums
     double q_dt = config.quench_dt0, q_alpha = config.quench_alpha0; long q_npos = 0, q_iter = 0;
+    const int q_local = rcp_dev_getenv("RCP_QLOCAL") ? std::atoi(rcp_dev_getenv("RCP_QLOCAL")) : config.quench_local;   // study: the environment decides (the wrapper resets research fields per quench)
+    const double q_alpha_min = rcp_dev_getenv("RCP_QALPHA_MIN") ? std::atof(rcp_dev_getenv("RCP_QALPHA_MIN")) : 0.0;   // study: a floor under FIRE's mixing (damping) factor; 0 = standard
+    // study (section 14, part 3, J10): L-BFGS for the search phase of the quench, FIRE for the finish. RCP_QLBFGS = memory
+    // (0: off); RCP_QLBFGS_RES = global residual at which FIRE takes over. A state machine around the force pass: one
+    // force evaluation per loop iteration; the line search uses the directional derivative only (the force pass
+    // returns no energy): a step whose directional derivative has turned clearly positive is shortened by a secant.
+    const int lb_m = rcp_dev_getenv("RCP_QLBFGS") ? std::atoi(rcp_dev_getenv("RCP_QLBFGS")) : 0;
+    const double lb_handover = rcp_dev_getenv("RCP_QLBFGS_RES") ? std::atof(rcp_dev_getenv("RCP_QLBFGS_RES")) : 1e-6;
+    bool lb_on = lb_m > 0; QLbfgs lb; lb.m = lb_m; std::vector<double> lb_g;
+    const double lb_cap = rcp_dev_getenv("RCP_QLBFGS_CAP") ? std::atof(rcp_dev_getenv("RCP_QLBFGS_CAP")) : 0.02;   // largest move of one coordinate per step, in smallest diameters
+    double lb_sumD = 0.0;
+    double lb_ks = 0.0, lb_ksq = 0.0;   // adaptive quench: the size scale is one more coordinate, w = ln(kappa) x sqrt(ks), gradient -dkappa / sqrt(ks)
+    long q_resets = 0, q_resets_last = 0, q_stopped = 0; const bool q_diag = rcp_dev_getenv("RCP_QDIAG") != nullptr;   // study: count FIRE's restarts
     std::vector<double> q_act; double q_act_med = 0.0;   // [224] activity-gated dissipation state
     double q_res = 1.0, q_gres = 1.0; bool q_converged = false;
     // [225] give-up triggers and wall bookkeeping. Wall contacts enter F in the force kernel but not z or the
@@ -6339,7 +6536,8 @@ std::pair<PackingResult, PackingTrace> run_packing_observed(
     // tick (else two consecutive ticks on the same flat window would burn
     // through several ticks while the system thinks it's "still flat").
     std::size_t mu_decay_next_tick_step = 0;
-    const double mu_decay_factor = [](){
+    const double mu_decay_factor = [&](){
+        if (config.sched_decay_factor > 0.0 && config.sched_decay_factor < 1.0) return config.sched_decay_factor;
         const char* s = std::getenv("RCP_MU_DECAY_FACTOR");
         if (!s || !s[0]) return 0.85;
         double v = std::atof(s);
@@ -6351,7 +6549,8 @@ std::pair<PackingResult, PackingTrace> run_packing_observed(
         double v = std::atof(s);
         return (v > 0.0) ? v : 5e-3;
     }();
-    const std::size_t mu_decay_cooldown = [](){
+    const std::size_t mu_decay_cooldown = [&](){
+        if (config.sched_decay_cooldown > 0) return static_cast<std::size_t>(config.sched_decay_cooldown);
         const char* s = std::getenv("RCP_MU_DECAY_COOLDOWN");
         if (!s || !s[0]) return std::size_t(250);
         long v = std::atol(s);
@@ -6428,11 +6627,12 @@ std::pair<PackingResult, PackingTrace> run_packing_observed(
         if (v == "forever") return SpeedPreset::Forever;
         return SpeedPreset::Quick;
     }();
-    const std::size_t osc_cycles_total = [speed_preset](){
+    const std::size_t osc_cycles_total = [&, speed_preset](){
+        if (config.sched_osc_cycles >= 0) return static_cast<std::size_t>(config.sched_osc_cycles);
         const char* s = std::getenv("RCP_OSC_CYCLES");
         if (s && s[0]) {
             long v = std::atol(s);
-            if (v >= 1 && v < 100) return std::size_t(v);
+            if (v >= 0 && v < 100) return std::size_t(v);   // 0 (study of section 14): no oscillation
         }
         switch (speed_preset) {
             case SpeedPreset::Immediate: return std::size_t(2);   // all presets: quick's cycles; they differ in the
@@ -6455,6 +6655,20 @@ std::pair<PackingResult, PackingTrace> run_packing_observed(
         const std::size_t base = static_cast<std::size_t>(dl);
         return static_cast<double>(rcp_rung1_end(base, rung1_extend_eff)) - static_cast<double>(base);
     }();
+    // step after which rung 1 ends (standard deadline x the extend factor), for the study's step-size schedules
+    const double rung1_end_step = [&]() -> double {
+        double dl = 2.0 * 4000.0 + 9.0 * std::sqrt(static_cast<double>(N) * static_cast<double>(Ndim)) - 2000.0;
+        if (dl < 1500.0) dl = 1500.0;
+        return static_cast<double>(rcp_rung1_end(static_cast<std::size_t>(dl), rung1_extend_eff));
+    }();
+    double fa_phi_ema = 0.0, fa_phi_ref = 0.0, fa_alpha = 0.0, fa_alpha_hot = 0.0;   // study mode 5: the controller's state
+    double fa6_mu = 0.0;   // study mode 6: the mu of the current step
+    bool fa_settle_on = false; long fa_settle_end = 0;   // study: the settle stage
+    bool fa_bridge_on = false; long fa_bridge_start = 0; double fa_bridge_mu0 = 0.0, fa_bridge_mu = 0.0, fa_bridge_acap = 0.0, fa_fnet = 0.0;   // study: the bridge stage
+    double fa5_start = 2500.0;   // mode 5: the step at which the controller starts (2500, or the end of the initial compression with adam_ref_plateau)
+    bool fa_cool_started = false;   // study: Adam's memory settings applied at the start of the cooling
+    if (config.adam_beta2 > 0.0 && config.adam_beta2 < 1.0) beta2 = config.adam_beta2;
+    bool fa6_started = false;   // study mode 6 with adam_ref_plateau: the controller has started (reference frozen)
     const double osc_period_factor = [](){
         const char* s = std::getenv("RCP_OSC_PERIOD_FACTOR");
         if (!s || !s[0]) return 0.5;
@@ -6994,7 +7208,7 @@ std::pair<PackingResult, PackingTrace> run_packing_observed(
         // same flat window before the system can respond. Per-step cost
         // when active = one phi-range scan over 250 doubles + a compare;
         // the existing transition gates already do this on every step.
-        if (!mu_pinned && mu_decay_active && step >= mu_decay_next_tick_step && step > 250) {   // [219] suspended under mu_pin
+        if (!mu_pinned && !fa_bridge_on && mu_decay_active && step >= mu_decay_next_tick_step && step > 250) {   // [219] suspended under mu_pin
             // Reuse phi_history (already maintained for transition gates).
             // Note: decay block runs at TOP of step, before phi_history[step-1]
             // is written this iteration. Use [step-250, step-1) to avoid the
@@ -7020,7 +7234,7 @@ std::pair<PackingResult, PackingTrace> run_packing_observed(
         // took), set period = osc_period_factor * t_basin, and start the
         // oscillation at step = current step. Note mu_flag is set to -1 so
         // rung -1 logic (Method B, alpha caps, etc.) applies during osc.
-        if (!mu_pinned && osc_enabled && osc_phase == OscPhase::INACTIVE &&   // [219] suspended under mu_pin
+        if (!mu_pinned && !fa_bridge_on && osc_enabled && osc_phase == OscPhase::INACTIVE &&   // [219] suspended under mu_pin
             mu_flag == 0 && !mu_decay_active && mu_change > 0 &&
             step > mu_change) {
             // mu_change was set at the 1->0 trigger step (= t_basin).
@@ -7047,12 +7261,12 @@ std::pair<PackingResult, PackingTrace> run_packing_observed(
         //   while mu is descending from a peak. mu_ref exponentially
         //   decays from mu_0 (rung 0 floor) to mu_-1 (rung -1 floor) with
         //   timescale t_relax (the measured 1->0 decay duration).
-        if (!mu_pinned && osc_enabled && osc_phase == OscPhase::ACTIVE) {   // [219] suspended under mu_pin
+        if (!mu_pinned && !fa_bridge_on && osc_enabled && osc_phase == OscPhase::ACTIVE) {   // [219] suspended under mu_pin
             const double t_into = static_cast<double>(step - osc_start_step);
             const double cycle_progress =
                 t_into / static_cast<double>(osc_period);
             if (cycle_progress >= static_cast<double>(osc_cycles_total)) {
-                mu = osc_mu_minus1;
+                if (osc_cycles_total > 0) mu = osc_mu_minus1;   // with 0 cycles the final descent starts from the level reached
                 osc_phase = OscPhase::FINAL_DESCENT;
                 osc_final_start_step = step;
                 mu_decay_next_tick_step = step + mu_decay_cooldown;
@@ -7126,7 +7340,11 @@ std::pair<PackingResult, PackingTrace> run_packing_observed(
                 mu_decay_next_tick_step = step + mu_decay_cooldown;
             }
         }
-        if (!mu_pinned && osc_enabled && osc_phase == OscPhase::DONE) {   // [219] under mu_pin the run continues to max_steps
+        if (fa_bridge_on && static_cast<long>(step) >= fa_bridge_start + config.adam_bridge_steps) {   // study: the bridge ends the run
+            steps = step;
+            break;
+        }
+        if (!mu_pinned && !fa_bridge_on && osc_enabled && osc_phase == OscPhase::DONE) {   // [219] under mu_pin the run continues to max_steps
             // [101] terminal reopen (opt-in, geo only): force a geo pass and
             // re-enter FINAL_DESCENT with a fresh convergence budget. No
             // schedule constant changes; mu stays where the descent left it.
@@ -7160,6 +7378,13 @@ std::pair<PackingResult, PackingTrace> run_packing_observed(
                     mu = mu_rung1 * rcp_bneck_kick_frac();
                     mu_decay_active = false;    // hold the small kick; don't immediately decay it
                 }
+            } else if (config.adam_settle_steps > 0 && !fa_settle_on) {   // study: settle before stopping
+                fa_settle_on = true;
+                fa_settle_end = static_cast<long>(step) + config.adam_settle_steps;
+                if (config.adam_settle_eps > 0.0) epsilon = config.adam_settle_eps;
+                if (config.adam_settle_mu > 0.0) mu = config.adam_settle_mu;
+            } else if (fa_settle_on && static_cast<long>(step) < fa_settle_end) {
+                // settling
             } else {
                 steps = step;
                 break;
@@ -7345,6 +7570,104 @@ std::pair<PackingResult, PackingTrace> run_packing_observed(
 
         if (step % 500 == 0) {
             alpha = std::min(alpha_max, 1.1 * alpha);
+        }
+        // study of section 14: a prescribed step size in rung 1 replaces the feedback above (off by default)
+        if (config.adam_alpha_mode == 5 || config.adam_alpha_mode == 6) {   // smoothed raw phi (50-step memory) and its running maximum
+            fa_phi_ema = fa_phi_ema <= 0.0 ? phi_cmp : 0.98 * fa_phi_ema + 0.02 * phi_cmp;
+            if (!config.adam_ref_plateau) { if (fa_phi_ema > fa_phi_ref) fa_phi_ref = fa_phi_ema; }
+            else if (!fa6_started && step > 500 && phi_cmp - phi_history[step - 250] < 1e-3 * phi_cmp) { fa6_started = true; fa_phi_ref = fa_phi_ema; fa5_start = static_cast<double>(step); }
+        }
+        if (config.adam_alpha_mode == 6 && config.mu_pin > 0.0 && config.max_steps > 0) {
+            const double s = static_cast<double>(step), T = static_cast<double>(config.max_steps);
+            const double t0 = config.adam_anneal_steps > 0 ? std::max(0.0, T - static_cast<double>(config.adam_anneal_steps)) : config.adam_alpha_c * T;
+            fa6_mu = config.mu_pin;
+            if (config.adam_ref_plateau ? fa6_started : s > 1000.0) {
+                if (fa_alpha <= 0.0) fa_alpha = alpha;
+                if (s <= t0) {
+                    const double target = std::pow(1.0 - config.adam_alpha_a, static_cast<double>(Ndim));
+                    fa_alpha *= std::exp(config.adam_alpha_gain * (fa_phi_ema / std::max(fa_phi_ref, 1e-300) - target));
+                    fa_alpha = std::min(0.1, std::max(1e-6, fa_alpha));
+                    fa_alpha_hot = fa_alpha_hot <= 0.0 ? fa_alpha : 0.998 * fa_alpha_hot + 0.002 * fa_alpha;
+                    alpha = fa_alpha;
+                } else {
+                    const double f = std::min(1.0, (s - t0) / std::max(1.0, T - t0));
+                    if (config.adam_anneal_ctrl) {   // compress the fluid at a controlled rate: ramp the target, keep steering
+                        const double e = config.adam_alpha_a * (1.0 - f) + config.adam_e_end * f;
+                        const double target = std::pow(1.0 - e, static_cast<double>(Ndim));
+                        fa_alpha *= std::exp(config.adam_alpha_gain * (fa_phi_ema / std::max(fa_phi_ref, 1e-300) - target));
+                        fa_alpha = std::min(0.1, std::max(1e-9, fa_alpha));
+                        alpha = fa_alpha;
+                    } else
+                    alpha = (fa_alpha_hot > 0.0 ? fa_alpha_hot : alpha) * std::pow(std::max(config.adam_alpha_b, 1.0), -f);
+                    if (config.adam_mu_end > 0.0) fa6_mu = config.mu_pin * std::pow(config.adam_mu_end / config.mu_pin, f);
+                    if (config.adam_mu_cycles > 1 && config.adam_mu_swing > 1.0)
+                        fa6_mu *= std::pow(config.adam_mu_swing, 0.5 * (1.0 - std::cos(2.0 * 3.141592653589793 * config.adam_mu_cycles * f)));
+                }
+            }
+        } else
+        if (config.adam_alpha_mode != 0 && mu_flag == 1 && config.adam_alpha_a > 0.0 &&
+            ((config.adam_alpha_mode == 5 && config.adam_ref_plateau) ? fa6_started : step > 2500)) {
+            const double s = static_cast<double>(step);
+            if (config.adam_alpha_mode == 1) alpha = config.adam_alpha_a;
+            else if (config.adam_alpha_mode == 2 && config.adam_alpha_b > 0.0) {
+                const double f = std::min(1.0, std::max(0.0, (s - 2500.0) / std::max(1.0, rung1_end_step - 2500.0)));
+                alpha = config.adam_alpha_a * std::pow(config.adam_alpha_b / config.adam_alpha_a, f);
+            } else if (config.adam_alpha_mode == 3) alpha = config.adam_alpha_a * std::pow(s / 2500.0, -config.adam_alpha_b);
+            else if (config.adam_alpha_mode == 5 && config.adam_alpha_b > 0.0) {
+                const bool in_steps = config.adam_hold_steps > 0 && config.adam_cool_steps > 0;
+                const double t0 = in_steps ? fa5_start + static_cast<double>(config.adam_hold_steps)
+                                           : fa5_start + config.adam_alpha_c * (rung1_end_step - fa5_start);
+                const double t1 = in_steps ? t0 + static_cast<double>(config.adam_cool_steps) : rung1_end_step;
+                if (fa_alpha <= 0.0) fa_alpha = alpha;                        // start from the feedback's value
+                if (s <= t0) {
+                    const double target = std::pow(1.0 - config.adam_alpha_a, static_cast<double>(Ndim));
+                    fa_alpha *= std::exp(config.adam_alpha_gain * (fa_phi_ema / std::max(fa_phi_ref, 1e-300) - target));
+                    fa_alpha = std::min(0.1, std::max(1e-6, fa_alpha));
+                    fa_alpha_hot = fa_alpha_hot <= 0.0 ? fa_alpha : 0.998 * fa_alpha_hot + 0.002 * fa_alpha;   // its recent mean
+                    alpha = fa_alpha;
+                } else {
+                    const double f = std::min(1.0, (s - t0) / std::max(1.0, t1 - t0));
+                    if (config.adam_anneal_ctrl) {   // controlled compression: the target expansion ramps from e to adam_e_end
+                        const double e = config.adam_alpha_a * (1.0 - f) + config.adam_e_end * f;
+                        fa_alpha *= std::exp(config.adam_alpha_gain * (fa_phi_ema / std::max(fa_phi_ref, 1e-300) - std::pow(1.0 - e, static_cast<double>(Ndim))));
+                        fa_alpha = std::min(0.1, std::max(1e-9, fa_alpha));
+                        alpha = fa_alpha;
+                    } else {
+                        // adam_cool_q < 1: the fall of the step size is completed after that fraction of the cooling, and
+                        // the rest is spent at the final step size ("soak")
+                        const double fq = (config.adam_cool_q > 0.0 && config.adam_cool_q < 1.0) ? std::min(1.0, f / config.adam_cool_q) : f;
+                        alpha = fa_alpha_hot * std::pow(config.adam_alpha_b, -fq);
+                    }
+                }
+            }
+            else if (config.adam_alpha_mode == 4 && config.adam_alpha_b > 0.0) {
+                const double t0 = 2500.0 + config.adam_alpha_c * (rung1_end_step - 2500.0);
+                const double f = s <= t0 ? 0.0 : std::min(1.0, (s - t0) / std::max(1.0, rung1_end_step - t0));
+                alpha = config.adam_alpha_a * std::pow(config.adam_alpha_b / config.adam_alpha_a, f);
+            }
+        }
+        if (config.adam_alpha_mode >= 4 && !fa_cool_started && (config.adam_beta2_cool > 0.0 || config.adam_cool_reset)) {
+            const double T6 = static_cast<double>(config.max_steps);
+            const double t0c = config.adam_alpha_mode == 6
+                ? (config.adam_anneal_steps > 0 ? std::max(0.0, T6 - static_cast<double>(config.adam_anneal_steps)) : config.adam_alpha_c * T6)
+                : 2500.0 + config.adam_alpha_c * (rung1_end_step - 2500.0);
+            if (static_cast<double>(step) > t0c) {
+                fa_cool_started = true;
+                if (config.adam_beta2_cool > 0.0 && config.adam_beta2_cool < 1.0) beta2 = config.adam_beta2_cool;
+                if (config.adam_cool_reset) {   // a fresh Adam: no memory of the hot stage's gradients
+                    std::fill(m_flat.begin(), m_flat.end(), 0.0); std::fill(v_flat.begin(), v_flat.end(), 0.0);
+                    std::fill(ell_m.begin(), ell_m.end(), 0.0); std::fill(ell_v.begin(), ell_v.end(), 0.0);
+                    m_kappa = 0.0; v_kappa = 0.0; v_update_kappa = 0.0; t = 1;
+                }
+            }
+        }
+        if (fa_settle_on && config.adam_settle_alpha > 0.0) alpha = config.adam_settle_alpha;
+        if (fa_bridge_on) {
+            const double f = std::min(1.0, static_cast<double>(static_cast<long>(step) - fa_bridge_start) / std::max<double>(1.0, static_cast<double>(config.adam_bridge_ramp)));
+            const double target = config.adam_bridge_mu > 0.0 ? config.adam_bridge_mu : fa_bridge_mu0;
+            fa_bridge_mu = fa_bridge_mu0 * std::pow(target / fa_bridge_mu0, f);
+            if (config.adam_bridge_c > 0.0) alpha = std::min(fa_bridge_acap, std::max(1e-13, config.adam_bridge_c * fa_fnet));
+            else if (config.adam_bridge_alpha > 0.0) alpha = config.adam_bridge_alpha;
         }
         // Cycle 17 H10: hard-lock alpha at rung -1 if freeze is on. Bypasses
         // all decay/bump/cap logic for a clean A/B against the oscillating
@@ -7566,8 +7889,11 @@ std::pair<PackingResult, PackingTrace> run_packing_observed(
             // extend (or a preset other than quick): rung 1 ends at factor x the standard deadline; rung1_extra, the
             // steps added (negative when shortened), is taken out again where the later schedule takes its lengths
             // from the step at which rung 1 ended, so that only rung 1 changes. Factor 1: the same numbers as before.
-            const std::size_t rung1_end = rcp_rung1_end(rung1_deadline, rung1_extend_eff);
-            if (!mu_pinned && step > static_cast<int>(rung1_end + mu_hold_shift)) {   // [219] suspended under mu_pin
+            std::size_t rung1_end = rcp_rung1_end(rung1_deadline, rung1_extend_eff);
+            if (config.adam_alpha_mode == 5 && config.adam_hold_steps > 0 && config.adam_cool_steps > 0)   // rung 1 in steps
+                rung1_end = (config.adam_ref_plateau && !fa6_started) ? std::numeric_limits<std::size_t>::max() / 4
+                    : static_cast<std::size_t>(fa5_start) + static_cast<std::size_t>(config.adam_hold_steps + config.adam_cool_steps);
+            if (!mu_pinned && !fa_bridge_on && step > static_cast<int>(rung1_end + mu_hold_shift)) {   // [219] suspended under mu_pin
                 // Cycle 19 Step 2: arm adaptive feedback mu decay.
                 // mu / 10 (= mu_1 / 10): empirically the winning ratio.
                 // Keeps mu_1 → mu_0 a decade decay, so t_relax measured
@@ -7577,12 +7903,17 @@ std::pair<PackingResult, PackingTrace> run_packing_observed(
                 // under-densified (bneck is a permutation, not a densifier [161]). The full
                 // normal convergence runs for ALL modes; mode-3 bneck now engages at the
                 // CONVERGED terminal via the reopen hook below (variant B, user [latest]).
+                if (config.adam_bridge_steps > 0) {   // study: the bridge takes over from here; no release
+                    fa_bridge_on = true; fa_bridge_start = static_cast<long>(step);
+                    fa_bridge_mu0 = mu; fa_bridge_mu = mu; fa_bridge_acap = alpha;
+                    mu_flag = 0; mu_change = step;
+                }
                 mu_decay_target = mu / 10.0;
                 // scaled: the level after rung 1 is its standard absolute value times mu_end_scale, whatever the plateau was
                 if (mu_scaled) mu_decay_target = mu_plateau_base / 10.0 * config.mu_end_scale;
-                mu_decay_active = true;
+                mu_decay_active = !fa_bridge_on;
                 mu_decay_next_tick_step = step + mu_decay_cooldown;
-                alpha /= 2.0;
+                if (!fa_bridge_on) alpha /= 2.0;
                 mu_flag = 0;
                 mu_change = step;
                 if (config.swap_geo_bottleneck == 3 && mu_rung1 <= 0.0) mu_rung1 = mu;   // H12c [163]: capture rung-1 mu for the reopen kick (mode 3 only)
@@ -7617,7 +7948,7 @@ std::pair<PackingResult, PackingTrace> run_packing_observed(
         // completed; osc handles the rung-0 → rung-1 transition via the
         // exponentially-decaying reference (mu_ref). Suppress the legacy
         // 0->-1 trigger and oscillation start block intercepts instead.
-        if (!mu_pinned && !osc_enabled && step > 500 && mu_flag == 0 && !mu_decay_active &&   // [219]
+        if (!mu_pinned && !fa_bridge_on && !osc_enabled && step > 500 && mu_flag == 0 && !mu_decay_active &&   // [219]
             step > mu_change + mu_decay_min_dwell) {
             std::vector<double> XX(phi_history.begin() + step - 250, phi_history.begin() + step - 1);
             double delta_XX = *std::max_element(XX.begin(), XX.end()) - *std::min_element(XX.begin(), XX.end());
@@ -7901,6 +8232,8 @@ std::pair<PackingResult, PackingTrace> run_packing_observed(
         }
         const double mu_hold_mult_now = config.swap_mu_ctrl ? mu_ctrl_mult : config.mu_hold_mult;
         const double mu_eff = aq_on ? aq_mu :                         // adaptive quench: its own fixed mu
+            fa_bridge_on ? fa_bridge_mu :                              // study: the bridge's mu
+            (config.adam_alpha_mode == 6 && fa6_mu > 0.0) ? fa6_mu :   // study mode 6: the budget run's mu
             mu_pinned ? config.mu_pin :             // [219] absolute mu pin
             mu_hold_now ? mu_hold_mult_now * mu1_ref :
             (mu_flag == 1 && rcp_mu1_boost() > 1.0)
@@ -8264,6 +8597,7 @@ std::pair<PackingResult, PackingTrace> run_packing_observed(
         g_t_bookkeep.begin();
         g_t_bk_meanforce.begin();
         F_magnitude = compute_mean_force(F, N, Ndim, Lc, z) / Fmean;
+        fa_fnet = F_magnitude * Fmean;   // mean net force per particle (study: the bridge's step size)
         F_history[step - 1] = F_magnitude;
         // Cycle 16: capture the rest of the per-step diagnostic series.
         // mu, alpha, mu_flag may change later in this step (mu/alpha ladder
@@ -8483,11 +8817,12 @@ std::pair<PackingResult, PackingTrace> run_packing_observed(
         }
         g_t_bk_phistory.end();
 
-        if (!runtime_fix_diameter && !quench_on) {   // [221] kappa frozen during a quench
+        if (!runtime_fix_diameter && !quench_on && !(fa_settle_on && config.adam_settle_fix)) {   // [221] kappa frozen during a quench (and in a fixed-size settle)
             // [219] while a morph is advancing, damp the global-scale response so positions absorb the transient
             // imbalance of the reference-size shift (morph_kappa_damp = 1 -> original step, bit for bit)
             const double kd = (morph_on && morph_armed && morph_lambda < 1.0) ? config.morph_kappa_damp : 1.0;
-            kappa = kappa - kd * alpha * m_hat_kappa / (std::sqrt(v_hat_kappa) + epsilon);   // kd == 1.0 is exact
+            const double alpha_kappa = (fa_bridge_on && config.adam_bridge_kalpha > 0.0) ? config.adam_bridge_kalpha : alpha;   // study: the bridge may give the size scale its own step
+            kappa = kappa - kd * alpha_kappa * m_hat_kappa / (std::sqrt(v_hat_kappa) + epsilon);   // kd == 1.0 is exact
         }
         g_t_bookkeep.end();
         g_t_position.begin();
@@ -8564,6 +8899,7 @@ std::pair<PackingResult, PackingTrace> run_packing_observed(
             if (q_iter % std::max<long>(1, config.quench_report_every) == 0) {
                 q_log.push_back(static_cast<double>(q_iter)); q_log.push_back(q_res); q_log.push_back(q_gres);
                 q_log.push_back(U); q_log.push_back(static_cast<double>(nback)); q_log.push_back(q_dt);
+                if (q_diag) { std::fprintf(stderr, "QDIAG %ld restarts %ld stopped %ld res %.3e dt %.3e | lbfgs: slope rejects %ld, energy rejects %ld, skipped %ld, actual/predicted %.3f, f %.12e\n", q_iter, q_resets - q_resets_last, q_stopped, q_gres, q_dt, lb.rejects, lb.frejects, lb.skips, lb.nacc ? lb.ratio_sum / lb.nacc : 0.0, lb.fprev); q_resets_last = q_resets; q_stopped = 0; lb.ratio_sum = 0.0; lb.nacc = 0; }
             }
             const bool q_armed = (q_iter >= 1) || (config.quench_kappa_mult == 1.0);
             // adaptive quench, as in the sphere block below: the size scale follows the pressure with drag. D is the
@@ -8581,7 +8917,9 @@ std::pair<PackingResult, PackingTrace> run_packing_observed(
                     aq_log.push_back(static_cast<double>(q_iter)); aq_log.push_back(mu_eff); aq_log.push_back(kappa);
                     aq_log.push_back(q_gres); aq_log.push_back(static_cast<double>(nback)); aq_log.push_back(nback ? zbb / static_cast<double>(nback) : 0.0);
                 }
-                if (ks > 0.0) kappa *= std::exp(config.quench_aq_gamma * q_dt * dkappa / ks);
+                lb_ks = ks; lb_sumD = sumD;
+                if (ks > 0.0 && lb_on) { /* L-BFGS moves the size scale below */ }
+                else if (ks > 0.0) kappa *= std::exp(config.quench_aq_gamma * q_dt * dkappa / ks);
                 else kappa *= 1.0 + 2e-4;
             }
             if (q_armed && nback > 0 && (aq_on ? q_gres : q_res) <= config.quench_tol && aq_done_ok) q_status = 1;
@@ -8608,6 +8946,46 @@ std::pair<PackingResult, PackingTrace> run_packing_observed(
                 for (std::size_t i = 0; i < N; ++i) q_minv[i] = med / std::max(1.0, static_cast<double>(qZ(i)));
             }
             auto q_free = [&](std::size_t i) { return !(q_held[i] || qS(i) <= 0.0); };
+            bool lb_did = false;
+            if (lb_on && q_iter > 0 && q_gres > 0.0 && q_gres < lb_handover) {   // the search is over: FIRE finishes
+                lb_on = false; std::fill(q_v.begin(), q_v.end(), 0.0); std::fill(ell_qw.begin(), ell_qw.end(), 0.0); q_dt = config.quench_dt0; q_alpha = config.quench_alpha0; q_npos = 0;
+                if (q_diag) std::fprintf(stderr, "QLBFGS handover at %ld: res %.3e, rejects %ld (energy %ld), skipped pairs %ld, mean actual/predicted decrease %.3f\n", q_iter, q_gres, lb.rejects, lb.frejects, lb.skips, lb.nacc ? lb.ratio_sum / lb.nacc : 0.0);
+            }
+            if (lb_on && (!aq_on || lb_ks > 0.0)) {
+                // coordinates: positions; rotation increments psi with d(angle) = d(psi) / A (A the bounding radius, as in
+                // the FIRE step), gradient -torque / A; and, in the adaptive quench, the size scale
+                lb_did = true;
+                const std::size_t nper = Ndim + nrot, nall = N * nper, ng = nall + (aq_on ? 1 : 0);
+                if (aq_on && lb_ksq == 0.0) lb_ksq = std::sqrt(lb_ks);
+                lb_g.assign(ng, 0.0);
+                for (std::size_t i = 0; i < N; ++i) {
+                    if (!q_free(i)) continue;
+                    const double ia = 1.0 / qA(i);
+                    for (std::size_t d = 0; d < Ndim; ++d) lb_g[i * nper + d] = -F[i * Ndim + d];
+                    for (std::size_t c = 0; c < nrot; ++c) lb_g[i * nper + Ndim + c] = -ell_torque[i * nrot + c] * ia;
+                }
+                if (aq_on) lb_g[nall] = -dkappa / lb_ksq;
+                const double a = lb.advance(lb_g, [&](std::vector<double>& dv) {
+                    double dmax = 0.0; for (std::size_t k = 0; k < nall; ++k) dmax = std::max(dmax, std::fabs(dv[k]));
+                    double sc = 1.0; const double cap = lb_cap * Dmin;
+                    if (dmax > cap) sc = cap / dmax;
+                    if (aq_on && std::fabs(dv[nall]) / lb_ksq * sc > 2e-4) sc = 2e-4 * lb_ksq / std::fabs(dv[nall]);
+                    if (sc < 1.0) for (double& v : dv) v *= sc;
+                }, ell_energy - (aq_on ? mu_eff * lb_sumD : 0.0), rcp_dev_getenv("RCP_QLBFGS_NOF") == nullptr);
+                double wst[8 * 7 / 2];
+                for (std::size_t i = 0; i < N; ++i) {
+                    for (std::size_t d = 0; d < Ndim; ++d) {
+                        const double dd = lb.d[i * nper + d]; if (dd == 0.0) continue;
+                        double xv = x[i * Ndim + d] + a * dd; const double L = box[d];
+                        if (xv >= L) xv -= L; else if (xv < 0.0) xv += L; x[i * Ndim + d] = xv;
+                    }
+                    const double ia = 1.0 / qA(i); bool any = false;
+                    for (std::size_t c = 0; c < nrot; ++c) { wst[c] = a * lb.d[i * nper + Ndim + c] * ia; if (wst[c] != 0.0) any = true; }
+                    if (any) ell_rotate_by(Ndim, ell_rot.data() + i * nn, wst);
+                }
+                if (aq_on) kappa *= std::exp(a * lb.d[nall] / lb_ksq);
+            }
+            if (!lb_did) {
             // FIRE: P = G.V over translational and rotational components
             double P = 0.0, fnorm2 = 0.0;
             for (std::size_t i = 0; i < N; ++i) {
@@ -8616,14 +8994,23 @@ std::pair<PackingResult, PackingTrace> run_packing_observed(
                 for (std::size_t d = 0; d < Ndim; ++d) { const double a = F[i * Ndim + d] * mi; P += a * q_v[i * Ndim + d]; fnorm2 += a * a; }
                 for (std::size_t c = 0; c < nrot; ++c) { const double a = ell_torque[i * nrot + c] * ia * mi; P += a * ell_qw[i * nrot + c]; fnorm2 += a * a; }
             }
-            if (P > 0.0) { if (++q_npos > 5) { q_dt = std::min(q_dt * 1.1, config.quench_dt_max); q_alpha *= 0.99; } }
-            else {
-                q_npos = 0; q_dt *= 0.5; q_alpha = config.quench_alpha0;
-                // half a step back, in position and in orientation, then stop
-                for (std::size_t k = 0; k < nd; ++k) { x[k] -= 0.5 * q_dt * q_v[k]; q_v[k] = 0.0; }
+            const bool q_event = !(P > 0.0);
+            if (!q_event) { if (++q_npos > 5) { q_dt = std::min(q_dt * 1.1, config.quench_dt_max); q_alpha = std::max(q_alpha_min, q_alpha * 0.99); } }
+            else { ++q_resets; q_npos = 0; q_dt *= 0.5; q_alpha = config.quench_alpha0; }
+            if ((q_event && q_local == 0) || (q_event && q_local == 1) || q_local == 2) {
+                // half a step back, in position and in orientation, then stop: every particle (standard), or only those
+                // moving against their own force and torque (quench_local)
                 double wback[8 * 7 / 2];
                 for (std::size_t i = 0; i < N; ++i) {
                     const double ia = 1.0 / qA(i); bool any = false;
+                    if (q_local != 0) {
+                        double Pi = 0.0;
+                        for (std::size_t d = 0; d < Ndim; ++d) Pi += F[i * Ndim + d] * q_v[i * Ndim + d];
+                        for (std::size_t c = 0; c < nrot; ++c) Pi += ell_torque[i * nrot + c] * ia * ell_qw[i * nrot + c];
+                        if (!(Pi < 0.0)) continue;
+                        ++q_stopped;
+                    }
+                    for (std::size_t d = 0; d < Ndim; ++d) { x[i * Ndim + d] -= 0.5 * q_dt * q_v[i * Ndim + d]; q_v[i * Ndim + d] = 0.0; }
                     for (std::size_t c = 0; c < nrot; ++c) { wback[c] = -0.5 * q_dt * ell_qw[i * nrot + c] * ia; if (wback[c] != 0.0) any = true; ell_qw[i * nrot + c] = 0.0; }
                     if (any) ell_rotate_by(Ndim, ell_rot.data() + i * nn, wback);
                 }
@@ -8681,6 +9068,7 @@ std::pair<PackingResult, PackingTrace> run_packing_observed(
                 for (std::size_t c = 0; c < nrot; ++c) { wstep[c] = q_dt * ell_qw[i * nrot + c] * ia; if (wstep[c] != 0.0) any = true; }
                 if (any) ell_rotate_by(Ndim, ell_rot.data() + i * nn, wstep);
             }
+            }   // FIRE (skipped while L-BFGS runs)
             ++q_iter;
         } else
         if (quench_on) {   // [221] FIRE quench: adaptive inertial descent on the true energy, unit or z-scaled masses
@@ -8754,6 +9142,7 @@ std::pair<PackingResult, PackingTrace> run_packing_observed(
             if (q_iter % std::max<long>(1, config.quench_report_every) == 0) {
                 q_log.push_back(static_cast<double>(q_iter)); q_log.push_back(q_res); q_log.push_back(q_gres);
                 q_log.push_back(U); q_log.push_back(static_cast<double>(nback)); q_log.push_back(q_dt);
+                if (q_diag) { std::fprintf(stderr, "QDIAG %ld restarts %ld stopped %ld res %.3e dt %.3e | lbfgs: slope rejects %ld, energy rejects %ld, skipped %ld, actual/predicted %.3f, f %.12e\n", q_iter, q_resets - q_resets_last, q_stopped, q_gres, q_dt, lb.rejects, lb.frejects, lb.skips, lb.nacc ? lb.ratio_sum / lb.nacc : 0.0, lb.fprev); q_resets_last = q_resets; q_stopped = 0; lb.ratio_sum = 0.0; lb.nacc = 0; }
             }
             // a kappa multiplier takes effect at the NEXT D = D0*kappa: never declare convergence before one iteration
             const bool q_armed = (q_iter >= 1) || (config.quench_kappa_mult == 1.0);
@@ -8774,7 +9163,9 @@ std::pair<PackingResult, PackingTrace> run_packing_observed(
                     aq_log.push_back(static_cast<double>(q_iter)); aq_log.push_back(mu_eff); aq_log.push_back(kappa);
                     aq_log.push_back(q_gres); aq_log.push_back(static_cast<double>(nback)); aq_log.push_back(nback ? zbb / static_cast<double>(nback) : 0.0);
                 }
-                if (ks > 0.0) kappa *= std::exp(config.quench_aq_gamma * q_dt * dkappa / ks);
+                lb_ks = ks; lb_sumD = sumD;
+                if (ks > 0.0 && lb_on) { /* L-BFGS moves the size scale below */ }
+                else if (ks > 0.0) kappa *= std::exp(config.quench_aq_gamma * q_dt * dkappa / ks);
                 else kappa *= 1.0 + 2e-4;                                   // nothing touches yet: swell until something does
             }
             if (q_armed && nback > 0 && (aq_on ? q_gres : q_res) <= config.quench_tol && aq_done_ok) q_status = 1;
@@ -8804,6 +9195,36 @@ std::pair<PackingResult, PackingTrace> run_packing_observed(
                 double med = 1.0; if (!zz.empty()) { std::nth_element(zz.begin(), zz.begin() + zz.size() / 2, zz.end()); med = zz[zz.size() / 2]; }
                 for (std::size_t i = 0; i < N; ++i) q_minv[i] = med / std::max(1.0, static_cast<double>(qZ(i)));
             }
+            bool lb_did = false;
+            if (lb_on && q_iter > 0 && q_gres > 0.0 && q_gres < lb_handover) {   // the search is over: FIRE finishes
+                lb_on = false; std::fill(q_v.begin(), q_v.end(), 0.0); q_dt = config.quench_dt0; q_alpha = config.quench_alpha0; q_npos = 0;
+                if (q_diag) std::fprintf(stderr, "QLBFGS handover at %ld: res %.3e, rejects %ld (energy %ld), skipped pairs %ld, mean actual/predicted decrease %.3f\n", q_iter, q_gres, lb.rejects, lb.frejects, lb.skips, lb.nacc ? lb.ratio_sum / lb.nacc : 0.0);
+            }
+            if (lb_on && (!aq_on || lb_ks > 0.0)) {
+                lb_did = true;
+                const std::size_t ng = nd + (aq_on ? 1 : 0);
+                if (aq_on && lb_ksq == 0.0) lb_ksq = std::sqrt(lb_ks);
+                lb_g.assign(ng, 0.0);
+                for (std::size_t i = 0; i < N; ++i) {
+                    if (q_held[i] || qS(i) <= 0.0) continue;
+                    for (std::size_t d = 0; d < Ndim; ++d) lb_g[i * Ndim + d] = -F[i * Ndim + d];
+                }
+                if (aq_on) lb_g[nd] = -dkappa / lb_ksq;
+                const double a = lb.advance(lb_g, [&](std::vector<double>& dv) {
+                    double dmax = 0.0; for (std::size_t k = 0; k < nd; ++k) dmax = std::max(dmax, std::fabs(dv[k]));
+                    double sc = 1.0; const double cap = lb_cap * Dmin;                 // no coordinate moves more than this in one step
+                    if (dmax > cap) sc = cap / dmax;
+                    if (aq_on && std::fabs(dv[nd]) / lb_ksq * sc > 2e-4) sc = 2e-4 * lb_ksq / std::fabs(dv[nd]);   // nor the size scale by more than 2e-4
+                    if (sc < 1.0) for (double& v : dv) v *= sc;
+                });
+                for (std::size_t i = 0; i < N; ++i) for (std::size_t d = 0; d < Ndim; ++d) {
+                    const double dd = lb.d[i * Ndim + d]; if (dd == 0.0) continue;
+                    double xv = x[i * Ndim + d] + a * dd; const double L = box[d];
+                    if (xv >= L) xv -= L; else if (xv < 0.0) xv += L; x[i * Ndim + d] = xv;
+                }
+                if (aq_on) kappa *= std::exp(a * lb.d[nd] / lb_ksq);
+            }
+            if (!lb_did) {
             // FIRE: P = F.v ; mixing ; adaptive dt / alpha ; semi-implicit Euler ; held and translation handling
             double P = 0.0, vnorm2 = 0.0, fnorm2 = 0.0;
             for (std::size_t i = 0; i < N; ++i) {
@@ -8812,9 +9233,16 @@ std::pair<PackingResult, PackingTrace> run_packing_observed(
                 for (std::size_t d = 0; d < Ndim; ++d) { const double a = F[i * Ndim + d] * mi; P += a * q_v[i * Ndim + d]; fnorm2 += a * a; vnorm2 += q_v[i * Ndim + d] * q_v[i * Ndim + d]; }
             }
             const bool q_warm = q_iter < config.quench_warm_steps;   // [224] warm phase: no resets, isokinetic rescale below
-            if (P > 0.0 || q_warm) { if (++q_npos > 5) { q_dt = std::min(q_dt * 1.1, config.quench_dt_max); q_alpha *= 0.99; } }
-            else { q_npos = 0; q_dt *= 0.5; q_alpha = config.quench_alpha0;
-                   for (std::size_t k = 0; k < nd; ++k) { x[k] -= 0.5 * q_dt * q_v[k]; q_v[k] = 0.0; } vnorm2 = 0.0; }
+            if (P > 0.0 || q_warm) { if (++q_npos > 5) { q_dt = std::min(q_dt * 1.1, config.quench_dt_max); q_alpha = std::max(q_alpha_min, q_alpha * 0.99); } }
+            else { ++q_resets; q_npos = 0; q_dt *= 0.5; q_alpha = config.quench_alpha0;
+                   if (q_local == 0) { for (std::size_t k = 0; k < nd; ++k) { x[k] -= 0.5 * q_dt * q_v[k]; q_v[k] = 0.0; } vnorm2 = 0.0; } }
+            if (q_local == 2 || (q_local == 1 && !(P > 0.0 || q_warm))) {   // study: local restart
+                for (std::size_t i = 0; i < N; ++i) {
+                    if (q_held[i] || q_light[i] || qS(i) <= 0.0) continue;
+                    double Pi = 0.0; for (std::size_t d = 0; d < Ndim; ++d) Pi += F[i * Ndim + d] * q_v[i * Ndim + d];
+                    if (Pi < 0.0) { ++q_stopped; for (std::size_t d = 0; d < Ndim; ++d) { x[i * Ndim + d] -= 0.5 * q_dt * q_v[i * Ndim + d]; q_v[i * Ndim + d] = 0.0; } }
+                }
+            }
             if (config.quench_mix_mode >= 2) {
                 // per-particle reset [222]: a particle moving against its own force stops (half-step back), independent of the rest
                 for (std::size_t i = 0; i < N; ++i) {
@@ -8905,6 +9333,7 @@ std::pair<PackingResult, PackingTrace> run_packing_observed(
                     if (xv >= L) xv -= L; else if (xv < 0.0) xv += L; x[i * Ndim + d] = xv;
                 }
             }
+            }   // FIRE (skipped while L-BFGS runs)
             ++q_iter;
         } else {
         if (rcp_fused_adam() && method != "Verlet") {

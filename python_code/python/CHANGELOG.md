@@ -1,8 +1,27 @@
 # Changelog
 
-## 1.2.2
+## 1.3.0
 
 ### New
+- **`pack(jam=True)` / `pack(jam=mu)`**: quench to a jammed state before returning (an `adaptive_quench` at `mu`,
+  default `mu_final`); the state is jammed at fixed sizes with no `mu` acting. `jam_max_iter` caps it; a quench that
+  stops there returns the packing with a warning. README, "A jammed state in one call".
+- **`lr_method`**: how Adam's learning rate is set. `"bounded_feedback"` (default) is the behaviour of every earlier
+  release, bit for bit. `"highly_active"` keeps the packing in vigorous motion and then compresses it at a
+  controlled rate: 25 to 50 % fewer Adam steps on the test cases, a slightly higher packing fraction, and a quench
+  after it that converges more reliably. Works with `diameter_permute`. README, "How Adam's learning rate is set".
+- **Pressure and stress**: `pressure`, `stress` (tensor), `particle_virial` (per particle, not divided by a volume),
+  `boundary_pressure` with `boundaries` and `boundary_force`, `stress_volume`, `update_pressure()`. From the contact
+  forces, independent of `mu`; filled by every run and on loading. README, "Pressure and stress".
+- **Hessian and eigenvalues**: `hessian()` (sparse, from force evaluations, every shape), `eigenvalues()` (all of
+  them) and `jam_check` (jammed or not, rattlers, zero and negative modes sorted by where they lie). Built at the end
+  of every quench (`auto_hessian`). Refused above 15,000 degrees of freedom unless `force=True`. NumPy only.
+  README, "Hessian and eigenvalues".
+- **Diameter permutation runs on all threads.** The pass was single-threaded for every shape; its candidate work is
+  now threaded for spheres, ellipsoids and rods, choosing exactly the exchanges it chose before (verified by
+  identical packings). 3D spheres, size ratio 10, 20,000 particles, four threads: 146 s before, 103 s after.
+- Build option `RCP_DEV_SWITCHES` (off by default): developer switches are compiled in only with it. README,
+  "Developer switches".
 - **`extend`**: `Packing(extend=x)` or `pack(extend=x)` lengthens the first stage of a run (the stage at the starting
   pressure `mu`) by the factor `x` and leaves the rest of the run as it is. A longer first stage gives a denser
   packing: 5,000 spheres with a size ratio of 10 reach `phi_contact` 0.7372 in 17,821 steps without it, 0.7405 in

@@ -13,6 +13,13 @@ option(
     OFF
 )
 
+# Developer switches (study settings, the quench's L-BFGS, diagnostics): compiled in only when this is ON. A normal
+# build does not read their environment variables and the Python wrapper refuses the study keywords.
+option(RCP_DEV_SWITCHES "Compile in the developer switches (study settings, hidden tools)" OFF)
+if(RCP_DEV_SWITCHES)
+    add_compile_definitions(RCP_DEV_SWITCHES)
+endif()
+
 # OpenMP for parallel force loop (Phase 1 parallelization)
 # MSVC's classic OpenMP mode is limited to OpenMP 2.0. The core uses tasks,
 # min/max reductions, and unsigned loop indices, all of which require MSVC's
