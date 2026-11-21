@@ -6556,6 +6556,22 @@ std::pair<PackingResult, PackingTrace> run_packing_observed(
         long v = std::atol(s);
         return (v > 0 && v < 100000) ? std::size_t(v) : std::size_t(250);
     }();
+    // The FINISH (the last lowering of mu, until the stopping test passes) always uses the standard factor and
+    // interval, whatever sched_decay_* say. LOG [065]: with the release's fast ticks (0.5 every 100 steps) a large,
+    // very polydisperse packing could not keep up in the finish, its stopping test never passed, mu ran down to
+    // 1e-20 and the particles came apart.
+    const double mu_decay_factor_finish = [](){
+        const char* s = std::getenv("RCP_MU_DECAY_FACTOR");
+        if (!s || !s[0]) return 0.85;
+        double v = std::atof(s);
+        return (v > 0.1 && v < 1.0) ? v : 0.85;
+    }();
+    const std::size_t mu_decay_cooldown_finish = [](){
+        const char* s = std::getenv("RCP_MU_DECAY_COOLDOWN");
+        if (!s || !s[0]) return std::size_t(250);
+        long v = std::atol(s);
+        return (v > 0 && v < 100000) ? std::size_t(v) : std::size_t(250);
+    }();
     // For the legacy 0->-1 transition trigger which previously needed
     // (step > mu_change + mu_decay_period + 250): keep a coarse upper bound
     // so the transition gate logic still has a "minimum dwell" reference.
@@ -6663,6 +6679,7 @@ std::pair<PackingResult, PackingTrace> run_packing_observed(
     }();
     double fa_phi_ema = 0.0, fa_phi_ref = 0.0, fa_alpha = 0.0, fa_alpha_hot = 0.0;   // study mode 5: the controller's state
     double fa6_mu = 0.0;   // study mode 6: the mu of the current step
+    long fin_hold_checks = 0;   // highly_active: checks in the finish with the overlap test passed and the force test not
     bool fa_settle_on = false; long fa_settle_end = 0;   // study: the settle stage
     bool fa_bridge_on = false; long fa_bridge_start = 0; double fa_bridge_mu0 = 0.0, fa_bridge_mu = 0.0, fa_bridge_acap = 0.0, fa_fnet = 0.0;   // study: the bridge stage
     double fa5_start = 2500.0;   // mode 5: the step at which the controller starts (2500, or the end of the initial compression with adam_ref_plateau)
@@ -7330,14 +7347,27 @@ std::pair<PackingResult, PackingTrace> run_packing_observed(
                         osc_phase = OscPhase::DONE;
                     }
                     // Hold mu — don't tick further.
+                } else if (config.adam_alpha_mode != 0 && max_min_dist < osc_ov_thresh) {
+                    // lr_method "highly_active" (LOG [065]): the largest overlap is already small enough, only the
+                    // force test fails. Lowering mu further cannot help it (it made the test fail for good, mu ran to
+                    // nothing and the packing came apart): hold mu and let the packing settle; after 12 such checks
+                    // the run ends as it is.
+                    osc_consec_conv = 0;
+                    if (++fin_hold_checks >= 12) osc_phase = OscPhase::DONE;
+                } else if (config.adam_alpha_mode != 0 && mu * mu_decay_factor_finish < 1e-3 * mu_plateau_base) {
+                    // lr modes (LOG [068b]): a floor under mu in the finish, a thousandth of the standard starting value.
+                    // At 700,000 particles of size ratio 90 the largest-overlap test was not met at any mu (loose small
+                    // particles keep producing an occasional deep overlap), mu ran to 2e-9 and every contact was lost.
+                    osc_consec_conv = 0;
+                    if (++fin_hold_checks >= 12) osc_phase = OscPhase::DONE;
                 } else {
                     osc_consec_conv = 0;
-                    mu *= mu_decay_factor;
+                    mu *= mu_decay_factor_finish;
                 }
                 if (step - osc_final_start_step > osc_max_final_steps) {
                     osc_phase = OscPhase::DONE;
                 }
-                mu_decay_next_tick_step = step + mu_decay_cooldown;
+                mu_decay_next_tick_step = step + mu_decay_cooldown_finish;
             }
         }
         if (fa_bridge_on && static_cast<long>(step) >= fa_bridge_start + config.adam_bridge_steps) {   // study: the bridge ends the run
@@ -7575,7 +7605,14 @@ std::pair<PackingResult, PackingTrace> run_packing_observed(
         if (config.adam_alpha_mode == 5 || config.adam_alpha_mode == 6) {   // smoothed raw phi (50-step memory) and its running maximum
             fa_phi_ema = fa_phi_ema <= 0.0 ? phi_cmp : 0.98 * fa_phi_ema + 0.02 * phi_cmp;
             if (!config.adam_ref_plateau) { if (fa_phi_ema > fa_phi_ref) fa_phi_ref = fa_phi_ema; }
-            else if (!fa6_started && step > 500 && phi_cmp - phi_history[step - 250] < 1e-3 * phi_cmp) { fa6_started = true; fa_phi_ref = fa_phi_ema; fa5_start = static_cast<double>(step); }
+            else if (!fa6_started && step > 500 && step % 25 == 0) {
+                // The initial compression has ended when phi has stayed within 0.2 % for 250 steps. (LOG [065]: the
+                // first test, "risen by less than 0.1 % in 250 steps", also fired at a transient: with a wide size
+                // distribution the first steps at the starting step size overshoot and then LOSE density, and the
+                // reference was taken at that peak, far below jamming.)
+                auto mm = std::minmax_element(phi_history.begin() + (step - 250), phi_history.begin() + (step - 1));
+                if (*mm.second - *mm.first < 2e-3 * phi_cmp) { fa6_started = true; fa_phi_ref = fa_phi_ema; fa5_start = static_cast<double>(step); }
+            }
         }
         if (config.adam_alpha_mode == 6 && config.mu_pin > 0.0 && config.max_steps > 0) {
             const double s = static_cast<double>(step), T = static_cast<double>(config.max_steps);
@@ -9352,7 +9389,14 @@ std::pair<PackingResult, PackingTrace> run_packing_observed(
             double* vd = v_flat.data();
             double* xd = x.data();
             const double* box_data = box.data();
-            const bool use_pp_mult = pp_alpha_mult_loaded && (mu_flag == -1);
+            const bool size_step_now = config.adam_size_step > 0.0 && config.adam_alpha_mode == 5 && fa6_started && mu_flag == 1;
+            if (size_step_now) {   // study: steps in proportion to (a power of) the particle's size
+                double s3 = 0.0, s4 = 0.0;
+                for (std::size_t q = 0; q < N; ++q) { const double d3 = D[q] * D[q] * D[q]; s3 += d3; s4 += d3 * D[q]; }
+                const double dstar = s3 > 0.0 ? s4 / s3 : 1.0;
+                for (std::size_t q = 0; q < N; ++q) pp_alpha_mult[q] = std::pow(D[q] / dstar, config.adam_size_step);
+            }
+            const bool use_pp_mult = size_step_now || (pp_alpha_mult_loaded && (mu_flag == -1));
             const double* ppm = use_pp_mult ? pp_alpha_mult.data() : nullptr;
 #if defined(__AVX512F__)
             if (!use_pp_mult && (Ndim == 2 || Ndim == 3)) {
@@ -9457,7 +9501,14 @@ std::pair<PackingResult, PackingTrace> run_packing_observed(
             const std::size_t total = N * Ndim;
             // Cycle 18 Method D: per-particle alpha multiplier — active only
             // at rung -1 when loaded. Damps explicit troublemaker particles.
-            const bool use_pp_mult = pp_alpha_mult_loaded && (mu_flag == -1);
+            const bool size_step_now = config.adam_size_step > 0.0 && config.adam_alpha_mode == 5 && fa6_started && mu_flag == 1;
+            if (size_step_now) {   // study: steps in proportion to (a power of) the particle's size
+                double s3 = 0.0, s4 = 0.0;
+                for (std::size_t q = 0; q < N; ++q) { const double d3 = D[q] * D[q] * D[q]; s3 += d3; s4 += d3 * D[q]; }
+                const double dstar = s3 > 0.0 ? s4 / s3 : 1.0;
+                for (std::size_t q = 0; q < N; ++q) pp_alpha_mult[q] = std::pow(D[q] / dstar, config.adam_size_step);
+            }
+            const bool use_pp_mult = size_step_now || (pp_alpha_mult_loaded && (mu_flag == -1));
             if (use_pp_mult) {
                 const double* ppm = pp_alpha_mult.data();
                 #pragma omp parallel for schedule(static)

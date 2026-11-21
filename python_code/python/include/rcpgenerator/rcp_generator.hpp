@@ -140,6 +140,10 @@ struct PackingConfig {
     // every velocity is set to zero). 1: on that event the time step is still halved, but only the particles moving
     // against their own force are stopped. 2: as 1, and such particles are stopped at every iteration.
     int    quench_local = 0;
+    // study (LOG [066]): with a wide size distribution one step size for all particles agitates the small ones far
+    // more, relative to their size, than the large ones. adam_size_step = p > 0: during the controller's hold and
+    // ramp (mode 5) particle i steps by alpha x (D_i / D*)^p, D* the volume-weighted mean diameter. 0: off.
+    double adam_size_step = 0.0;
     double adam_cool_q = 1.0;   // mode 5: fraction of the cooling over which the step size falls; the rest is held at its end value
     double adam_beta2 = 0.0, adam_beta2_cool = 0.0;
     int    adam_cool_reset = 0;

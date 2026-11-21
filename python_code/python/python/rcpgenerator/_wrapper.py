@@ -91,7 +91,8 @@ class Packing:
 
     Every shape, after ``pack()``, ``quench()`` or ``adaptive_quench()``: ``z`` (contacts per particle, in the
     order of ``positions``; a wall the particle touches counts as one), ``z_mean``, ``n_rattlers`` (fewer than
-    Ndim + 1 contacts) and ``z_mean_no_rattlers``. ``mu_final`` is the pressure term a packing run ended on.
+    Ndim + 1 contacts) and ``z_mean_no_rattlers``. ``mu_final`` is the pressure term a packing run steps down to (the level its release of ``mu`` ends on:
+    2.5e-5 with the standard schedule), ``mu_last`` the value on its very last step.
     ``extend=x`` lengthens the first stage of the packing run by the factor x (see ``pack``);
     ``adaptive_quench()`` balances a packing (any shape) at a pressure with the sizes free.
     """
@@ -138,7 +139,7 @@ class Packing:
     _DEV_SCALES = ("mu_boost_scale", "mu_plateau_scale", "mu_end_scale")
     # Study settings of BUILD.md section 14 (branch fast-adam): accepted by the constructor, sent to the core only
     # when they differ from these defaults. Not documented for users.
-    _STUDY_DEFAULTS = {"adam_alpha_mode": 0, "adam_alpha_a": 0.0, "adam_alpha_b": 0.0, "adam_alpha_c": 0.0, "adam_mu_end": 0.0, "adam_beta2": 0.0, "adam_cool_q": 1.0, "adam_bridge_steps": 0, "adam_bridge_ramp": 500, "adam_bridge_mu": 0.0, "adam_bridge_c": 0.0, "adam_bridge_alpha": 0.0, "adam_bridge_kalpha": 0.0, "adam_settle_steps": 0, "adam_settle_eps": 0.0, "adam_settle_alpha": 0.0, "adam_settle_mu": 0.0, "adam_settle_fix": 0, "adam_hold_steps": 0, "adam_cool_steps": 0, "sched_osc_cycles": -1, "sched_decay_cooldown": 0, "sched_decay_factor": 0.0,
+    _STUDY_DEFAULTS = {"adam_alpha_mode": 0, "adam_alpha_a": 0.0, "adam_alpha_b": 0.0, "adam_alpha_c": 0.0, "adam_mu_end": 0.0, "adam_beta2": 0.0, "adam_cool_q": 1.0, "adam_bridge_steps": 0, "adam_bridge_ramp": 500, "adam_bridge_mu": 0.0, "adam_bridge_c": 0.0, "adam_bridge_alpha": 0.0, "adam_bridge_kalpha": 0.0, "adam_size_step": 0.0, "adam_settle_steps": 0, "adam_settle_eps": 0.0, "adam_settle_alpha": 0.0, "adam_settle_mu": 0.0, "adam_settle_fix": 0, "adam_hold_steps": 0, "adam_cool_steps": 0, "sched_osc_cycles": -1, "sched_decay_cooldown": 0, "sched_decay_factor": 0.0,
                        "adam_anneal_ctrl": 0, "adam_e_end": -0.03, "adam_ref_plateau": 0, "adam_beta2_cool": 0.0, "adam_cool_reset": 0, "adam_alpha_gain": 0.01, "adam_mu_swing": 1.0, "adam_mu_cycles": 0, "adam_anneal_steps": 0}
     # How Adam's step size (learning rate) is set during the run: lr_method (BUILD.md sections 14 and 15).
     # "bounded_feedback" (the default; bit-identical to earlier releases): the step size is kept within bounds by a
@@ -247,6 +248,7 @@ class Packing:
         obj.mu_history = deepcopy(final_result.get("mu_history", []))
         obj.alpha_history = deepcopy(final_result.get("alpha_history", []))
         obj.mu_final = final_result.get("mu_final")
+        obj.mu_last = None   # not saved: the value on the last step of the run that made the state
         obj.quench_aq_log = []
         for k, v in cls._RUN_ATTR_DEFAULTS.items():       # diagnostics a run sets and a saved state does not carry
             if not hasattr(obj, k):
@@ -337,7 +339,8 @@ class Packing:
         self.trajectory_energy = []
         self.trajectory_max_min_dist = []
         self.trajectory_origin = []
-        self.mu_final = None        # the pressure term mu at the end of the last pack() (or adaptive_quench())
+        self.mu_final = None        # the mu the last pack()'s step-down targets (or the mu of the last adaptive_quench())
+        self.mu_last = None         # the mu on the last step of the last pack()
         self._set_contact_numbers(None)   # z, z_mean, n_rattlers, z_mean_no_rattlers: filled by pack() and the quenches
         self.quench_aq_log = []
 
@@ -619,6 +622,18 @@ class Packing:
         self.n_rattlers = len(z) - len(held)
         self.z_mean_no_rattlers = (sum(held) / len(held)) if held else None
 
+    def _measure_config(self) -> dict[str, Any]:
+        """The pack config for a measurement of the state as it is (pressure, Hessian): for ellipsoids the contact
+        between two particles is iterated to convergence. A packing run tracks each contact from step to step and
+        needs only a few iterations per step (``ell_iters``); a single evaluation from scratch does not have that
+        history, and with the run's few iterations it is not converged for strongly aspherical shapes: the forces
+        are then not those the run balanced (measured on 8 : 1 ellipsoids: net force 2e-3 where the run had 1e-13,
+        and a Hessian that is not symmetric)."""
+        cfg = self._collect_pack_config(translate=False)
+        if self.aspect_ratios and "ell_iters" in cfg:
+            cfg["ell_iters"] = max(int(cfg["ell_iters"]), 400)
+        return cfg
+
     def _set_pressure(self, compute: bool, keep_round: bool = False) -> None:
         """Fill the contact-stress attributes from the state as it is (sizes fixed; ``mu`` plays no part), or clear
         them. Units: the code's (pair stiffness 1, box lengths).
@@ -641,7 +656,7 @@ class Packing:
                 setattr(self, k, None)
             return
         try:
-            cfg = self._collect_pack_config(translate=False)
+            cfg = self._measure_config()
             # Rods after a quench: the quench balanced slightly ROUNDED rods; the stress is that of the same contact law.
             if not keep_round:
                 in_quench = self.is_rod and int(getattr(self, "quench_mode", 0)) and float(getattr(self, "quench_rod_round", 0.0)) > 0.0
@@ -684,7 +699,7 @@ class Packing:
         the eigenvalues of a system that size would need). Not available above 8 dimensions."""
         _hessian.check_size(self._hessian_dof(), force, "hessian()")
         if self._hessian_obj is None or rebuild or step is not None:
-            cfg = self._collect_pack_config(translate=False)
+            cfg = self._measure_config()
             if self.is_rod and float(getattr(self, "stress_rod_round", 0.0) or 0.0) > 0.0:
                 cfg["rod_round"] = float(self.stress_rod_round)   # after a quench: the rounded rods it balanced
             self._hessian_obj = _hessian.build(self._collect_pack_input(), cfg, shape=bool(self._nonsphere),
@@ -714,14 +729,15 @@ class Packing:
         H = self.hessian(force=force)
         n = int(self.Ndim); N = len(self.diameters)
         if not self._nonsphere:
-            spin = [0] * N
-        elif self.is_rod:
-            spin = [(n - 1) * (n - 2) // 2] * N
+            planes = [[] for _ in range(N)]
+        elif self.is_rod:      # a rod is unchanged by any rotation among the axes across its own
+            planes = [[(k, l) for k in range(1, n) for l in range(k + 1, n)]] * N
         elif self.has_shape_table:
-            spin = [_hessian.spin_modes(n, [1.0] + list(r)) for r in self.aspect_ratios]
+            planes = [_hessian.spin_planes(n, [1.0] + list(r)) for r in self.aspect_ratios]
         else:
-            spin = [_hessian.spin_modes(n, [1.0] + list(self.aspect_ratios))] * N
-        v = _hessian.verdict(H, n_dim=n, walls=self.walls, spin=spin, tol=tol)
+            planes = [_hessian.spin_planes(n, [1.0] + list(self.aspect_ratios))] * N
+        spin = [len(q) for q in planes]
+        v = _hessian.verdict(H, n_dim=n, walls=self.walls, spin=spin, tol=tol, planes=planes)
         ev = v.pop("eigenvalues")
         self.jam_check = v
         return ev
@@ -903,11 +919,12 @@ class Packing:
         if getattr(self, "lr_method", "bounded_feedback") != "bounded_feedback":   # only when not the default
             cfg["lr_method"] = self.lr_method
             if translate and getattr(self, "_engine_run", False):   # a pack() run with lr_method="highly_active"
-                cfg.update(self._FLUID_RECIPE)
+                for rk, rv in self._FLUID_RECIPE.items():   # a developer build may override a recipe value by its study keyword
+                    cfg.setdefault(rk, rv)
                 cfg["mu_plateau_scale"] = self._FLUID_PRESSURE * float(getattr(self, "mu_plateau_scale", 1.0))
                 cfg.pop("rung1_extend", None)   # with this method extend scales the hold, not the standard deadline
-                cfg["adam_hold_steps"] = max(1, int(round(self._FLUID_HOLD * (1.0 if getattr(self, "extend", None) is None else float(self.extend)))))
-                cfg["adam_cool_steps"] = self._FLUID_COOL[1 if self._nonsphere else 0]
+                cfg.setdefault("adam_hold_steps", max(1, int(round(self._FLUID_HOLD * (1.0 if getattr(self, "extend", None) is None else float(self.extend))))))
+                cfg.setdefault("adam_cool_steps", self._FLUID_COOL[1 if self._nonsphere else 0])
         if self.aspect_ratios:   # ellipsoids only: a sphere pack config is exactly what it always was
             if not self.has_shape_table:   # one shape for all travels in the config, a table in the input
                 cfg["aspect_ratios"] = list(self.aspect_ratios)
@@ -1146,9 +1163,19 @@ class Packing:
             self.mu_history = result.get("mu_history", [])
             self.alpha_history = result.get("alpha_history", [])
             self.quench_aq_log = list(result.get("quench_aq_log", []))
-            if not int(getattr(self, "quench_mode", 0)):   # a packing run: the mu it ended on (a quench leaves it alone)
+            if not int(getattr(self, "quench_mode", 0)):   # a packing run (a quench leaves both alone)
+                # mu_final: the value the run's step-down of mu TARGETS, i.e. the level the release ends on (2.5e-5 with
+                # the standard schedule: a tenth of the starting mu). mu_last: the value mu actually had on the last
+                # step; the finish goes on lowering it in small ticks until the stopping test passes, so it differs
+                # from run to run and can be far lower. The quenches' default mu is mu_final (Ken, 2026-11-21).
                 n_mu = min(int(self.steps), len(self.mu_history))
-                self.mu_final = float(self.mu_history[n_mu - 1]) if n_mu > 0 else None
+                self.mu_last = float(self.mu_history[n_mu - 1]) if n_mu > 0 else None
+                flags = result.get("mu_flag_history", [])
+                nf = min(n_mu, len(flags))
+                rel = [k for k in range(nf) if int(flags[k]) == 0]
+                # the release has ended where the stage flag first turns to -1 after it: mu there IS the target
+                after = next((k for k in range(rel[-1] + 1, nf) if int(flags[k]) == -1), None) if rel else None
+                self.mu_final = float(self.mu_history[after]) if after is not None else self.mu_last   # a run stopped before the release ended: what it had
             self.swap_log = result.get("reorder_log", [])
             self.particle_origin = result.get("particle_origin", [])
             self.swap_counts = result.get("spike_log", [])   # per-particle accepted swaps when swap > 0
@@ -1384,7 +1411,8 @@ class Packing:
         jam_max_iter: int = 200000,
     ) -> dict[str, Any]:
         """Run the packing. ``jam=True`` (or ``jam=mu``) quenches the result to a jammed state before returning:
-        an ``adaptive_quench`` at the pressure ``mu`` (default: the run's own final ``mu``, ``mu_final``), after
+        an ``adaptive_quench`` at the pressure ``mu`` (default: ``mu_final``, the level the run's step-down of ``mu``
+        targets, 2.5e-5 with the standard schedule), after
         which the particle forces balance at the sizes the packing ends with, so the state is jammed at fixed sizes
         with no ``mu`` acting (a plain ``quench()`` after it has nothing left to do). ``mu`` sets the overlap of
         that state; the closer to zero, the longer the quench. The same result as calling ``pack()`` and then
@@ -1812,7 +1840,8 @@ class Packing:
         Parameters
         ----------
         mu : float, optional
-            The pressure term. Default: ``mu_final``, the value the last ``pack()`` (or ``adaptive_quench()``)
+            The pressure term. Default: ``mu_final``, the level the last ``pack()`` stepped ``mu`` down to (2.5e-5
+            with the standard schedule; not the value on its last step, which is ``mu_last``), or the ``mu`` of the last ``adaptive_quench()``
             ended on. A larger ``mu`` gives a more compressed packing with larger overlaps, a smaller one a
             packing closer to contact. Must be given when the state has no ``mu_final`` (for example a state
             saved by an earlier version).
@@ -2076,7 +2105,9 @@ class Packing:
         return self.update_box(new_box)
 
     def copy(self) -> "Packing":
-        return type(self).from_dict(self.to_dict())
+        obj = type(self).from_dict(self.to_dict())
+        obj.mu_last = getattr(self, "mu_last", None)   # not part of the saved state, but a copy is the same packing
+        return obj
 
     def clone(self) -> "Packing":
         return self.copy()

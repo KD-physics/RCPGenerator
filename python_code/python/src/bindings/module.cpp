@@ -242,6 +242,7 @@ rcpgenerator::PackingConfig packing_config_from_dict(const py::dict& source) {
     assign_if_present(source, "adam_mu_end", config.adam_mu_end);
     assign_if_present(source, "adam_beta2", config.adam_beta2);
     assign_if_present(source, "adam_cool_q", config.adam_cool_q);
+    assign_if_present(source, "adam_size_step", config.adam_size_step);
     assign_if_present(source, "quench_local", config.quench_local);
     assign_if_present(source, "adam_bridge_steps", config.adam_bridge_steps);
     assign_if_present(source, "adam_bridge_ramp", config.adam_bridge_ramp);

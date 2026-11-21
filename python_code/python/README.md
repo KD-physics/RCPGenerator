@@ -431,7 +431,8 @@ After `pack()` or `relax()`, the most commonly used attributes are:
 | `z` | Contacts per particle, in the particle order of `positions`: the neighbours it overlaps, plus one for each wall it overlaps. Filled by `pack()`, `quench()` and `adaptive_quench()` and on loading a packed state; it describes the state those left. `None` before a run and for spheres above 8 dimensions. |
 | `z_mean`, `n_rattlers`, `z_mean_no_rattlers` | The mean of `z` over all particles; the number of rattlers (particles with fewer than `Ndim + 1` contacts, which cannot be held in place); the mean of `z` over the particles that are not rattlers. A packing straight from `pack()` is not in force balance, so there these count the pairs that happen to overlap at the stop; after a quench they are the contact numbers of the balanced network. |
 | `mean_overlap`, `max_overlap` | The mean and the largest relative overlap over the pairs of particles that overlap: for spheres `1 - distance / (r_i + r_j)`, for ellipsoids and rods one minus the factor by which the pair would have to shrink to touch. Wall contacts are not included (`1 - shrink_factor` is the largest overlap with walls included). Filled with `z`. Shrinking every diameter by the factor `1 - mean_overlap` lowers the packing fraction by about `Ndim * mean_overlap`; this is the number to use when two packings are to be compared at the same degree of overlap. |
-| `mu_final` | The pressure term `mu` the run ended on; the default `mu` of [`adaptive_quench()`](#adaptive-quench-balance-at-a-pressure). `None` for a state that was not packed by this version. |
+| `mu_final` | The level the run steps the pressure term `mu` down to: 2.5e-5 with the standard schedule (a tenth of the starting `mu`). The default `mu` of [`adaptive_quench()`](#adaptive-quench-balance-at-a-pressure) and of `pack(jam=True)`. `None` for a state that was not packed by this version. |
+| `mu_last` | The value `mu` had on the last step of the run. After the step-down the run goes on lowering `mu` in small ticks until its stopping test passes, so this differs from run to run. Not saved. |
 | `alpha_history` | Learning-rate value by step. |
 | `mu_flag_history` | Chemical-potential rung indicator (`-1`, `0`, or `1`) by step. |
 | `orientations` | Ellipsoids and rods: final rotation matrices, shape `(N, Ndim, Ndim)`, in the particle order of `positions`; columns are the body axes, column 0 the longest axis or the rod's axis. Empty for spheres. |
@@ -820,7 +821,7 @@ as for `quench()`); with shapes, positions and orientations move together and to
 
 ```python
 packing.pack()
-packing.adaptive_quench()               # mu = packing.mu_final, the value pack() ended on
+packing.adaptive_quench()               # mu = packing.mu_final, the level pack() stepped mu down to (2.5e-5)
 print(packing.quench_status, packing.quench_iters, packing.quench_global_residual)
 print(packing.phi_final, packing.phi_contact)      # the balanced state, and the same state shrunk to contact
 ```
@@ -887,7 +888,8 @@ p.pack(jam=True)            # pack, then quench to a jammed state before returni
 p.pack(jam=2.5e-4)          # the same at a pressure mu of your choice
 ```
 
-`jam` runs `adaptive_quench(mu)` right after the pack (default `mu`: the run's own final `mu`, `mu_final`). When it
+`jam` runs `adaptive_quench(mu)` right after the pack (default `mu`: `mu_final`, the level the run steps `mu` down
+to, 2.5e-5 with the standard schedule). When it
 has converged the contact forces on every load-bearing particle balance at the sizes the packing ended with. `mu`
 acts only on the common size scale, never on a particle, so that state is jammed at fixed sizes with no `mu`
 acting: a plain `quench()` after it has nothing left to do. `mu` is therefore only the dial for the overlap of the
@@ -898,7 +900,10 @@ final state (the mean overlap is roughly proportional to it).
   `quench_status` says so.
 - **Cost.** A state closer to the jamming point (smaller `mu`, smaller overlap) takes longer, by any route: on a
   4D ellipsoid test case about 25,000 quench iterations at `mu = 2.5e-4`, 50,000 at `1e-4` and 120,000 at `2.5e-5`.
-  `mu_final` differs from run to run (1e-5 to 8e-5 on the test cases); pass a value for a fixed pressure.
+  The default, 2.5e-5, is a low pressure: pass a larger `mu` when a small overlap is not needed, or when the quench
+  does not settle. Strongly flattened ellipsoids need it: 1,000 ellipsoids with semi-axes 0.2 : 1 : 1.62 did not
+  converge in 300,000 iterations at 2.5e-4 and converged in 88,000 at `jam=1e-3` (such shapes are held by fewer
+  contacts than a count of degrees of freedom gives, through soft modes that stiffen with the pressure).
 - Rattlers are left as they are: the quench balances the particles that carry load.
 
 ## How Adam's learning rate is set: `lr_method`
@@ -923,6 +928,17 @@ walls and containers):
   scatter between seeds), and an `adaptive_quench()` after it that changes the packing fraction by about 1e-4 or
   less and converges more reliably;
 - with `diameter_permute=True` it makes more exchanges and ends denser again.
+
+**Wide size distributions.** The gain in packing fraction is for narrow size distributions (it is kept at 120,000
+particles: +0.004 in 45 % fewer steps for a 1 : 1.4 mix). It shrinks as the size ratio grows: for power-law
+distributions the two methods agree at a size ratio of 10, and at 20 and 50 `"highly_active"` is 0.001 to 0.005
+below the default at its default length while using about 30 % fewer steps. There the default method already
+agitates the small particles strongly (its step is a sizeable fraction of the smallest diameter), so the extra
+agitation adds nothing; no way of managing the step size that was tried beat the default at equal cost, and the
+packing fraction rises by about 0.003 to 0.004 per doubling of the steps with either method. One draw of the sizes
+can differ from another by more than that (0.013 between three draws at a size ratio of 50 with the largest
+particle at 0.37 of the box, where repeated placements of one size list agree to 0.0002), so compare methods on the
+same size list.
 
 `extend` is its one dial: it scales the length of the hold (3,000 steps at `extend=1`). A longer hold gives a
 denser packing, about +0.002 per doubling. **Single-size spheres in 3D begin to order when pushed**: 1.4 % of the
@@ -987,6 +1003,9 @@ arc length on the bounding sphere, so that every entry is a stiffness. It is bui
   quench the automatic build is skipped above the limit, without an error. Use beyond the limit is your call.
 - The verdict is about rigidity. Whether the forces balance is what `quench_global_residual` says.
 - A pair that exactly touches (a loose particle resting on a neighbour) enters with half its stiffness.
+- For ellipsoids the pressure and the Hessian are measured with every contact iterated to convergence, whatever
+  `ell_iters` is (a run follows each contact from step to step and needs few iterations; a measurement from
+  scratch of a strongly aspherical shape does not have that history).
 
 ## Ellipsoids and rods
 

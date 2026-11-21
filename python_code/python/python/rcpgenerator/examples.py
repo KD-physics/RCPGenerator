@@ -437,7 +437,7 @@ import rcpgenerator
 packing = rcpgenerator.Packing(N=1000, Ndim=3, phi=0.05, box=[1.0, 1.0, 1.0], walls=[0, 0, 0],
                                dist={"type": "lognormal", "mu": 0.0, "sigma": 0.3}, seed=1)
 packing.pack()
-print("mu at the end of the run:", packing.mu_final)
+print("mu the run stepped down to:", packing.mu_final)
 packing.adaptive_quench()          # the diameters follow the pressure mu (default: mu_final) until forces balance
 print(packing.quench_status, packing.quench_iters, packing.quench_global_residual)
 print(packing.phi_final, packing.phi_contact)      # the balanced state, and the same state shrunk to contact

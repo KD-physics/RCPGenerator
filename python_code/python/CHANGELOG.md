@@ -28,9 +28,11 @@
   32,145 steps with `extend=3`, 0.7426 in 67,843 steps with `extend=8.04`. Not set: the run is unchanged.
 - **`adaptive_quench(mu=..., tol=..., max_iter=...)`**: force balance with the diameters free. One common scale
   factor on all diameters follows the pressure term `mu` until the contact forces carry it. Default `mu`: the new
-  attribute `mu_final`, the value the packing run ended on. Spheres, ellipsoids and rods (rods in 2D and 3D).
+  attribute `mu_final`, the level the packing run steps `mu` down to. Spheres, ellipsoids and rods (rods in 2D and 3D).
   README, "Adaptive quench".
-- `mu_final`: the `mu` a run ended on. `to_dict()` has one more `final_result` key for it.
+- `mu_final`: the level a run steps `mu` down to (2.5e-5 with the standard schedule); the default `mu` of
+  `adaptive_quench()` and `pack(jam=True)`. `to_dict()` has one more `final_result` key for it. `mu_last`: the value on
+  the run's last step (not saved).
 - **Contact numbers**: `z` (contacts per particle, in the order of `positions`; a wall the particle touches counts
   as one), `z_mean`, `n_rattlers` (fewer than `Ndim + 1` contacts) and `z_mean_no_rattlers`. Filled by `pack()`,
   `quench()` and `adaptive_quench()` and on loading a packed state, for every shape (`None` for spheres above 8

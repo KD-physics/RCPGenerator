@@ -143,6 +143,7 @@ def build(inp: dict, cfg: dict, *, shape: bool, mean_overlap: float | None, step
     keep = vals != 0.0
     H = Hessian(N * dpp, dpp, rows[keep], cols[keep], vals[keep], 2 * ncol * dpp + 1, step)
     H.n_colours = ncol
+    H.rot = O0; H.x0 = x0; H.radius = A; H.box = [float(b) for b in cfg.get("box", [1.0] * n)]; H.comps = comps   # for the rigid motions (verdict)
     H.z = np.asarray(cs["z"], dtype=np.int64)   # contacts of the force law at this state: pairs, plus one per boundary pressed on
     # contacts per particle from the matrix: a neighbour j of i with a non-zero block
     contact = np.zeros(pi.shape[0], dtype=bool)
@@ -168,7 +169,13 @@ def spin_modes(n: int, axes) -> int:
     return sum(m * (m - 1) // 2 for m in vals.values())
 
 
-def verdict(H: Hessian, *, n_dim: int, walls, spin, tol: float = 1e-8) -> dict:
+def spin_planes(n: int, axes) -> list:
+    """Pairs (k, l) of body axes with equal semi-axes: a rotation in such a plane leaves the particle unchanged."""
+    ax = [round(float(v), 12) for v in axes]
+    return [(k, l) for k in range(n) for l in range(k + 1, n) if ax[k] == ax[l]]
+
+
+def verdict(H: Hessian, *, n_dim: int, walls, spin, tol: float = 1e-8, planes=None) -> dict:
     """All eigenvalues of the Hessian (every particle), and what they say about the particles that are held.
 
     Held: what is left after taking out the rattlers one after another (a particle with fewer than Ndim + 1
@@ -195,7 +202,48 @@ def verdict(H: Hessian, *, n_dim: int, walls, spin, tol: float = 1e-8) -> dict:
                 zc[j] -= 1
                 if zc[j] < n_dim + 1: stack.append(j)
     idx = np.where(held)[0]
-    ev, V = np.linalg.eigh(H.to_dense()) if H.n else (np.zeros(0), np.zeros((0, 0)))
+    tc = -int(walls[0]) if int(walls[0]) < 0 else 0
+    # The rigid motions of the whole packing are zero modes by symmetry: a translation along each periodic direction,
+    # a rotation in each plane of a curved container. They are taken out of the matrix exactly (projected), because
+    # in the matrix as measured they are zero only if every particle is in balance, and the quench does not balance
+    # rattlers: a rigid rotation then shows up as a small negative eigenvalue (measured: -5e-7 in a cylinder).
+    A_full = H.to_dense() if H.n else np.zeros((0, 0))
+    rigid_vecs = []
+    if H.n:
+        for k in range(tc, n_dim):
+            if int(walls[k]) == 0:
+                v = np.zeros((N, d)); v[:, k] = 1.0; rigid_vecs.append(v.ravel())
+        if tc >= 2:
+            c = 0.5 * H.box[0]
+            for a in range(tc):
+                for b in range(a + 1, tc):
+                    v = np.zeros((N, d)); v[:, a] = H.x0[:, b] - c; v[:, b] = -(H.x0[:, a] - c)
+                    if d > n_dim and (a, b) in H.comps: v[:, n_dim + H.comps.index((a, b))] = H.radius   # the particle turns with the packing
+                    rigid_vecs.append(v.ravel())
+    # The same for the rotations that leave a particle's shape unchanged (a spheroid or a rod about its axis): exact
+    # zero modes by symmetry, taken out particle by particle. In space-frame components a rotation in the body plane
+    # (k, l) is R G R^T, G the generator of that plane.
+    spin_basis = {}
+    if H.n and planes is not None and d > n_dim and H.rot is not None:
+        for i in range(N):
+            if not planes[i]: continue
+            vs = []
+            for (k, l) in planes[i]:
+                R = H.rot[i]; M = np.outer(R[:, k], R[:, l]) - np.outer(R[:, l], R[:, k])
+                vs.append([M[a, b] for (a, b) in H.comps])
+            Qi, _ = np.linalg.qr(np.array(vs).T)
+            spin_basis[i] = Qi
+            r0 = i * d + n_dim; r1 = (i + 1) * d
+            A_full[r0:r1, :] -= Qi @ (Qi.T @ A_full[r0:r1, :])
+            A_full[:, r0:r1] -= (A_full[:, r0:r1] @ Qi) @ Qi.T
+        for v in rigid_vecs:   # a rigid rotation contains a part of each spin: remove it, so the two sets are orthogonal
+            vv = v.reshape(N, d)
+            for i, Qi in spin_basis.items(): vv[i, n_dim:] -= Qi @ (Qi.T @ vv[i, n_dim:])
+    if rigid_vecs:
+        Q, _ = np.linalg.qr(np.array(rigid_vecs).T)
+        A_full = A_full - Q @ (Q.T @ A_full); A_full = A_full - (A_full @ Q) @ Q.T
+        A_full = 0.5 * (A_full + A_full.T)
+    ev, V = np.linalg.eigh(A_full) if H.n else (np.zeros(0), np.zeros((0, 0)))
     zero = np.abs(ev) <= tol
     n_neg = int((ev < -tol).sum()); n_zero = int(zero.sum())
     n_zero_held = 0; n_neg_held = 0
@@ -206,8 +254,7 @@ def verdict(H: Hessian, *, n_dim: int, walls, spin, tol: float = 1e-8) -> dict:
     if len(idx) and n_neg:   # a negative mode counts against the packing when most of it lies on held particles
         wt = (V[np.ix_(rows, np.where(ev < -tol)[0])] ** 2).sum(0)
         n_neg_held = int((wt >= 0.5).sum())
-    tc = -int(walls[0]) if int(walls[0]) < 0 else 0
-    rigid = sum(1 for k in range(tc, n_dim) if int(walls[k]) == 0) + tc * (tc - 1) // 2
+    rigid = len(rigid_vecs)
     allowed = (rigid + int(sum(int(spin[i]) for i in idx.tolist()))) if len(idx) else 0
     return dict(eigenvalues=ev, n_negative=n_neg, n_negative_held=n_neg_held, n_negative_rattlers=n_neg - n_neg_held, n_zero=n_zero, n_zero_held=n_zero_held, n_zero_allowed=int(allowed),
                 n_zero_rattlers=n_zero - n_zero_held, n_rattlers=int(N - len(idx)), n_held=int(len(idx)), rattlers=np.where(~held)[0].tolist(),
